@@ -841,6 +841,28 @@ async def handle_on_ready(
     except Exception as bwe:
         print(f"[Bridge] Warning initializing Banana Watcher: {bwe}")
 
+    # Ensure BRIEF Daemon is running (Zero only; never Vulcan)
+    if not is_vulcan_agent():
+        try:
+            brief_config_path = Path("/workspace/memory/private/brief/config.toml")
+            if brief_config_path.exists():
+                from tools.brief.config import BriefConfig, is_kill_switch_active
+                from tools.brief.daemon import ensure_brief_daemon_running, get_daemon_pid
+
+                brief_cfg = BriefConfig.load(
+                    config_path=brief_config_path,
+                    state_dir="/workspace/data/brief",
+                    memory_dir="/workspace/memory/private/brief",
+                )
+                if is_kill_switch_active(brief_cfg.kill_switch_path):
+                    print("[Antigravity] BRIEF daemon paused via kill_switch.flag; skipping boot auto-start.")
+                else:
+                    started = await asyncio.to_thread(ensure_brief_daemon_running, brief_cfg)
+                    brief_pid = await asyncio.to_thread(get_daemon_pid, brief_cfg)
+                    print(f"[Antigravity] BRIEF daemon active (started={started}, PID: {brief_pid}).")
+        except Exception as bde:
+            print(f"[Bridge] Warning initializing BRIEF daemon: {bde}")
+
     # Reconcile FORGE worktrees and interrupted chunks on boot
     try:
         from tools.forge import reconcile_forge_on_boot

@@ -2119,6 +2119,7 @@ class BridgeScheduler:
             "zero_mail_listener.py",
             "amazon_order_listener.py",
             "banana_watcher.py",
+            "tools/brief/daemon.py",
         )
         proc_root = Path("/proc")
         if proc_root.exists():

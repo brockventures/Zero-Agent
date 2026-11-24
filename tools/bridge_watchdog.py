@@ -13,7 +13,6 @@ Runs periodically (every 5m) or on-demand to monitor:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from datetime import datetime
@@ -24,8 +23,8 @@ WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
 
-from tools.process_probe import reap_stale_agy_processes, diagnose_process_tree, is_process_making_progress
-from tools.bridge_state import DATA_DIR, BEACON_FILE, SESSIONS_FILE, get_all_active_pids
+from tools.process_probe import reap_stale_agy_processes, is_process_making_progress
+from tools.bridge_state import DATA_DIR, BEACON_FILE, get_all_active_pids, is_vulcan_agent
 
 PT_TZ = ZoneInfo("America/Los_Angeles")
 LOG_FILE = DATA_DIR / "bridge_watchdog.log"
@@ -44,6 +43,94 @@ def log(msg: str):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def check_brief_daemon_supervision(
+    auto_heal: bool = True,
+    *,
+    config_path: Path | str = Path("/workspace/memory/private/brief/config.toml"),
+    state_dir: Path | str = Path("/workspace/data/brief"),
+    memory_dir: Path | str = Path("/workspace/memory/private/brief"),
+) -> dict:
+    """Supervise the BRIEF daemon externally without triggering a Zero bridge reload."""
+    if is_vulcan_agent():
+        return {"checked": False, "status": "skipped_vulcan"}
+
+    resolved_config_path = Path(config_path)
+    if not resolved_config_path.exists():
+        return {"checked": False, "status": "unconfigured"}
+
+    try:
+        from tools.brief.config import BriefConfig, is_kill_switch_active
+        from tools.brief.daemon import ensure_brief_daemon_running, get_daemon_pid
+        from tools.brief.queue import BriefQueue
+        from tools.brief.watchdog import run_watchdog
+
+        cfg = BriefConfig.load(
+            config_path=resolved_config_path,
+            state_dir=state_dir,
+            memory_dir=memory_dir,
+        )
+    except Exception as cfg_err:
+        log(f"⚠️ BRIEF supervision config load failed: {cfg_err}")
+        return {
+            "checked": True,
+            "status": "error",
+            "restarted": False,
+            "error": str(cfg_err),
+        }
+
+    if is_kill_switch_active(cfg.kill_switch_path):
+        return {
+            "checked": True,
+            "status": "paused_kill_switch",
+            "restarted": False,
+        }
+
+    pid = get_daemon_pid(cfg)
+    restarted = False
+    status = "running" if pid is not None else "stopped"
+    if pid is None:
+        if auto_heal:
+            try:
+                started = ensure_brief_daemon_running(cfg)
+                pid = get_daemon_pid(cfg)
+                if started:
+                    restarted = True
+                    status = "restarted"
+                    log(f"🔄 BRIEF daemon was not running; auto-restarted cleanly (PID: {pid}).")
+                else:
+                    status = "restart_failed"
+                    log("⚠️ BRIEF daemon was not running and auto-restart returned False.")
+            except Exception as start_err:
+                status = "restart_failed"
+                log(f"⚠️ BRIEF daemon auto-restart failed: {start_err}")
+        else:
+            status = "stopped"
+
+    watchdog_result = None
+    watchdog_error = None
+    try:
+        queue = BriefQueue(
+            cfg.db_path,
+            allowlisted_senders=cfg.allowlisted_emails,
+        )
+        watchdog_result = run_watchdog(cfg, queue, dry_run=not auto_heal)
+    except Exception as wd_err:
+        watchdog_error = str(wd_err)
+        log(f"⚠️ BRIEF external watchdog check failed: {wd_err}")
+
+    result = {
+        "checked": True,
+        "status": status,
+        "pid": pid,
+        "restarted": restarted,
+    }
+    if watchdog_result is not None:
+        result["watchdog"] = watchdog_result
+    if watchdog_error is not None:
+        result["watchdog_error"] = watchdog_error
+    return result
 
 
 def check_bridge_health(auto_heal: bool = True) -> tuple[bool, str, dict]:
@@ -113,7 +200,23 @@ def check_bridge_health(auto_heal: bool = True) -> tuple[bool, str, dict]:
     except Exception as re_err:
         issues.append(f"Process reaper check failed: {re_err}")
 
-    # 4. Self-Healing Trigger
+    # 4. Supervise BRIEF daemon independently (never triggers RELOAD_FLAG)
+    try:
+        brief_sup = check_brief_daemon_supervision(auto_heal=auto_heal)
+        details["brief_supervision"] = brief_sup
+        if brief_sup.get("restarted"):
+            brief_pid = brief_sup.get("pid")
+            pid_suffix = f" (PID {brief_pid})" if brief_pid else ""
+            actions_taken.append(f"Restarted BRIEF daemon independently{pid_suffix}")
+    except Exception as brief_err:
+        details["brief_supervision"] = {
+            "checked": True,
+            "status": "error",
+            "restarted": False,
+            "error": str(brief_err),
+        }
+
+    # 5. Self-Healing Trigger
     is_healthy = len(issues) == 0
     if not is_healthy and auto_heal:
         log(f"🚨 Bridge Watchdog detected {len(issues)} issue(s): {'; '.join(issues)}. Arming self-healing reload flag...")
@@ -129,6 +232,8 @@ def check_bridge_health(auto_heal: bool = True) -> tuple[bool, str, dict]:
         summary_parts.append("✅ Discord bridge & gateway healthy.")
         if gw_heartbeat:
             summary_parts.append(f"Gateway latency: {beacon_data.get('gateway_latency_ms', 0)}ms (heartbeat age: {int(now - float(gw_heartbeat))}s).")
+        if actions_taken:
+            summary_parts.append("\n**Actions Taken:**\n" + "\n".join(f"• {act}" for act in actions_taken))
     else:
         summary_parts.append(f"⚠️ **Bridge Degradation Detected ({len(issues)} issues)**:\n" + "\n".join(f"• {iss}" for iss in issues))
         if actions_taken:
