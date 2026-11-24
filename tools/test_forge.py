@@ -5250,8 +5250,8 @@ def test_stage_decision_uses_cryptographic_hex_ids_and_preserves_retry_bypass(tm
             category="homelab",
             title=f"Action {i}",
             summary="Verify random token_hex decision ID.",
-            handler_type="noop",
-            payload={"note": f"n{i}"},
+            handler_type="shell",
+            payload={"command": "true", "note": f"n{i}"},
             channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
             db_path=db_path,
         )
@@ -5423,8 +5423,8 @@ def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
         category="ops",
         title="Pending Card",
         summary="Dismiss me.",
-        handler_type="noop",
-        payload={},
+        handler_type="shell",
+        payload={"command": "true", "cwd": str(tmp_path)},
         channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
         db_path=db_path,
     )
@@ -5441,8 +5441,8 @@ def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
         category="ops",
         title="Approved Card",
         summary="Already approved.",
-        handler_type="noop",
-        payload={"note": "done"},
+        handler_type="shell",
+        payload={"command": "true", "cwd": str(tmp_path)},
         channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
         db_path=db_path,
     )
@@ -5461,8 +5461,8 @@ def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
         category="ops",
         title="Executing Card",
         summary="Currently executing.",
-        handler_type="noop",
-        payload={},
+        handler_type="shell",
+        payload={"command": "true", "cwd": str(tmp_path)},
         channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
         db_path=db_path,
     )
@@ -5481,8 +5481,8 @@ def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
         category="ops",
         title="Stale Executing Card",
         summary="Stuck in executing.",
-        handler_type="noop",
-        payload={},
+        handler_type="shell",
+        payload={"command": "true", "cwd": str(tmp_path)},
         channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
         db_path=db_path,
     )
@@ -6996,6 +6996,85 @@ def test_unknown_exit_reconcile_forge_on_boot(tmp_path, monkeypatch):
     assert updated_meta["status"] == "unknown_exit"
     assert updated_meta["end_time"] == row["end_time"]
     assert updated_meta["duration_seconds"] is not None and updated_meta["duration_seconds"] >= 100.0
+
+
+def test_stage_decision_rejects_noop_and_approval_handlers(tmp_path):
+    """Verify stage_decision and stage_decision_card reject 'noop' and 'approval' handlers."""
+    import pytest
+
+    db_path = tmp_path / "forge_reject_noop.db"
+    forge_mod.init_forge_db(db_path)
+
+    for bad_handler in ("noop", "approval", "NOOP", " approval ", "NoOp"):
+        with pytest.raises(ValueError, match="prohibited"):
+            forge_mod.stage_decision(
+                category="ops",
+                title="No-op Card",
+                summary="Should be rejected.",
+                handler_type=bad_handler,
+                payload={"note": "nothing"},
+                channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+                db_path=db_path,
+            )
+
+    for bad_handler in ("noop", "approval"):
+        with pytest.raises(ValueError, match="prohibited"):
+            forge_mod.stage_decision_card(
+                category="ops",
+                title="No-op Card Alias",
+                summary="Should be rejected.",
+                handler_type=bad_handler,
+                payload={},
+                channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+                db_path=db_path,
+            )
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
+    assert count == 0
+
+
+def test_execute_decision_fails_legacy_noop_and_approval_cards(tmp_path):
+    """Verify legacy 'noop' and 'approval' rows in forge_decisions fail cleanly when executed."""
+    db_path = tmp_path / "forge_legacy_noop.db"
+    forge_mod.init_forge_db(db_path)
+
+    now = time.time()
+    legacy_handlers = ("noop", "approval", "NOOP", " approval ")
+    with forge_mod.get_db_connection(db_path) as conn:
+        for idx, h_type in enumerate(legacy_handlers):
+            conn.execute(
+                """
+                INSERT INTO forge_decisions (
+                    id, category, title, summary, handler_type, payload_json,
+                    channel_id, is_private, status, expires_at, created_at
+                ) VALUES (?, 'ops', ?, 'Legacy card', ?, ?, ?, 1, 'pending', ?, ?)
+                """,
+                (
+                    f"dec-legacy-{idx}",
+                    f"Legacy {h_type}",
+                    h_type,
+                    json.dumps({"note": "legacy"}),
+                    forge_mod.ZERO_CHAT_CHANNEL_ID,
+                    now + 3600.0,
+                    now,
+                ),
+            )
+
+    for idx, h_type in enumerate(legacy_handlers):
+        did = f"dec-legacy-{idx}"
+        res = forge_mod.execute_decision(did, user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+        assert res["ok"] is False
+        assert res["status"] == "failed"
+        assert "Unsupported no-op handler_type" in res["error"]
+        assert res["receipt"] == res["error"]
+        with forge_mod.get_db_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT status, receipt_text FROM forge_decisions WHERE id = ?",
+                (did,),
+            ).fetchone()
+        assert row["status"] == "failed"
+        assert row["receipt_text"] == res["receipt"]
 
 
 if __name__ == "__main__":

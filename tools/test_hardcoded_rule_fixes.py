@@ -1,13 +1,11 @@
-#!/usr/bin/env python3
 """Regression test suite verifying elimination of hardcoded rules across tools and sidecars."""
 
+import sys
 import unittest
 from datetime import datetime
-from zoneinfo import ZoneInfo
-from unittest.mock import patch, MagicMock
-
-import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if REPO_ROOT in sys.path:
@@ -143,7 +141,10 @@ class TestHardcodedRuleFixes(unittest.TestCase):
 
     def test_weekly_digest_dynamic_reminders_and_cashflow(self):
         """Verify weekly digest queries dynamic sources without hardcoded lists or bills, including birthdays."""
-        from tools.weekly_digest import get_upcoming_reminders_and_renewals, get_recent_cashflow_rows
+        from tools.weekly_digest import (
+            get_recent_cashflow_rows,
+            get_upcoming_reminders_and_renewals,
+        )
 
         now = datetime(2026, 9, 3, 10, 0, tzinfo=PT)
         renewals = get_upcoming_reminders_and_renewals(now, days=30)
@@ -161,6 +162,7 @@ class TestHardcodedRuleFixes(unittest.TestCase):
     def test_weekly_digest_week_ahead_radar(self, mock_cal):
         """Verify weekly digest queries and filters 7-day week ahead radar events, excluding Roy Cloud and Emily."""
         import json
+
         from tools.weekly_digest import get_week_ahead_events
 
         mock_cal.return_value = json.dumps({
@@ -220,7 +222,7 @@ class TestHardcodedRuleFixes(unittest.TestCase):
                 "snippet": "Here is what happened in tech today."
             }
         ]
-        cal, prio, news, trans = _triage_unread_emails(test_emails)
+        cal, prio, news, _trans = _triage_unread_emails(test_emails)
         self.assertTrue(any("10:30 AM" in c for c in cal))
         self.assertTrue(any("Morning Brew" in n for n in news))
         self.assertTrue(any("#766140857" in p and "ready" in p for p in prio))
@@ -235,7 +237,7 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             {"speaker": "Zero", "content": "Fixed and verified classifier prefilter bypass."}
         ]
         with patch("subprocess.Popen", side_effect=OSError("offline fallback")):
-            ms, dr, ed = synthesize_session_milestones(dialogue, "test_session")
+            ms, _dr, _ed = synthesize_session_milestones(dialogue, "test_session")
         self.assertIn("classifier prefilter", ms.lower())
         self.assertNotIn("Google Takeout & Profile: Deep synthesis completed", ms)
 
@@ -247,12 +249,12 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             {"speaker": "Zero", "content": "Benchmarked at 0.42ms average latency."}
         ]
         with patch("subprocess.Popen", side_effect=OSError("offline fallback")):
-            ms, dr, ed = synthesize_session_milestones(dialogue, "crab_cavern_test")
+            _ms, dr, _ed = synthesize_session_milestones(dialogue, "crab_cavern_test")
         self.assertIn("benchmark", dr.lower())
 
     def test_declarative_dispatch_and_formatter_rules(self):
         """Verify forge.py and bridge_formatting.py declarative dispatch tables and token rules."""
-        from tools import forge, bridge_formatting
+        from tools import bridge_formatting, forge
 
         if hasattr(forge, "_CLI_CMD_HANDLERS"):
             for cmd_key in ("enqueue", "status", "stage-decision", "reconcile", "_build_worker", "_job_worker", "job"):
@@ -261,7 +263,7 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             for job_key in ("start", "status", "list", "cancel", "logs"):
                 self.assertIn(job_key, forge._CLI_JOB_HANDLERS)
         if hasattr(forge, "_DECISION_HANDLERS"):
-            for h_key in ("shell", "send_mail", "docker_compose", "gh_merge", "bridge_reload", "file_delete", "forge_enqueue", "noop"):
+            for h_key in ("shell", "send_mail", "docker_compose", "gh_merge", "bridge_reload", "file_delete", "forge_enqueue"):
                 self.assertIn(h_key, forge._DECISION_HANDLERS)
 
         formatted = bridge_formatting.format_for_discord("> [!WARNING]\n> Check `<b>code</b>` and <b>bold</b>\n- **1. First:** item")
@@ -273,6 +275,7 @@ class TestHardcodedRuleFixes(unittest.TestCase):
     def test_ambient_bot_skip(self):
         """Verify route_external_message skips score_relevance for untagged peer bot messages."""
         import asyncio
+
         from tools.bridge_ambient import route_external_message
 
         rules = {

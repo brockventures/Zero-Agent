@@ -10484,6 +10484,11 @@ def stage_decision(
     token: Optional[str] = None,
 ) -> dict:
     """Stage a deterministic Decision Card in SQLite (and optionally post directly to Discord)."""
+    handler_norm = (handler_type or "").strip().lower()
+    if handler_norm in ("noop", "approval"):
+        raise ValueError(
+            "No-op Decision Cards ('noop', 'approval') are prohibited: every Decision Card must wire a real executable handler."
+        )
     ok_val, val_err = _validate_decision_shell_payload(handler_type.strip(), payload)
     if not ok_val:
         raise ValueError(val_err)
@@ -11002,9 +11007,9 @@ def execute_approval_card(
                 else:
                     receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
 
-        elif handler in ("noop", "approval"):
-            ok = True
-            receipt = str(payload.get("receipt") or payload.get("note") or "Approved by Ryan")
+        elif (handler or "").strip().lower() in ("noop", "approval"):
+            ok = False
+            receipt = f"Unsupported no-op handler_type: {handler} (Decision Cards must execute a real action)"
 
         else:
             ok = False
