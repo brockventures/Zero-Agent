@@ -12,6 +12,7 @@ Runs periodically (every 5m) or on-demand to monitor:
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 import time
@@ -133,6 +134,110 @@ def check_brief_daemon_supervision(
     return result
 
 
+_SUBDAEMON_SPECS: tuple[tuple[str, str, str, str], ...] = (
+    ("mcp_daemon", "tools.mcp_daemon", "get_status", "ensure_mcp_daemon_running"),
+    ("zero_mail_listener", "tools.zero_mail_listener", "get_status", "ensure_mail_listener_running"),
+    ("amazon_order_listener", "tools.amazon_order_listener", "get_status", "ensure_amazon_listener_running"),
+    ("zero_health_server", "tools.zero_health_server", "is_running", "ensure_health_server_running"),
+    ("banana_watcher", "tools.banana_watcher", "get_daemon_status", "ensure_banana_watcher_running"),
+)
+
+
+def _parse_subdaemon_status(raw_status) -> tuple[bool, int | None]:
+    """Normalize dict or PID/bool daemon status into (is_alive, pid)."""
+    if isinstance(raw_status, dict):
+        if "running" in raw_status:
+            alive = bool(raw_status.get("running"))
+        else:
+            alive = bool(raw_status.get("pid"))
+        pid = raw_status.get("pid")
+        return alive, pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+    alive = bool(raw_status)
+    pid = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    return alive, pid
+
+
+def check_subdaemons_supervision(auto_heal: bool = True) -> dict:
+    """Supervise Zero's 5 internal sub-daemons independently without triggering RELOAD_FLAG."""
+    if is_vulcan_agent():
+        return {
+            "checked": False,
+            "status": "skipped_vulcan",
+            "daemons": {},
+            "restarted": [],
+        }
+
+    daemons: dict[str, dict] = {}
+    restarted: list[str] = []
+
+    for name, module_path, status_attr, ensure_attr in _SUBDAEMON_SPECS:
+        try:
+            mod = importlib.import_module(module_path)
+            status_fn = getattr(mod, status_attr)
+            ensure_fn = getattr(mod, ensure_attr)
+
+            alive, pid = _parse_subdaemon_status(status_fn())
+            if alive:
+                daemons[name] = {
+                    "status": "running",
+                    "pid": pid,
+                    "restarted": False,
+                }
+                continue
+
+            if not auto_heal:
+                daemons[name] = {
+                    "status": "stopped",
+                    "pid": pid,
+                    "restarted": False,
+                }
+                continue
+
+            ensure_res = ensure_fn()
+            post_alive, post_pid = _parse_subdaemon_status(status_fn())
+            if ensure_res is not False and post_alive:
+                restarted.append(name)
+                daemons[name] = {
+                    "status": "restarted",
+                    "pid": post_pid,
+                    "restarted": True,
+                }
+                pid_suffix = f" (PID {post_pid})" if post_pid else ""
+                log(f"🔄 Sub-daemon '{name}' was not running; auto-restarted cleanly{pid_suffix}.")
+            else:
+                daemons[name] = {
+                    "status": "restart_failed",
+                    "pid": post_pid,
+                    "restarted": False,
+                }
+                log(f"⚠️ Sub-daemon '{name}' was not running and auto-restart failed.")
+        except Exception as err:
+            daemons[name] = {
+                "status": "error",
+                "restarted": False,
+                "error": str(err),
+            }
+            log(f"⚠️ Sub-daemon '{name}' supervision check failed: {err}")
+
+    has_unhealthy = any(
+        d.get("status") in ("stopped", "restart_failed", "error")
+        for d in daemons.values()
+    )
+    if has_unhealthy:
+        overall_status = "degraded"
+    elif restarted:
+        overall_status = "restarted"
+    else:
+        overall_status = "running"
+
+    return {
+        "checked": True,
+        "status": overall_status,
+        "daemons": daemons,
+        "restarted": restarted,
+    }
+
+
 def check_bridge_health(auto_heal: bool = True) -> tuple[bool, str, dict]:
     """Inspect bridge gateway, turn state, and background agy subprocesses."""
     now = time.time()
@@ -214,6 +319,24 @@ def check_bridge_health(auto_heal: bool = True) -> tuple[bool, str, dict]:
             "status": "error",
             "restarted": False,
             "error": str(brief_err),
+        }
+
+    # 4b. Supervise Zero's 5 internal sub-daemons independently (never triggers RELOAD_FLAG)
+    try:
+        sub_sup = check_subdaemons_supervision(auto_heal=auto_heal)
+        details["subdaemon_supervision"] = sub_sup
+        sub_daemons = sub_sup.get("daemons", {})
+        for daemon_name in sub_sup.get("restarted", []):
+            daemon_pid = sub_daemons.get(daemon_name, {}).get("pid")
+            pid_suffix = f" (PID {daemon_pid})" if daemon_pid else ""
+            actions_taken.append(f"Restarted sub-daemon '{daemon_name}' independently{pid_suffix}")
+    except Exception as sub_err:
+        details["subdaemon_supervision"] = {
+            "checked": True,
+            "status": "error",
+            "daemons": {},
+            "restarted": [],
+            "error": str(sub_err),
         }
 
     # 5. Self-Healing Trigger
