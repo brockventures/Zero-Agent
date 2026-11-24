@@ -1,0 +1,33 @@
+# BRIEF (Background Routing, Inbox & Execution Filter) Configuration Example
+# Copy to /workspace/memory/private/brief/config.toml (or /workspace/data/brief/config.toml)
+# and customize owner allowlists and thresholds.
+
+[channel]
+channel_id = 1574655816236269569
+
+[owner]
+allowlisted_emails = ["owner@example.com"]
+
+[polling]
+gmail_interval_seconds = 120
+calendar_interval_seconds = 300
+router_interval_seconds = 15
+
+[limits]
+max_events_per_hour = 30
+max_proactive_messages_per_day = 12
+quiet_hours_start = "22:00"
+quiet_hours_end = "07:00"
+timezone = "America/Los_Angeles"
+
+[sessions]
+email_grain = "thread"
+dm_max_turns = 40
+dm_max_days = 7
+intake_model = "gemini-4-hydrogen-high"
+task_model = "gemini-4-neon-medium"
+
+[safety]
+dry_run = true
+max_retries = 3
+stuck_delivery_seconds = 300
