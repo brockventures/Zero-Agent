@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from tools.brief.config import BriefConfig, touch_heartbeat
+from tools.brief.config import BriefConfig, _normalize_domain, touch_heartbeat
 from tools.brief.queue import BriefQueue
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ __all__ = [
     "GmailWatcher",
     "GoogleReadonlyApiClient",
     "call_with_backoff",
+    "classify_gmail_filter",
     "compute_backoff_delay",
     "resolve_readonly_oauth_credentials",
     "should_prefilter_gmail",
@@ -70,6 +71,21 @@ def _extract_email_set(values: Iterable[str] | None) -> set[str]:
     if not values:
         return set()
     return {norm for item in values if (norm := _normalize_email(str(item)))}
+
+
+def _extract_domain_set(values: Iterable[str] | None) -> set[str]:
+    if not values:
+        return set()
+    return {norm for item in values if (norm := _normalize_domain(str(item)))}
+
+
+def _match_domain(sender_domain: str, domain_set: set[str]) -> str:
+    if not sender_domain or not domain_set:
+        return ""
+    for target in sorted(domain_set):
+        if sender_domain == target or sender_domain.endswith(f".{target}"):
+            return target
+    return ""
 
 
 def _format_pt_timestamp(ts: float | None, tz_name: str = "America/Los_Angeles") -> str:
@@ -418,21 +434,33 @@ def _normalize_headers_map(
     return result
 
 
-def should_prefilter_gmail(
+def classify_gmail_filter(
     labels: Iterable[str] | None,
     headers: Mapping[str, Any] | Iterable[Mapping[str, Any]] | None,
     sender: str,
     owner_emails: Iterable[str] | None = None,
     *,
     allowlisted_emails: Iterable[str] | None = None,
-) -> tuple[bool, str]:
-    """Cheap pre-filter dropping bulk/system/own Gmail messages before LLM routing.
+    vip_senders: Iterable[str] | None = None,
+    automated_domain_allowlist: Iterable[str] | None = None,
+    blocked_domains: Iterable[str] | None = None,
+) -> tuple[str, str]:
+    """Classify a Gmail message into two-tier bulk pre-filter modes before LLM routing.
+
+    Returns `(mode, reason)` where `mode` is one of:
+      - `'drop'`: drop immediately without enqueueing
+      - `'full'`: enqueue with full extracted message body
+      - `'snippet_only'`: enqueue with snippet-only triage envelope (<= 300 chars)
 
     Precedence:
-      1. Always drop SENT / DRAFT / TRASH / SPAM labels.
-      2. Always drop own sender address (`owner_emails`).
-      3. Drop CATEGORY_PROMOTIONS / CATEGORY_SOCIAL / CATEGORY_FORUMS labels.
-      4. Drop List-Unsubscribe bulk mail unless sender is in `allowlisted_emails`.
+      1. SENT / DRAFT / TRASH / SPAM labels -> `drop`
+      2. Own sender address (`owner_emails`) -> `drop`
+      3. CATEGORY_PROMOTIONS / CATEGORY_SOCIAL / CATEGORY_FORUMS labels -> `drop`
+      4. `blocked_domains` (exact or subdomain dot-boundary match) -> `drop`
+      5. No `List-Unsubscribe` header, OR sender in `allowlisted_emails` / `vip_senders`,
+         OR domain in `automated_domain_allowlist` -> `full`
+      6. Primary inbox mail carrying `List-Unsubscribe` on neither allowlist nor blocklist
+         -> `snippet_only`
     """
     label_set = {
         str(lbl).strip().upper()
@@ -441,29 +469,75 @@ def should_prefilter_gmail(
     }
     for lbl in _ALWAYS_DROP_LABELS:
         if lbl in label_set:
-            return True, f"label:{lbl}"
+            return "drop", f"label:{lbl}"
 
     header_map = _normalize_headers_map(headers)
     effective_sender = str(sender or "").strip() or header_map.get("from", "")
     sender_addr = parseaddr(effective_sender)[1].strip().lower()
     if not sender_addr and "@" in effective_sender:
         sender_addr = effective_sender.lower()
+    sender_domain = (
+        sender_addr.rsplit("@", 1)[1].strip().rstrip(".")
+        if "@" in sender_addr
+        else ""
+    )
 
     own_set = _extract_email_set(owner_emails)
     if sender_addr and sender_addr in own_set:
-        return True, "own_sender"
+        return "drop", "own_sender"
 
     for lbl in _CATEGORY_DROP_LABELS:
         if lbl in label_set:
-            return True, f"label:{lbl}"
+            return "drop", f"label:{lbl}"
+
+    blocked_match = _match_domain(sender_domain, _extract_domain_set(blocked_domains))
+    if blocked_match:
+        return "drop", f"blocked_domain:{blocked_match}"
 
     list_unsub = header_map.get("list-unsubscribe", "").strip()
-    if list_unsub:
-        allowlist_set = _extract_email_set(allowlisted_emails)
-        if not sender_addr or sender_addr not in allowlist_set:
-            return True, "list_unsubscribe"
+    if not list_unsub:
+        return "full", ""
 
-    return False, ""
+    allowlist_set = _extract_email_set(allowlisted_emails) | _extract_email_set(vip_senders)
+    if sender_addr and sender_addr in allowlist_set:
+        return "full", ""
+
+    allowed_domain_match = _match_domain(
+        sender_domain,
+        _extract_domain_set(automated_domain_allowlist),
+    )
+    if allowed_domain_match:
+        return "full", ""
+
+    return "snippet_only", "list_unsubscribe"
+
+
+def should_prefilter_gmail(
+    labels: Iterable[str] | None,
+    headers: Mapping[str, Any] | Iterable[Mapping[str, Any]] | None,
+    sender: str,
+    owner_emails: Iterable[str] | None = None,
+    *,
+    allowlisted_emails: Iterable[str] | None = None,
+    vip_senders: Iterable[str] | None = None,
+    automated_domain_allowlist: Iterable[str] | None = None,
+    blocked_domains: Iterable[str] | None = None,
+) -> tuple[bool, str]:
+    """Backward-compatible wrapper around `classify_gmail_filter`.
+
+    Returns `(True, reason)` when `mode == 'drop'`, else `(False, reason)`.
+    """
+    mode, reason = classify_gmail_filter(
+        labels,
+        headers,
+        sender,
+        owner_emails,
+        allowlisted_emails=allowlisted_emails,
+        vip_senders=vip_senders,
+        automated_domain_allowlist=automated_domain_allowlist,
+        blocked_domains=blocked_domains,
+    )
+    return (mode == "drop"), reason
 
 
 def _decode_b64url(data: str) -> str:
@@ -748,28 +822,47 @@ class GmailWatcher(_BaseWatcher):
             header_map = _normalize_headers_map(raw_headers)
             sender = header_map.get("from", "").strip()
 
-            dropped, _reason = should_prefilter_gmail(
+            mode, _reason = classify_gmail_filter(
                 labels,
                 raw_headers,
                 sender,
                 own_emails,
                 allowlisted_emails=self.config.allowlisted_emails,
+                vip_senders=self.config.vip_senders,
+                automated_domain_allowlist=self.config.automated_domain_allowlist,
+                blocked_domains=self.config.blocked_domains,
             )
-            if dropped:
+            if mode == "drop":
                 filtered += 1
                 continue
 
             received_at = _parse_gmail_received_at(msg, header_map, now_ts)
             subject = header_map.get("subject", "(no subject)").strip() or "(no subject)"
-            body_text = _extract_gmail_body_text(payload, snippet=str(msg.get("snippet") or ""))
             received_pt = _format_pt_timestamp(received_at, tz_name=self.config.timezone)
-            envelope_body = (
-                f"Subject: {subject}\n"
-                f"From: {sender or '(unknown)'}\n"
-                f"Date: {received_pt}\n"
-                f"Labels: {', '.join(str(lbl) for lbl in labels) or '(none)'}\n\n"
-                f"{body_text}"
-            ).strip()
+            labels_str = ", ".join(str(lbl) for lbl in labels) or "(none)"
+
+            if mode == "snippet_only":
+                snippet_text = _WHITESPACE_RE.sub(" ", str(msg.get("snippet") or "")).strip()
+                if len(snippet_text) > 300:
+                    snippet_text = snippet_text[:297] + "..."
+                envelope_body = (
+                    f"Subject: {subject}\n"
+                    f"From: {sender or '(unknown)'}\n"
+                    f"Date: {received_pt}\n"
+                    f"Labels: {labels_str}\n"
+                    "Filter: primary_list_unsubscribe_snippet_only "
+                    "(default bias: IGNORE unless genuinely actionable)\n\n"
+                    f"{snippet_text}"
+                ).strip()
+            else:
+                body_text = _extract_gmail_body_text(payload, snippet=str(msg.get("snippet") or ""))
+                envelope_body = (
+                    f"Subject: {subject}\n"
+                    f"From: {sender or '(unknown)'}\n"
+                    f"Date: {received_pt}\n"
+                    f"Labels: {labels_str}\n\n"
+                    f"{body_text}"
+                ).strip()
 
             inserted_id = self.queue.enqueue_event(
                 source="gmail",

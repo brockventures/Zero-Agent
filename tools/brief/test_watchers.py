@@ -27,6 +27,7 @@ from tools.brief.watchers import (
     CursorStore,
     GmailWatcher,
     GoogleReadonlyApiClient,
+    classify_gmail_filter,
     resolve_readonly_oauth_credentials,
     should_prefilter_gmail,
     touch_heartbeat,
@@ -195,18 +196,25 @@ def test_should_prefilter_gmail_precedence_and_header_formats() -> None:
             f"label:{cat}",
         )
 
-    # List-Unsubscribe header drops non-allowlisted senders (list-of-dicts Gmail format)
+    # Primary List-Unsubscribe mail from non-allowlisted senders survives as snippet_only (not dropped)
     gmail_headers = [
         {"name": "From", "value": "Deals <deals@example.com>"},
         {"name": "List-Unsubscribe", "value": "<mailto:unsub@example.com>"},
     ]
+    assert classify_gmail_filter(
+        ["INBOX"],
+        gmail_headers,
+        "Deals <deals@example.com>",
+        own,
+        allowlisted_emails=allowlist,
+    ) == ("snippet_only", "list_unsubscribe")
     assert should_prefilter_gmail(
         ["INBOX"],
         gmail_headers,
         "Deals <deals@example.com>",
         own,
         allowlisted_emails=allowlist,
-    ) == (True, "list_unsubscribe")
+    ) == (False, "list_unsubscribe")
 
     # Allowlisted sender bypasses List-Unsubscribe (dict header format, case-insensitive)
     assert should_prefilter_gmail(
@@ -225,6 +233,227 @@ def test_should_prefilter_gmail_precedence_and_header_formats() -> None:
         own,
         allowlisted_emails=allowlist,
     ) == (False, "")
+
+
+def test_classify_gmail_filter_two_tier_domain_and_vip_rules() -> None:
+    own = ["brief-inbox@example.com"]
+    allowlist = ["owner@example.com"]
+    vip = ["coach@team.example.org"]
+    domain_allowlist = ["konstella.com", "@SchoolPortal.EDU"]
+    blocked = ["marketing.example", ".spammer.net"]
+
+    # Blocked domain (exact + subdomain) drops even without List-Unsubscribe or if VIP
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {},
+        "Offers <promo@marketing.example>",
+        own,
+        blocked_domains=blocked,
+    ) == ("drop", "blocked_domain:marketing.example")
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {},
+        "Sub <bounce@mail.marketing.example>",
+        own,
+        blocked_domains=blocked,
+    ) == ("drop", "blocked_domain:marketing.example")
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {},
+        "Spoof <vip@spammer.net>",
+        own,
+        vip_senders=["vip@spammer.net"],
+        blocked_domains=blocked,
+    ) == ("drop", "blocked_domain:spammer.net")
+
+    # Lookalike domain must NOT match dot-boundary rule for blocked or allowlisted domains
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {"List-Unsubscribe": "<mailto:u@evilmarketing.example>"},
+        "News <news@evilmarketing.example>",
+        own,
+        blocked_domains=blocked,
+    ) == ("snippet_only", "list_unsubscribe")
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {"List-Unsubscribe": "<mailto:u@evilkonstella.com>"},
+        "Phish <alerts@evilkonstella.com>",
+        own,
+        automated_domain_allowlist=domain_allowlist,
+    ) == ("snippet_only", "list_unsubscribe")
+
+    # Allowlisted portal domain (exact and subdomain) passes full even with List-Unsubscribe
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {"List-Unsubscribe": "<https://konstella.com/unsub>"},
+        "Konstella <no-reply@konstella.com>",
+        own,
+        automated_domain_allowlist=domain_allowlist,
+    ) == ("full", "")
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {"List-Unsubscribe": "<https://konstella.com/unsub>"},
+        "Konstella <alerts@notify.konstella.com>",
+        own,
+        automated_domain_allowlist=domain_allowlist,
+    ) == ("full", "")
+
+    # VIP sender passes full even with List-Unsubscribe
+    assert classify_gmail_filter(
+        ["INBOX"],
+        {"List-Unsubscribe": "<mailto:unsub@team.example.org>"},
+        "Coach <COACH@team.example.org>",
+        own,
+        allowlisted_emails=allowlist,
+        vip_senders=vip,
+    ) == ("full", "")
+
+
+def test_gmail_watcher_two_tier_prefilter_envelopes(tmp_path: Path) -> None:
+    cfg = BriefConfig(
+        allowlisted_emails=["owner@example.com"],
+        vip_senders=["teacher@school.example.org"],
+        automated_domain_allowlist=["konstella.com"],
+        blocked_domains=["marketing.example"],
+        dry_run=True,
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path / "memory",
+        prompts_dir=REPO_ROOT / "prompts" / "brief",
+    )
+    queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
+    queue.init_db()
+    cursors = CursorStore(cfg.cursors_path)
+    cursors.save({"gmail_history_id": "100"})
+
+    long_snippet = "A" * 350
+    messages: dict[str, dict[str, Any]] = {
+        "m-promo": {
+            "id": "m-promo",
+            "threadId": "t-promo",
+            "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"],
+            "internalDate": "1795490100000",
+            "payload": {
+                "headers": [{"name": "From", "value": "Sales <sales@shop.example>"}],
+                "mimeType": "text/plain",
+                "body": {"data": _b64("Big sale")},
+            },
+        },
+        "m-blocked": {
+            "id": "m-blocked",
+            "threadId": "t-blocked",
+            "labelIds": ["INBOX"],
+            "internalDate": "1795490101000",
+            "payload": {
+                "headers": [{"name": "From", "value": "Blaster <hi@mail.marketing.example>"}],
+                "mimeType": "text/plain",
+                "body": {"data": _b64("Blocked body")},
+            },
+        },
+        "m-konstella-sub": {
+            "id": "m-konstella-sub",
+            "threadId": "t-konstella",
+            "labelIds": ["INBOX"],
+            "internalDate": "1795490102000",
+            "snippet": "Short snippet",
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "Konstella <notify@mail.konstella.com>"},
+                    {"name": "Subject", "value": "Volunteer Sign-Up"},
+                    {"name": "List-Unsubscribe", "value": "<https://konstella.com/u>"},
+                ],
+                "mimeType": "text/plain",
+                "body": {"data": _b64("FULL_KONSTELLA_BODY: Classroom snack shift tomorrow.")},
+            },
+        },
+        "m-vip": {
+            "id": "m-vip",
+            "threadId": "t-vip",
+            "labelIds": ["INBOX"],
+            "internalDate": "1795490103000",
+            "snippet": "VIP snippet",
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "Ms. Lee <teacher@school.example.org>"},
+                    {"name": "Subject", "value": "Field Trip Permission"},
+                    {"name": "List-Unsubscribe", "value": "<mailto:u@school.example.org>"},
+                ],
+                "mimeType": "text/plain",
+                "body": {"data": _b64("FULL_VIP_BODY: Sign permission slip by Friday.")},
+            },
+        },
+        "m-unknown-unsub": {
+            "id": "m-unknown-unsub",
+            "threadId": "t-unknown",
+            "labelIds": ["INBOX"],
+            "internalDate": "1795490104000",
+            "snippet": long_snippet,
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "Digest <news@unknown-newsletter.example>"},
+                    {"name": "Subject", "value": "Weekly Digest"},
+                    {"name": "List-Unsubscribe", "value": "<mailto:unsub@unknown-newsletter.example>"},
+                ],
+                "mimeType": "text/plain",
+                "body": {"data": _b64("FULL_NEWSLETTER_BODY_MUST_NOT_APPEAR")},
+            },
+        },
+    }
+
+    def _handler(url: str, params: dict[str, Any]) -> dict[str, Any]:
+        if url.endswith("/users/me/history"):
+            return {
+                "historyId": "110",
+                "history": [
+                    {
+                        "messagesAdded": [
+                            {"message": {"id": "m-promo"}},
+                            {"message": {"id": "m-blocked"}},
+                            {"message": {"id": "m-konstella-sub"}},
+                            {"message": {"id": "m-vip"}},
+                            {"message": {"id": "m-unknown-unsub"}},
+                        ]
+                    }
+                ],
+            }
+        if "/users/me/messages/" in url:
+            return messages[url.rsplit("/", 1)[-1]]
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    watcher = GmailWatcher(
+        queue,
+        cursors,
+        cfg,
+        api_client=FakeApiClient(_handler),
+        now_fn=lambda: 1795490200.0,
+        sleep_fn=lambda _: None,
+    )
+    res = watcher.poll_once()
+    assert res["status"] == "ok"
+    assert res["filtered"] == 2
+    assert res["enqueued"] == 3
+
+    events = {}
+    while (ev := queue.claim_next_event(now=1795490300.0)) is not None:
+        events[ev["external_id"]] = ev
+
+    assert set(events.keys()) == {"m-konstella-sub", "m-vip", "m-unknown-unsub"}
+    assert "FULL_KONSTELLA_BODY: Classroom snack shift tomorrow." in events["m-konstella-sub"]["body"]
+    assert "Filter: primary_list_unsubscribe_snippet_only" not in events["m-konstella-sub"]["body"]
+
+    assert "FULL_VIP_BODY: Sign permission slip by Friday." in events["m-vip"]["body"]
+    assert "Filter: primary_list_unsubscribe_snippet_only" not in events["m-vip"]["body"]
+
+    snippet_body = events["m-unknown-unsub"]["body"]
+    assert "Subject: Weekly Digest" in snippet_body
+    assert "From: Digest <news@unknown-newsletter.example>" in snippet_body
+    assert (
+        "Filter: primary_list_unsubscribe_snippet_only "
+        "(default bias: IGNORE unless genuinely actionable)"
+    ) in snippet_body
+    assert "FULL_NEWSLETTER_BODY_MUST_NOT_APPEAR" not in snippet_body
+    snippet_tail = snippet_body.rsplit("\n\n", 1)[-1]
+    assert len(snippet_tail) == 300
+    assert snippet_tail.endswith("...")
 
 
 def test_gmail_watcher_startup_zero_backfill_incremental_prefilter_and_404_skip(
