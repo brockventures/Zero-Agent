@@ -40,9 +40,70 @@ def test_brief_toml_example_is_valid_and_pii_free() -> None:
     parsed = tomllib.loads(raw)
     assert parsed["channel"]["channel_id"] == 1574655816236269569
     assert parsed["owner"]["allowlisted_emails"] == ["owner@example.com"]
+    assert parsed["owner"]["vip_senders"] == ["partner@example.com"]
     assert parsed["limits"]["timezone"] == "America/Los_Angeles"
+    assert parsed["limits"]["max_overnight_bypasses"] == 3
+    assert parsed["limits"]["imminent_event_minutes"] == 60
+    assert parsed["filtering"]["automated_domain_allowlist"] == ["alerts.example.org"]
+    assert parsed["filtering"]["blocked_domains"] == ["marketing.example.net"]
     assert parsed["sessions"]["email_grain"] == "thread"
     assert parsed["safety"]["dry_run"] is True
+
+
+def test_config_wave1_fields_defaults_and_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BRIEF_OWNER_EMAILS", raising=False)
+    defaults_cfg = BriefConfig()
+    assert defaults_cfg.vip_senders == []
+    assert defaults_cfg.max_overnight_bypasses == 3
+    assert defaults_cfg.imminent_event_minutes == 60
+    assert defaults_cfg.automated_domain_allowlist == []
+    assert defaults_cfg.blocked_domains == []
+
+    # Backward compatibility: legacy TOML without new sections loads safe defaults
+    legacy_toml = tmp_path / "legacy.toml"
+    legacy_toml.write_text(
+        '[owner]\nallowlisted_emails = ["owner@example.com"]\n',
+        encoding="utf-8",
+    )
+    legacy_cfg = BriefConfig.load(
+        config_path=legacy_toml,
+        state_dir=tmp_path / "s1",
+        memory_dir=tmp_path / "m1",
+        secrets_path=tmp_path / "no-secrets.json",
+    )
+    assert legacy_cfg.vip_senders == []
+    assert legacy_cfg.max_overnight_bypasses == 3
+    assert legacy_cfg.imminent_event_minutes == 60
+    assert legacy_cfg.automated_domain_allowlist == []
+    assert legacy_cfg.blocked_domains == []
+
+    wave1_toml = tmp_path / "wave1.toml"
+    wave1_toml.write_text(
+        '[owner]\n'
+        'allowlisted_emails = ["owner@example.com"]\n'
+        'vip_senders = ["VIP Partner <Partner@Example.COM>", "school@example.org", "partner@example.com"]\n'
+        '[limits]\n'
+        'max_overnight_bypasses = 2\n'
+        'imminent_event_minutes = 45\n'
+        '[filtering]\n'
+        'automated_domain_allowlist = [" @Konstella.COM ", ".alerts.example.org.", "konstella.com"]\n'
+        'blocked_domains = ["@Promo.Example.NET", "promo.example.net", "  ads.example.com  "]\n',
+        encoding="utf-8",
+    )
+    wave1_cfg = BriefConfig.load(
+        config_path=wave1_toml,
+        state_dir=tmp_path / "s2",
+        memory_dir=tmp_path / "m2",
+        secrets_path=tmp_path / "no-secrets.json",
+    )
+    assert wave1_cfg.vip_senders == ["partner@example.com", "school@example.org"]
+    assert wave1_cfg.max_overnight_bypasses == 2
+    assert wave1_cfg.imminent_event_minutes == 45
+    assert wave1_cfg.automated_domain_allowlist == ["konstella.com", "alerts.example.org"]
+    assert wave1_cfg.blocked_domains == ["promo.example.net", "ads.example.com"]
 
 
 def test_layered_prompts_exist_and_cover_core_contracts() -> None:

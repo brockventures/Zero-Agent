@@ -29,6 +29,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.brief.config import (
     DEFAULT_SECRETS_PATH,
     BriefConfig,
+    _normalize_email,
     ensure_memory_scaffold,
     is_kill_switch_active,
     touch_heartbeat,
@@ -83,6 +84,10 @@ _VERDICT_KIND_RE = re.compile(
     re.IGNORECASE,
 )
 _URGENT_WORD_RE = re.compile(r"(?<!not\s)\burgent\b", re.IGNORECASE)
+_CALENDAR_START_LINE_RE = re.compile(
+    r"^Start:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\b",
+    re.MULTILINE,
+)
 
 
 def _resolve_cfg(
@@ -228,6 +233,7 @@ def _is_response_urgent(
     *,
     urgent: bool = False,
 ) -> bool:
+    """Daytime proactive-budget urgency check; never used to bypass quiet hours."""
     if urgent:
         return True
     text = str(response_text or "").strip()
@@ -245,6 +251,98 @@ def _is_response_urgent(
             if _URGENT_WORD_RE.search(str(parsed.get("summary") or "")):
                 return True
     return bool(_URGENT_WORD_RE.search(text))
+
+
+def _extract_calendar_start_ts(event: Mapping[str, Any], tz_name: str) -> float | None:
+    raw_ts = event.get("start_ts")
+    if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+        return float(raw_ts)
+
+    for key in ("starts_at", "start"):
+        val = event.get(key)
+        if isinstance(val, Mapping):
+            val = val.get("dateTime")
+        if isinstance(val, str) and val.strip():
+            norm = val.strip()
+            if norm.endswith("Z"):
+                norm = norm[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(norm)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+            return float(dt.timestamp())
+
+    body = event.get("body")
+    if isinstance(body, str) and body:
+        match = _CALENDAR_START_LINE_RE.search(body)
+        if match:
+            try:
+                dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M").replace(
+                    tzinfo=ZoneInfo(tz_name)
+                )
+                return float(dt.timestamp())
+            except ValueError:
+                return None
+    return None
+
+
+def is_quiet_hours_bypass_eligible(
+    cfg: BriefConfig,
+    *,
+    tag: str = "",
+    event: Mapping[str, Any] | None = None,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """Deterministically check whether an event is eligible to bypass quiet hours.
+
+    Returns `(True, reason)` ONLY when:
+      a) owner-initiated / trusted event (`event.get('trusted') is True` or
+         `tag == 'intake/discord/brief'`), OR
+      b) sender email matches `cfg.vip_senders` or `cfg.allowlisted_emails`, OR
+      c) imminent calendar event (`source == 'calendar'` and
+         `starts_within_minutes <= cfg.imminent_event_minutes` or `imminent is True`).
+    """
+    ev = event or {}
+    clean_tag = str(tag or "").strip()
+    source = str(ev.get("source") or "").strip().lower()
+
+    if ev.get("trusted") is True or (
+        clean_tag == "intake/discord/brief" and ev.get("trusted") is not False
+    ):
+        return True, "trusted_owner"
+
+    sender_addr = _normalize_email(str(ev.get("sender") or ""))
+    if sender_addr:
+        allow_set = {e.lower() for e in cfg.allowlisted_emails}
+        if sender_addr in allow_set:
+            return True, "allowlisted_sender"
+        vip_set = {e.lower() for e in cfg.vip_senders}
+        if sender_addr in vip_set:
+            return True, "vip_sender"
+
+    if source == "calendar":
+        if ev.get("imminent") is True:
+            return True, "imminent_calendar"
+        imminent_limit = max(0, int(cfg.imminent_event_minutes))
+        raw_swm = ev.get("starts_within_minutes")
+        if raw_swm is not None and not isinstance(raw_swm, bool):
+            try:
+                mins = float(raw_swm)
+            except (TypeError, ValueError):
+                mins = -1.0
+            if imminent_limit > 0 and 0.0 <= mins <= float(imminent_limit):
+                return True, "imminent_calendar"
+        else:
+            start_ts = _extract_calendar_start_ts(ev, cfg.timezone)
+            if start_ts is not None:
+                now_ts = float(time.time() if now is None else now)
+                mins = (start_ts - now_ts) / 60.0
+                if imminent_limit > 0 and 0.0 <= mins <= float(imminent_limit):
+                    return True, "imminent_calendar"
+
+    return False, "not_eligible"
 
 
 class BriefDeliveryGate:
@@ -317,6 +415,14 @@ class BriefDeliveryGate:
         except (TypeError, ValueError):
             return 0
 
+    def _get_overnight_bypass_count_unlocked(self, date_key: str) -> int:
+        days = self._load_budget_unlocked()
+        entry = days.get(date_key) or {}
+        try:
+            return max(0, int(entry.get("overnight_bypasses", 0)))
+        except (TypeError, ValueError):
+            return 0
+
     def _record_send_unlocked(
         self,
         date_key: str,
@@ -325,12 +431,14 @@ class BriefDeliveryGate:
         proactive: bool,
         urgent: bool,
         owner_initiated: bool,
+        overnight_bypass: bool = False,
     ) -> int:
         days = self._load_budget_unlocked()
         entry = dict(days.get(date_key) or {})
         proactive_count = max(0, int(entry.get("proactive_sent", 0)))
         owner_count = max(0, int(entry.get("owner_sent", 0)))
         urgent_count = max(0, int(entry.get("urgent_sent", 0)))
+        overnight_bypasses = max(0, int(entry.get("overnight_bypasses", 0)))
 
         if proactive:
             proactive_count += 1
@@ -338,11 +446,14 @@ class BriefDeliveryGate:
             owner_count += 1
         if urgent:
             urgent_count += 1
+        if overnight_bypass:
+            overnight_bypasses += 1
 
         days[date_key] = {
             "proactive_sent": proactive_count,
             "owner_sent": owner_count,
             "urgent_sent": urgent_count,
+            "overnight_bypasses": overnight_bypasses,
             "updated_at": now_ts,
         }
         self._save_budget_unlocked(days, date_key)
@@ -436,41 +547,66 @@ class BriefDeliveryGate:
         is_owner = bool(
             owner_initiated
             or (event_source == "discord" and bool((event or {}).get("trusted", True)))
+            or (
+                tag.strip() == "intake/discord/brief"
+                and (event or {}).get("trusted") is not False
+            )
         )
-        is_urgent = _is_response_urgent(response_text, urgent=urgent)
+        # Untrusted external emails MUST NEVER bypass quiet hours via LLM output text.
+        is_urgent = False if quiet else _is_response_urgent(response_text, urgent=urgent)
         formatted = _format_discord_message(response_text)
 
         with self._lock:
             used = self._get_proactive_count_unlocked(date_key)
+            overnight_used = self._get_overnight_bypass_count_unlocked(date_key)
+            overnight_limit = max(0, int(self.config.max_overnight_bypasses))
+            bypass_granted = False
+            bypass_reason = ""
 
-            if quiet and not is_owner and not is_urgent:
-                items = self._load_deferred_unlocked()
-                items.append(
-                    {
-                        "id": uuid.uuid4().hex[:12],
-                        "kind": kind,
-                        "tag": tag,
-                        "event_id": (event or {}).get("id"),
-                        "source": event_source,
-                        "content": formatted,
-                        "queued_at": now_ts,
-                        "queued_at_pt": _format_pt_timestamp(
-                            now_ts, tz_name=self.config.timezone
-                        ),
-                        "reason": "quiet_hours",
-                    }
+            if quiet and not is_owner:
+                eligible, bypass_reason = is_quiet_hours_bypass_eligible(
+                    self.config,
+                    tag=tag,
+                    event=event,
+                    now=now_ts,
                 )
-                self._save_deferred_unlocked(items)
-                return {
-                    "delivered": False,
-                    "status": "deferred_quiet_hours",
-                    "kind": kind,
-                    "quiet_hours": True,
-                    "budget_used": used,
-                    "budget_limit": limit,
-                }
+                if not eligible or overnight_used >= overnight_limit:
+                    defer_reason = (
+                        "quiet_hours_bypass_cap"
+                        if eligible and overnight_used >= overnight_limit
+                        else "quiet_hours"
+                    )
+                    items = self._load_deferred_unlocked()
+                    items.append(
+                        {
+                            "id": uuid.uuid4().hex[:12],
+                            "kind": kind,
+                            "tag": tag,
+                            "event_id": (event or {}).get("id"),
+                            "source": event_source,
+                            "content": formatted,
+                            "queued_at": now_ts,
+                            "queued_at_pt": _format_pt_timestamp(
+                                now_ts, tz_name=self.config.timezone
+                            ),
+                            "reason": defer_reason,
+                        }
+                    )
+                    self._save_deferred_unlocked(items)
+                    return {
+                        "delivered": False,
+                        "status": "deferred_quiet_hours",
+                        "kind": kind,
+                        "quiet_hours": True,
+                        "budget_used": used,
+                        "budget_limit": limit,
+                        "overnight_bypasses_used": overnight_used,
+                        "overnight_bypasses_limit": overnight_limit,
+                        "bypass_reason": defer_reason,
+                    }
+                bypass_granted = True
 
-            is_proactive = not is_owner and not is_urgent
+            is_proactive = not is_owner and not is_urgent and not bypass_granted
             if is_proactive and used >= limit:
                 return {
                     "delivered": False,
@@ -492,14 +628,16 @@ class BriefDeliveryGate:
                     "budget_limit": limit,
                 }
 
+            record_overnight_bypass = bool(quiet and not is_owner and bypass_granted)
             new_used = self._record_send_unlocked(
                 date_key,
                 now_ts,
                 proactive=is_proactive,
                 urgent=is_urgent,
                 owner_initiated=is_owner,
+                overnight_bypass=record_overnight_bypass,
             )
-            return {
+            result: dict[str, Any] = {
                 "delivered": True,
                 "status": "dry_run" if self.config.dry_run and self._post_fn is None else "sent",
                 "kind": kind,
@@ -508,6 +646,11 @@ class BriefDeliveryGate:
                 "budget_limit": limit,
                 "content": formatted,
             }
+            if record_overnight_bypass:
+                result["overnight_bypasses_used"] = overnight_used + 1
+                result["overnight_bypasses_limit"] = overnight_limit
+                result["bypass_reason"] = bypass_reason
+            return result
 
     def flush_deferred(self, now: float | datetime | None = None) -> dict[str, Any]:
         """Flush queued quiet-hours deliveries once outside quiet hours, honoring daily budget."""
@@ -699,6 +842,66 @@ class BriefDaemonRunner:
                 else:
                     existing.extend(value)
 
+    def _resolve_outcome_event(self, outcome: Mapping[str, Any]) -> dict[str, Any]:
+        ev_id = outcome.get("event_id")
+        event_dict: dict[str, Any] = {
+            "id": ev_id,
+            "source": outcome.get("source"),
+        }
+        for key in (
+            "sender",
+            "trusted",
+            "body",
+            "imminent",
+            "starts_within_minutes",
+            "start",
+            "starts_at",
+            "start_ts",
+        ):
+            if key in outcome and outcome.get(key) is not None:
+                event_dict[key] = outcome.get(key)
+
+        needs_lookup = (
+            ev_id is not None
+            and (
+                "sender" not in event_dict
+                or "trusted" not in event_dict
+                or (
+                    str(event_dict.get("source") or "").strip().lower() == "calendar"
+                    and "body" not in event_dict
+                )
+            )
+        )
+        if needs_lookup:
+            row: Mapping[str, Any] | None = None
+            if hasattr(self.queue, "get_event"):
+                try:
+                    row = self.queue.get_event(int(ev_id))
+                except Exception:
+                    row = None
+            elif hasattr(self.queue, "_tx"):
+                try:
+                    with self.queue._tx() as conn:
+                        fetched = conn.execute(
+                            "SELECT id, source, sender, trusted, body FROM events WHERE id = ?",
+                            (int(ev_id),),
+                        ).fetchone()
+                    if fetched is not None:
+                        row = {
+                            "id": fetched["id"],
+                            "source": fetched["source"],
+                            "sender": fetched["sender"],
+                            "trusted": bool(fetched["trusted"]),
+                            "body": fetched["body"],
+                        }
+                except Exception:
+                    row = None
+            if isinstance(row, Mapping):
+                for key in ("source", "sender", "trusted", "body"):
+                    if key not in event_dict and row.get(key) is not None:
+                        event_dict[key] = row.get(key)
+        return event_dict
+
     def run_tick(self, now: float | None = None) -> dict[str, Any]:
         """Execute one scheduled daemon tick across timers, watchers, router, and watchdog."""
         now_ts = float(self._now_fn() if now is None else now)
@@ -784,13 +987,11 @@ class BriefDaemonRunner:
                 delivery_res: dict[str, Any] | None = None
                 if outcome.get("status") == "done":
                     try:
+                        event_ctx = self._resolve_outcome_event(outcome)
                         delivery_res = self.delivery_gate.deliver(
                             str(outcome.get("response") or ""),
                             tag=str(outcome.get("tag") or ""),
-                            event={
-                                "id": outcome.get("event_id"),
-                                "source": outcome.get("source"),
-                            },
+                            event=event_ctx,
                             now=now_ts,
                         )
                         if delivery_res.get("delivered"):

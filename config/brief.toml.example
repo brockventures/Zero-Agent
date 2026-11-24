@@ -7,6 +7,7 @@ channel_id = 1574655816236269569
 
 [owner]
 allowlisted_emails = ["owner@example.com"]
+vip_senders = ["partner@example.com"]
 
 [polling]
 gmail_interval_seconds = 120
@@ -16,9 +17,15 @@ router_interval_seconds = 15
 [limits]
 max_events_per_hour = 30
 max_proactive_messages_per_day = 12
+max_overnight_bypasses = 3
+imminent_event_minutes = 60
 quiet_hours_start = "22:00"
 quiet_hours_end = "07:00"
 timezone = "America/Los_Angeles"
+
+[filtering]
+automated_domain_allowlist = ["alerts.example.org"]
+blocked_domains = ["marketing.example.net"]
 
 [sessions]
 email_grain = "thread"

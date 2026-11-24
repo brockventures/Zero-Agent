@@ -61,6 +61,49 @@ def _merge_unique_emails(*groups: list[str]) -> list[str]:
     return merged
 
 
+def _normalize_domain(value: str) -> str:
+    candidate = str(value or "").strip().lower()
+    if "@" in candidate:
+        candidate = candidate.rsplit("@", 1)[-1]
+    candidate = candidate.strip().lstrip("@.").rstrip(".")
+    if not candidate or any(ch.isspace() for ch in candidate):
+        return ""
+    return candidate
+
+
+def _parse_domain_list(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    items: list[str]
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(item) for item in raw]
+    else:
+        return []
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        normalized = _normalize_domain(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _merge_unique_domains(*groups: list[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for domain in group:
+            normalized = _normalize_domain(domain)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                merged.append(normalized)
+    return merged
+
+
 def _load_secrets_owner_emails(secrets_path: Path | None) -> list[str]:
     if secrets_path is None or not secrets_path.exists():
         return []
@@ -87,6 +130,7 @@ class BriefConfig:
 
     # [owner]
     allowlisted_emails: list[str] = field(default_factory=list)
+    vip_senders: list[str] = field(default_factory=list)
 
     # [polling]
     gmail_interval_seconds: int = 120
@@ -96,9 +140,15 @@ class BriefConfig:
     # [limits]
     max_events_per_hour: int = 30
     max_proactive_messages_per_day: int = 12
+    max_overnight_bypasses: int = 3
+    imminent_event_minutes: int = 60
     quiet_hours_start: str = "22:00"
     quiet_hours_end: str = "07:00"
     timezone: str = "America/Los_Angeles"
+
+    # [filtering]
+    automated_domain_allowlist: list[str] = field(default_factory=list)
+    blocked_domains: list[str] = field(default_factory=list)
 
     # [sessions]
     email_grain: str = "thread"
@@ -137,6 +187,11 @@ class BriefConfig:
         if self.config_path is not None:
             self.config_path = Path(self.config_path)
         self.allowlisted_emails = _merge_unique_emails(self.allowlisted_emails)
+        self.vip_senders = _merge_unique_emails(self.vip_senders)
+        self.max_overnight_bypasses = max(0, int(self.max_overnight_bypasses))
+        self.imminent_event_minutes = max(0, int(self.imminent_event_minutes))
+        self.automated_domain_allowlist = _merge_unique_domains(self.automated_domain_allowlist)
+        self.blocked_domains = _merge_unique_domains(self.blocked_domains)
 
     @property
     def db_path(self) -> Path:
@@ -242,13 +297,17 @@ class BriefConfig:
         owner = data.get("owner", {})
         polling = data.get("polling", {})
         limits = data.get("limits", {})
+        filtering = data.get("filtering", {})
         sessions = data.get("sessions", {})
         safety = data.get("safety", {})
         gate = data.get("gate", {})
+        if not isinstance(filtering, dict):
+            filtering = {}
         if not isinstance(gate, dict):
             gate = {}
 
         toml_emails = _parse_email_list(owner.get("allowlisted_emails", []))
+        vip_emails = _parse_email_list(owner.get("vip_senders", []))
         env_emails = _parse_email_list(os.environ.get("BRIEF_OWNER_EMAILS", ""))
         resolved_secrets = Path(secrets_path) if secrets_path is not None else None
         secret_emails = _load_secrets_owner_emails(resolved_secrets)
@@ -273,14 +332,21 @@ class BriefConfig:
         return cls(
             channel_id=int(channel.get("channel_id", DEFAULT_CHANNEL_ID)),
             allowlisted_emails=_merge_unique_emails(toml_emails, env_emails, secret_emails),
+            vip_senders=vip_emails,
             gmail_interval_seconds=int(polling.get("gmail_interval_seconds", 120)),
             calendar_interval_seconds=int(polling.get("calendar_interval_seconds", 300)),
             router_interval_seconds=int(polling.get("router_interval_seconds", 15)),
             max_events_per_hour=int(limits.get("max_events_per_hour", 30)),
             max_proactive_messages_per_day=int(limits.get("max_proactive_messages_per_day", 12)),
+            max_overnight_bypasses=int(limits.get("max_overnight_bypasses", 3)),
+            imminent_event_minutes=int(limits.get("imminent_event_minutes", 60)),
             quiet_hours_start=str(limits.get("quiet_hours_start", "22:00")),
             quiet_hours_end=str(limits.get("quiet_hours_end", "07:00")),
             timezone=str(limits.get("timezone", "America/Los_Angeles")),
+            automated_domain_allowlist=_parse_domain_list(
+                filtering.get("automated_domain_allowlist", [])
+            ),
+            blocked_domains=_parse_domain_list(filtering.get("blocked_domains", [])),
             email_grain=str(sessions.get("email_grain", "thread")),
             dm_max_turns=int(sessions.get("dm_max_turns", 40)),
             dm_max_days=int(sessions.get("dm_max_days", 7)),

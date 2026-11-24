@@ -23,7 +23,11 @@ from tools.brief.actions import (
     validate_action_args,
 )
 from tools.brief.config import BriefConfig
-from tools.brief.daemon import BriefDeliveryGate, is_quiet_hours
+from tools.brief.daemon import (
+    BriefDeliveryGate,
+    is_quiet_hours,
+    is_quiet_hours_bypass_eligible,
+)
 from tools.brief.queue import BriefQueue
 from tools.brief.watchdog import _format_pt_timestamp, post_brief_alert
 
@@ -665,16 +669,90 @@ class BriefApprovalGate:
             used = self._delivery_gate._get_proactive_count_unlocked(date_key)
         return used < limit
 
-    def _record_proactive_send(self, now_ts: float, *, urgent: bool) -> None:
+    def _can_bypass_overnight(self, now_ts: float) -> bool:
+        limit = max(0, int(self.config.max_overnight_bypasses))
+        if limit <= 0:
+            return False
+        date_key, _ = self._delivery_gate._pt_date_key(now=now_ts)
+        with self._delivery_gate._lock:
+            used = self._delivery_gate._get_overnight_bypass_count_unlocked(date_key)
+        return used < limit
+
+    def _record_proactive_send(
+        self,
+        now_ts: float,
+        *,
+        urgent: bool,
+        owner_initiated: bool = False,
+        overnight_bypass: bool = False,
+    ) -> None:
         date_key, _ = self._delivery_gate._pt_date_key(now=now_ts)
         with self._delivery_gate._lock:
             self._delivery_gate._record_send_unlocked(
                 date_key,
                 now_ts,
-                proactive=not urgent,
+                proactive=not urgent and not owner_initiated and not overnight_bypass,
                 urgent=urgent,
-                owner_initiated=False,
+                owner_initiated=owner_initiated,
+                overnight_bypass=overnight_bypass,
             )
+
+    def _build_proposal_bypass_context(
+        self,
+        data: Mapping[str, Any],
+        from_session: str,
+    ) -> dict[str, Any]:
+        """Extract deterministic sender/calendar context without trusting LLM-asserted trust flags."""
+        ctx: dict[str, Any] = {}
+        nested_event = data.get("event") if isinstance(data.get("event"), Mapping) else {}
+
+        raw_source = data.get("source") if "source" in data else nested_event.get("source")
+        if isinstance(raw_source, str) and raw_source.strip():
+            ctx["source"] = raw_source.strip().lower()
+        elif from_session.startswith("intake/calendar/"):
+            ctx["source"] = "calendar"
+        elif from_session.startswith("intake/gmail/"):
+            ctx["source"] = "gmail"
+        elif from_session.startswith("intake/discord/"):
+            ctx["source"] = "discord"
+
+        raw_sender = data.get("sender") if "sender" in data else nested_event.get("sender")
+        if isinstance(raw_sender, str) and raw_sender.strip():
+            ctx["sender"] = raw_sender.strip()
+
+        for key in ("imminent", "starts_within_minutes", "start", "starts_at", "start_ts", "body"):
+            val = data.get(key) if key in data else nested_event.get(key)
+            if val is not None:
+                ctx[key] = val
+
+        if (
+            from_session
+            and ("sender" not in ctx or (ctx.get("source") == "calendar" and "body" not in ctx))
+            and hasattr(self.queue, "_tx")
+        ):
+            try:
+                with self.queue._tx() as conn:
+                    row = conn.execute(
+                        """
+                        SELECT source, sender, body
+                        FROM events
+                        WHERE target_tag = ?
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (from_session,),
+                    ).fetchone()
+                if row is not None:
+                    if "source" not in ctx and row["source"]:
+                        ctx["source"] = str(row["source"]).strip().lower()
+                    if "sender" not in ctx and row["sender"]:
+                        ctx["sender"] = str(row["sender"]).strip()
+                    if "body" not in ctx and row["body"]:
+                        ctx["body"] = str(row["body"])
+            except Exception:
+                pass
+
+        return ctx
 
     def _handle_invalid_pending(
         self,
@@ -911,11 +989,25 @@ class BriefApprovalGate:
                 summary["rejected_ids"].append(proposal_id)
                 continue
 
-            # Valid non-urgent proposals wait untouched in pending/ during quiet hours or daily cap.
-            if not urgent:
-                if is_quiet_hours(self.config, now=now_ts):
-                    summary["deferred_quiet_hours"] += 1
-                    continue
+            # Quiet hours: untrusted `urgent: true` proposals MUST NOT bypass quiet hours.
+            # Only owner `#brief` session OR deterministic VIP/imminent context under
+            # `max_overnight_bypasses` may stage during quiet hours.
+            is_owner_session = from_session == "intake/discord/brief"
+            used_overnight_bypass = False
+            if is_quiet_hours(self.config, now=now_ts):
+                if not is_owner_session:
+                    bypass_ctx = self._build_proposal_bypass_context(data, from_session)
+                    eligible, _ = is_quiet_hours_bypass_eligible(
+                        self.config,
+                        tag=from_session,
+                        event=bypass_ctx,
+                        now=now_ts,
+                    )
+                    if not eligible or not self._can_bypass_overnight(now_ts):
+                        summary["deferred_quiet_hours"] += 1
+                        continue
+                    used_overnight_bypass = True
+            elif not urgent and not is_owner_session:
                 if not self._can_send_proactive(now_ts):
                     summary["deferred_budget"] += 1
                     continue
@@ -987,7 +1079,12 @@ class BriefApprovalGate:
             if decision_id:
                 self.gate_store.update_decision_id(proposal_id, decision_id)
 
-            self._record_proactive_send(now_ts, urgent=urgent)
+            self._record_proactive_send(
+                now_ts,
+                urgent=urgent,
+                owner_initiated=is_owner_session,
+                overnight_bypass=used_overnight_bypass,
+            )
             summary["staged"] += 1
             summary["staged_ids"].append(proposal_id)
 

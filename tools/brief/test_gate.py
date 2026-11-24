@@ -226,7 +226,9 @@ def test_invalid_action_and_malformed_json_rejected_and_archived(tmp_path: Path)
     assert "gate-receipt:corrupt:rejected" in ext_ids
 
 
-def test_quiet_hours_and_daily_budget_hold_non_urgent_while_urgent_bypasses(tmp_path: Path) -> None:
+def test_quiet_hours_refuses_untrusted_urgent_while_daytime_budget_allows_urgent(
+    tmp_path: Path,
+) -> None:
     cfg = _make_config(tmp_path, dry_run=True, max_proactive=1)
     quiet_ts = _ts_pt(2026, 11, 24, 23, 30)  # 23:30 PT (inside 22:00-07:00)
     day_ts = _ts_pt(2026, 11, 25, 9, 0)  # 09:00 PT (outside quiet hours)
@@ -239,14 +241,14 @@ def test_quiet_hours_and_daily_budget_hold_non_urgent_while_urgent_bypasses(tmp_
             urgent=False,
         ),
     )
-    write_proposal_atomic(
-        cfg.proposals_pending_dir,
-        _sample_create_proposal(
-            "prop-urgent",
-            expires_at="2026-11-26T18:00:00-08:00",
-            urgent=True,
-        ),
+    untrusted_urgent = _sample_create_proposal(
+        "prop-urgent",
+        expires_at="2026-11-26T18:00:00-08:00",
+        urgent=True,
     )
+    # Even if an LLM writes trusted=True in JSON, untrusted session must NOT bypass quiet hours.
+    untrusted_urgent["trusted"] = True
+    write_proposal_atomic(cfg.proposals_pending_dir, untrusted_urgent)
 
     staged_calls: list[dict[str, Any]] = []
     gate = BriefApprovalGate(
@@ -256,15 +258,15 @@ def test_quiet_hours_and_daily_budget_hold_non_urgent_while_urgent_bypasses(tmp_
     )
 
     quiet_res = gate.scan_pending_proposals(now=quiet_ts)
-    assert quiet_res["staged"] == 1
-    assert quiet_res["staged_ids"] == ["prop-urgent"]
-    assert quiet_res["deferred_quiet_hours"] == 1
+    assert quiet_res["staged"] == 0
+    assert quiet_res["deferred_quiet_hours"] == 2
     assert (cfg.proposals_pending_dir / "prop-routine.json").is_file()
+    assert (cfg.proposals_pending_dir / "prop-urgent.json").is_file()
 
-    # Outside quiet hours, prop-routine now stages and consumes the daily cap (max_proactive=1)
+    # Outside quiet hours, both routine (consumes max_proactive=1) and urgent stage cleanly.
     day_res = gate.scan_pending_proposals(now=day_ts)
-    assert day_res["staged"] == 1
-    assert day_res["staged_ids"] == ["prop-routine"]
+    assert day_res["staged"] == 2
+    assert sorted(day_res["staged_ids"]) == ["prop-routine", "prop-urgent"]
 
     # Another routine proposal on the same day must wait untouched due to daily proactive cap
     write_proposal_atomic(
@@ -279,6 +281,86 @@ def test_quiet_hours_and_daily_budget_hold_non_urgent_while_urgent_bypasses(tmp_
     assert cap_res["staged"] == 0
     assert cap_res["deferred_budget"] == 1
     assert (cfg.proposals_pending_dir / "prop-over-cap.json").is_file()
+
+
+def test_gate_quiet_hours_bypass_owner_session_vip_imminent_and_cap(tmp_path: Path) -> None:
+    cfg = BriefConfig(
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path / "memory",
+        allowlisted_emails=["owner@example.com"],
+        vip_senders=["vip@example.com"],
+        max_overnight_bypasses=2,
+        imminent_event_minutes=60,
+        dry_run=True,
+        quiet_hours_start="22:00",
+        quiet_hours_end="07:00",
+        timezone="America/Los_Angeles",
+    )
+    quiet_ts = _ts_pt(2026, 11, 24, 23, 30)
+
+    # 1) Owner Discord session (#brief) bypasses quiet hours and does NOT count against cap.
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        _sample_create_proposal(
+            "prop-owner-discord",
+            expires_at="2026-11-26T18:00:00-08:00",
+            from_session="intake/discord/brief",
+            urgent=False,
+        ),
+    )
+
+    # 2) VIP sender proposal (resolved via sender metadata) -> bypass 1 of 2.
+    vip_prop = _sample_create_proposal(
+        "prop-vip-1",
+        expires_at="2026-11-26T18:00:00-08:00",
+        from_session="intake/gmail/vip-thread",
+        urgent=True,
+    )
+    vip_prop["sender"] = "VIP <vip@example.com>"
+    write_proposal_atomic(cfg.proposals_pending_dir, vip_prop)
+
+    # 3) Imminent calendar proposal -> bypass 2 of 2.
+    cal_prop = _sample_create_proposal(
+        "prop-cal-imminent",
+        expires_at="2026-11-26T18:00:00-08:00",
+        from_session="intake/calendar/ev-soon",
+        urgent=True,
+    )
+    cal_prop["source"] = "calendar"
+    cal_prop["starts_within_minutes"] = 25
+    write_proposal_atomic(cfg.proposals_pending_dir, cal_prop)
+
+    # 4) Third eligible overnight bypass exceeds max_overnight_bypasses=2 -> deferred.
+    vip_prop_2 = _sample_create_proposal(
+        "prop-vip-over-cap",
+        expires_at="2026-11-26T18:00:00-08:00",
+        from_session="intake/gmail/vip-thread-2",
+        urgent=True,
+    )
+    vip_prop_2["sender"] = "vip@example.com"
+    write_proposal_atomic(cfg.proposals_pending_dir, vip_prop_2)
+
+    staged_calls: list[dict[str, Any]] = []
+    gate = BriefApprovalGate(
+        cfg,
+        stage_card_fn=lambda **kw: staged_calls.append(kw) or {"decision_id": f"dec-{len(staged_calls)}"},
+        now_fn=lambda: quiet_ts,
+    )
+    res = gate.scan_pending_proposals(now=quiet_ts)
+    assert res["staged"] == 3
+    assert set(res["staged_ids"]) == {
+        "prop-owner-discord",
+        "prop-vip-1",
+        "prop-cal-imminent",
+    }
+    assert res["deferred_quiet_hours"] == 1
+    assert (cfg.proposals_pending_dir / "prop-vip-over-cap.json").is_file()
+
+    budget_json = json.loads(
+        (cfg.state_dir / "delivery_budget.json").read_text(encoding="utf-8")
+    )
+    assert budget_json["days"]["2026-11-24"]["overnight_bypasses"] == 2
+    assert budget_json["days"]["2026-11-24"]["owner_sent"] == 1
 
 
 def test_tamper_detection_refuses_execution_quarantines_and_alerts(tmp_path: Path) -> None:
