@@ -953,39 +953,6 @@ async def on_button_interaction(interaction: discord.Interaction):
                         pass
                 return
 
-            if action_prefix == "forge_dismiss":
-                handler_type = ""
-                try:
-                    import tools.forge
-                    with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
-                        row = conn.execute(
-                            "SELECT handler_type FROM forge_decisions WHERE id = ?",
-                            (decision_id,),
-                        ).fetchone()
-                    handler_type = (row["handler_type"] or "") if row else ""
-                except Exception:
-                    handler_type = ""
-
-                if handler_type == "brief_proposal":
-                    try:
-                        import tools.forge
-                        await interaction.response.send_modal(
-                            tools.forge.BriefProposalDismissModal(
-                                decision_id,
-                                db_path=tools.forge.FORGE_DB_PATH,
-                            )
-                        )
-                    except Exception as me:
-                        try:
-                            is_done = interaction.response.is_done()
-                            if asyncio.iscoroutine(is_done):
-                                is_done = await is_done
-                            if not is_done:
-                                await interaction.response.send_message(f"⚠️ Could not open dismiss modal: {me}", ephemeral=True)
-                        except Exception:
-                            pass
-                    return
-
             try:
                 is_done = interaction.response.is_done()
                 if asyncio.iscoroutine(is_done):

@@ -1055,20 +1055,11 @@ def test_brief_edit_and_dismiss_modals_integration(
         inter_shell_edit.response.send_modal.assert_awaited_once()
         assert isinstance(inter_shell_edit.response.send_modal.call_args[0][0], live_forge.ForgeDecisionEditModal)
 
-        # brief_proposal dismiss opens BriefProposalDismissModal BEFORE defer()
+        # brief_proposal dismiss executes instant 1-tap silent dismiss (Option B) without BriefProposalDismissModal
         inter_brief_dismiss = _make_interaction(f"forge_dismiss:{dec_brief_dismiss}")
         await bridge.on_button_interaction(inter_brief_dismiss)
-        inter_brief_dismiss.response.defer.assert_not_awaited()
-        inter_brief_dismiss.response.send_modal.assert_awaited_once()
-        opened_dismiss_modal = inter_brief_dismiss.response.send_modal.call_args[0][0]
-        assert isinstance(opened_dismiss_modal, live_forge.BriefProposalDismissModal)
-
-        # Submit BriefProposalDismissModal with optional note
-        opened_dismiss_modal.db_path = forge_db
-        opened_dismiss_modal.reason_input._value = "No meetings before 9 AM"
-        submit_dismiss_inter = _make_interaction("modal_submit_dismiss")
-        await opened_dismiss_modal.on_submit(submit_dismiss_inter)
-        submit_dismiss_inter.response.defer.assert_awaited_once()
+        inter_brief_dismiss.response.send_modal.assert_not_awaited()
+        inter_brief_dismiss.response.defer.assert_awaited_once()
         dismissed_row = gate.gate_store.get_proposal("prop-modal-dismiss-submit")
         assert dismissed_row is not None
         assert dismissed_row["status"] == "dismissed"
@@ -1078,7 +1069,14 @@ def test_brief_edit_and_dismiss_modals_integration(
             if r["external_id"] == "gate-receipt:prop-modal-dismiss-submit:dismissed"
         ]
         assert len(dismiss_modal_receipts) == 1
-        assert "No meetings before 9 AM" in dismiss_modal_receipts[0]["body"]
+        assert "status=dismissed" in dismiss_modal_receipts[0]["body"]
+        with live_forge.get_db_connection(forge_db) as conn:
+            dismiss_dec_row = conn.execute(
+                "SELECT receipt_text FROM forge_decisions WHERE id = ?",
+                (dec_brief_dismiss,),
+            ).fetchone()
+        assert dismiss_dec_row is not None
+        assert dismiss_dec_row["receipt_text"] == "Dismissed by user"
 
         # Submit BriefProposalEditModal with readable PT time
         opened_edit_modal.db_path = forge_db
@@ -1105,3 +1103,127 @@ def test_brief_edit_and_dismiss_modals_integration(
         assert shell_row["status"] == "dismissed"
 
     asyncio.run(_exercise_bridge_and_modals())
+
+
+def test_brief_option_b_silent_dismiss_and_edit_modal_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Option B: forge_dismiss is silent 1-tap while forge_edit still opens BriefProposalEditModal."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import tools.bridge as bridge
+    import tools.forge as live_forge
+
+    cfg = _write_gate_config(tmp_path, dry_run=True)
+    forge_db = tmp_path / "forge.db"
+    live_forge.init_forge_db(forge_db)
+    now_ts = _ts_pt(2026, 11, 24, 12, 0)
+
+    for pid, title in (
+        ("prop-optb-dismiss", "Optional Webinar"),
+        ("prop-optb-edit", "Doctor Followup"),
+    ):
+        write_proposal_atomic(
+            cfg.proposals_pending_dir,
+            {
+                "id": pid,
+                "action": "calendar.create",
+                "args": {
+                    "summary": title,
+                    "start": "2026-12-05T11:00:00-08:00",
+                    "end": "2026-12-05T11:30:00-08:00",
+                },
+                "reason": "Extracted from email.",
+                "expires_at": "2026-11-28T18:00:00-08:00",
+                "from_session": f"intake/gmail/{pid}",
+                "urgent": False,
+            },
+        )
+
+    gate = BriefApprovalGate(
+        cfg,
+        stage_card_fn=lambda **kw: live_forge.stage_decision(
+            category=kw["category"],
+            title=kw["title"],
+            summary=kw["summary"],
+            handler_type=kw["handler_type"],
+            payload=kw["payload"],
+            channel_id=kw["channel_id"],
+            ttl_seconds=kw["ttl_seconds"],
+            is_private=kw["is_private"],
+            db_path=forge_db,
+            post_to_discord=False,
+        ),
+        now_fn=lambda: now_ts,
+    )
+    assert gate.scan_pending_proposals(now=now_ts)["staged"] == 2
+    dec_dismiss = gate.gate_store.get_proposal("prop-optb-dismiss")["decision_id"]
+    dec_edit = gate.gate_store.get_proposal("prop-optb-edit")["decision_id"]
+    assert dec_dismiss and dec_edit
+
+    monkeypatch.setattr(live_forge, "FORGE_DB_PATH", forge_db)
+    monkeypatch.setattr(
+        live_forge,
+        "BriefProposalDismissModal",
+        MagicMock(side_effect=AssertionError("BriefProposalDismissModal must not be invoked on forge_dismiss")),
+    )
+
+    async def _run() -> None:
+        fake_view = bridge.discord.ui.View()
+        fake_view.add_item(bridge.discord.ui.Button(label="Approve", custom_id=f"forge_approve:{dec_dismiss}"))
+        fake_view.add_item(bridge.discord.ui.Button(label="Edit", custom_id=f"forge_edit:{dec_dismiss}"))
+        fake_view.add_item(bridge.discord.ui.Button(label="Dismiss", custom_id=f"forge_dismiss:{dec_dismiss}"))
+        monkeypatch.setattr(bridge.discord.ui.View, "from_message", classmethod(lambda _cls, _msg: fake_view))
+
+        msg = MagicMock()
+        msg.edit = AsyncMock()
+        msg.embeds = [MagicMock()]
+
+        inter_dismiss = MagicMock()
+        inter_dismiss.type = bridge.discord.InteractionType.component
+        inter_dismiss.data = {"custom_id": f"forge_dismiss:{dec_dismiss}"}
+        inter_dismiss.user = SimpleNamespace(id=live_forge.OWNER_USER_ID)
+        inter_dismiss.response = MagicMock()
+        inter_dismiss.response.is_done = MagicMock(return_value=False)
+        inter_dismiss.response.send_modal = AsyncMock()
+        inter_dismiss.response.defer = AsyncMock()
+        inter_dismiss.response.send_message = AsyncMock()
+        inter_dismiss.followup = MagicMock()
+        inter_dismiss.followup.send = AsyncMock()
+        inter_dismiss.message = msg
+
+        await bridge.on_button_interaction(inter_dismiss)
+
+        inter_dismiss.response.send_modal.assert_not_awaited()
+        inter_dismiss.response.defer.assert_awaited_once()
+        assert all(getattr(item, "disabled", False) for item in fake_view.children)
+        assert msg.edit.await_count == 2
+        final_edit_kwargs = msg.edit.await_args_list[-1].kwargs
+        assert "embed" in final_edit_kwargs
+        assert (final_edit_kwargs["embed"].title or "").startswith("🛑 ")
+        assert "Dismissed" in (final_edit_kwargs["embed"].footer.text or "")
+
+        row = gate.gate_store.get_proposal("prop-optb-dismiss")
+        assert row is not None
+        assert row["status"] == "dismissed"
+
+        inter_edit = MagicMock()
+        inter_edit.type = bridge.discord.InteractionType.component
+        inter_edit.data = {"custom_id": f"forge_edit:{dec_edit}"}
+        inter_edit.user = SimpleNamespace(id=live_forge.OWNER_USER_ID)
+        inter_edit.response = MagicMock()
+        inter_edit.response.is_done = MagicMock(return_value=False)
+        inter_edit.response.send_modal = AsyncMock()
+        inter_edit.response.defer = AsyncMock()
+        inter_edit.response.send_message = AsyncMock()
+        inter_edit.message = None
+
+        await bridge.on_button_interaction(inter_edit)
+        inter_edit.response.send_modal.assert_awaited_once()
+        assert isinstance(inter_edit.response.send_modal.call_args[0][0], live_forge.BriefProposalEditModal)
+
+    asyncio.run(_run())
+
