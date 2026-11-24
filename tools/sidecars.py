@@ -4,7 +4,7 @@
 
 Implements all scheduled maintenance and monitoring jobs:
 1. Heartbeat Sweep (every 2 hours)
-2. Nightly Triage & Agenda Briefing (daily @ 23:30 PT)
+2. Nightly Triage & Agenda Briefing (daily @ 22:30 PT)
 3. NAS Log Review (nightly @ 22:00 PT)
 4. Plex Transcode Session Cleanup (nightly @ 03:00 PT)
 5. Dated Reminders (daily @ 09:00 PT)

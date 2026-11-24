@@ -133,7 +133,7 @@ DEFAULT_JOBS = [
         "name": "Nightly Triage & Briefing",
         "enabled": True,
         "schedule_type": "daily",
-        "hour_pt": 23,
+        "hour_pt": 22,
         "minute_pt": 30,
         "prompt": "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails.",
         "catchup_if_missed": True,
