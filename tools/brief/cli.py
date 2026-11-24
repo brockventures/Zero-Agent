@@ -20,6 +20,12 @@ from tools.brief.config import (
     is_kill_switch_active,
     set_kill_switch,
 )
+from tools.brief.daemon import (
+    get_daemon_status,
+    run_daemon_loop,
+    start_daemon_background,
+    stop_daemon,
+)
 from tools.brief.harness import DryRunHarness
 from tools.brief.queue import BriefQueue
 from tools.brief.replay import run_replay
@@ -91,12 +97,19 @@ def _cmd_status(args: argparse.Namespace) -> int:
     health = check_brief_health(cfg, queue)
     cursors = _inspect_cursors(cfg.cursors_path)
     kill_active = is_kill_switch_active(cfg)
+    daemon_st = get_daemon_status(cfg)
 
     payload: dict[str, Any] = {
         "channel_id": cfg.channel_id,
         "state_dir": str(cfg.state_dir),
         "memory_dir": str(cfg.memory_dir),
         "db_exists": db_exists,
+        "daemon": {
+            "running": daemon_st["running"],
+            "pid": daemon_st["pid"],
+            "lock_held": daemon_st["lock_held"],
+            "log_file": daemon_st["log_file"],
+        },
         "kill_switch": {
             "active": kill_active,
             "path": str(cfg.kill_switch_path),
@@ -110,9 +123,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
+        daemon_label = (
+            f"RUNNING (PID {daemon_st['pid']})" if daemon_st["running"] else "stopped"
+        )
         print(f"BRIEF Status ({health['checked_at_pt']})")
         print(f"  Channel ID   : {cfg.channel_id}")
         print(f"  State Dir    : {cfg.state_dir}")
+        print(f"  Daemon       : {daemon_label}")
         print(f"  Kill Switch  : {'ACTIVE' if kill_active else 'inactive'}")
         print(
             "  Queue        : "
@@ -296,6 +313,55 @@ def _cmd_kill_switch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    if getattr(args, "dry_run", False):
+        cfg.dry_run = True
+
+    action = args.action
+    if action == "status":
+        st = get_daemon_status(cfg)
+        if args.json:
+            print(json.dumps(st, indent=2, sort_keys=True))
+        else:
+            state_label = f"RUNNING (PID {st['pid']})" if st["running"] else "STOPPED"
+            print(f"BRIEF Daemon : {state_label}")
+            print(f"  State Dir  : {st['state_dir']}")
+            print(f"  Lock Held  : {st['lock_held']}")
+            print(f"  Log File   : {st['log_file']}")
+            print(f"  Quiet Hours: {'active' if st['quiet_hours'] else 'inactive'}")
+            print(f"  Kill Switch: {'ACTIVE' if st['kill_switch_active'] else 'inactive'}")
+        return 0
+    if action == "start":
+        ok = start_daemon_background(cfg)
+        st = get_daemon_status(cfg)
+        print(
+            f"BRIEF daemon started (PID {st['pid']})."
+            if ok
+            else "Failed to start BRIEF daemon."
+        )
+        return 0 if ok else 1
+    if action == "stop":
+        ok = stop_daemon(cfg)
+        print("BRIEF daemon stopped." if ok else "Failed to stop BRIEF daemon.")
+        return 0 if ok else 1
+    if action == "restart":
+        stop_daemon(cfg)
+        time.sleep(0.5)
+        ok = start_daemon_background(cfg)
+        st = get_daemon_status(cfg)
+        print(
+            f"BRIEF daemon restarted (PID {st['pid']})."
+            if ok
+            else "Failed to restart BRIEF daemon."
+        )
+        return 0 if ok else 1
+    if action == "run":
+        ok = run_daemon_loop(cfg, max_ticks=args.max_ticks)
+        return 0 if ok else 1
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the BRIEF operator CLI argument parser."""
     common_subparser_opts = argparse.ArgumentParser(add_help=False)
@@ -421,6 +487,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_ks.add_argument("--reason", default="", help="Optional reason recorded when turning on.")
     p_ks.add_argument("--json", action="store_true", help="Output JSON.")
     p_ks.set_defaults(func=_cmd_kill_switch)
+
+    p_daemon = subparsers.add_parser(
+        "daemon",
+        parents=[common_subparser_opts],
+        help="Start, stop, restart, inspect, or run the BRIEF singleton daemon.",
+    )
+    p_daemon.add_argument(
+        "action",
+        nargs="?",
+        choices=("start", "stop", "restart", "status", "run"),
+        default="status",
+        help="Daemon lifecycle action (default: status).",
+    )
+    p_daemon.add_argument("--json", action="store_true", help="Output JSON (for status).")
+    p_daemon.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Force dry-run mode when running in foreground (`daemon run`).",
+    )
+    p_daemon.add_argument(
+        "--max-ticks",
+        type=int,
+        default=None,
+        help="Maximum ticks to execute in `daemon run` before exiting.",
+    )
+    p_daemon.set_defaults(func=_cmd_daemon)
 
     return parser
 
