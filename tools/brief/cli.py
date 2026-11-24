@@ -14,6 +14,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from tools.brief.actions import (
+    DEFAULT_GOOGLE_OAUTH_PATH,
+    READONLY_OAUTH_SCOPES,
+    WRITE_OAUTH_SCOPES,
+    build_oauth_consent_urls,
+)
 from tools.brief.config import (
     BriefConfig,
     ensure_memory_scaffold,
@@ -22,10 +28,12 @@ from tools.brief.config import (
 )
 from tools.brief.daemon import (
     get_daemon_status,
+    is_quiet_hours,
     run_daemon_loop,
     start_daemon_background,
     stop_daemon,
 )
+from tools.brief.gate import GATE_STATUSES, BriefApprovalGate, BriefGateStore
 from tools.brief.harness import DryRunHarness
 from tools.brief.queue import BriefQueue
 from tools.brief.replay import run_replay
@@ -75,6 +83,33 @@ def _inspect_cursors(cursors_path: Path) -> dict[str, Any]:
     }
 
 
+def _count_pending_proposal_files(pending_dir: Path) -> int:
+    if not pending_dir.is_dir():
+        return 0
+    return sum(
+        1
+        for entry in pending_dir.iterdir()
+        if entry.is_file()
+        and not entry.name.startswith(".")
+        and not entry.name.endswith(".tmp")
+        and entry.suffix.lower() == ".json"
+    )
+
+
+def _inspect_gate_summary(cfg: BriefConfig) -> dict[str, Any]:
+    gate_db_exists = cfg.gate_db_path.is_file()
+    if gate_db_exists:
+        counts = BriefGateStore(cfg.gate_db_path).get_status_counts()
+    else:
+        counts = {status: 0 for status in GATE_STATUSES}
+    return {
+        "db_exists": gate_db_exists,
+        "pending_files": _count_pending_proposal_files(cfg.proposals_pending_dir),
+        **counts,
+        "total": sum(counts.values()),
+    }
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     cfg = _load_runtime_config(args)
     queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
@@ -96,6 +131,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     health = check_brief_health(cfg, queue)
     cursors = _inspect_cursors(cfg.cursors_path)
+    gate_summary = _inspect_gate_summary(cfg)
     kill_active = is_kill_switch_active(cfg)
     daemon_st = get_daemon_status(cfg)
 
@@ -115,6 +151,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "path": str(cfg.kill_switch_path),
         },
         "queue": queue_stats,
+        "gate": gate_summary,
         "sessions": sessions,
         "cursors": cursors,
         "health": health,
@@ -136,6 +173,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
             f"pending={queue_stats['pending']} delivering={queue_stats['delivering']} "
             f"done={queue_stats['done']} dropped={queue_stats['dropped']} "
             f"failed={queue_stats['failed']} total={queue_stats['total']}"
+        )
+        print(
+            "  Gate         : "
+            f"staged={gate_summary['staged']} executed={gate_summary['executed']} "
+            f"edited_executed={gate_summary['edited_executed']} "
+            f"dismissed={gate_summary['dismissed']} expired={gate_summary['expired']} "
+            f"tampered={gate_summary['tampered']} pending_files={gate_summary['pending_files']}"
         )
         print(f"  Sessions     : {len(sessions)}")
         print(
@@ -362,6 +406,137 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_gate_status(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    if cfg.gate_db_path.is_file():
+        status_payload = BriefApprovalGate(cfg).get_gate_status()
+    else:
+        counts = {status: 0 for status in GATE_STATUSES}
+        status_payload = {
+            **counts,
+            "total": 0,
+            "counts": counts,
+            "pending_files": _count_pending_proposal_files(cfg.proposals_pending_dir),
+            "staged_proposals": [],
+            "quiet_hours": is_quiet_hours(cfg),
+            "dry_run": bool(cfg.dry_run),
+            "allow_shared_oauth_fallback": bool(cfg.gate_allow_shared_oauth_fallback),
+            "write_token_configured": Path(cfg.gate_write_token_path).is_file(),
+        }
+
+    if args.json:
+        print(json.dumps(status_payload, indent=2, sort_keys=True))
+    else:
+        print("BRIEF Approval Gate Status")
+        print(f"  Gate DB        : {cfg.gate_db_path} ({'present' if cfg.gate_db_path.is_file() else 'missing'})")
+        print(f"  Pending Files  : {status_payload['pending_files']}")
+        print(
+            "  Counts         : "
+            f"staged={status_payload['staged']} executed={status_payload['executed']} "
+            f"edited_executed={status_payload['edited_executed']} "
+            f"dismissed={status_payload['dismissed']} expired={status_payload['expired']} "
+            f"rejected={status_payload['rejected']} tampered={status_payload['tampered']} "
+            f"failed={status_payload['failed']}"
+        )
+        print(f"  Write Token    : {'configured' if status_payload['write_token_configured'] else 'missing'}")
+        print(f"  Shared Fallback: {'enabled' if status_payload['allow_shared_oauth_fallback'] else 'disabled'}")
+        print(f"  Quiet Hours    : {'active' if status_payload['quiet_hours'] else 'inactive'}")
+        for item in status_payload["staged_proposals"]:
+            print(
+                f"    - {item['id']} [{item['action']}] session={item['from_session']} "
+                f"decision={item.get('decision_id') or '-'} expires={item['expires_at_pt']}"
+            )
+    return 0
+
+
+def _cmd_gate_scan(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    if args.dry_run:
+        cfg.dry_run = True
+
+    if is_kill_switch_active(cfg):
+        print(
+            json.dumps(
+                {
+                    "status": "skipped",
+                    "reason": "kill_switch_active",
+                    "expired": [],
+                    "scanned": 0,
+                    "staged": 0,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    gate = BriefApprovalGate(cfg)
+    expired_ids = gate.expire_stale_proposals()
+    scan_res = gate.scan_pending_proposals()
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "expired_ids": expired_ids,
+                **scan_res,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _cmd_gate_approve(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    if args.dry_run:
+        cfg.dry_run = True
+    gate = BriefApprovalGate(cfg)
+    res = gate.approve_proposal(args.proposal_id)
+    print(json.dumps(res, indent=2, sort_keys=True))
+    return 0 if res.get("ok") else 1
+
+
+def _cmd_gate_dismiss(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    gate = BriefApprovalGate(cfg)
+    res = gate.dismiss_proposal(args.proposal_id, note=args.note or "")
+    print(json.dumps(res, indent=2, sort_keys=True))
+    return 0 if res.get("ok") else 1
+
+
+def _cmd_mint_oauth_urls(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    try:
+        urls = build_oauth_consent_urls(
+            args.oauth_client_path,
+            redirect_uri=args.redirect_uri,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(f"Error building Google OAuth consent URLs: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "oauth_client_path": str(args.oauth_client_path),
+        "redirect_uri": args.redirect_uri,
+        "readonly_scopes": READONLY_OAUTH_SCOPES,
+        "write_scopes": WRITE_OAUTH_SCOPES,
+        "write_token_path": str(cfg.gate_write_token_path),
+        **urls,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print("BRIEF Google OAuth Split-Credential Consent URLs")
+        print(f"  Client File   : {args.oauth_client_path}")
+        print(f"  Read-Only Scopes : {READONLY_OAUTH_SCOPES}")
+        print(f"  Read-Only URL    : {urls['readonly_url']}")
+        print(f"  Write-Only Scopes: {WRITE_OAUTH_SCOPES}")
+        print(f"  Write Token Dest : {cfg.gate_write_token_path}")
+        print(f"  Write-Only URL   : {urls['write_url']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the BRIEF operator CLI argument parser."""
     common_subparser_opts = argparse.ArgumentParser(add_help=False)
@@ -513,6 +688,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum ticks to execute in `daemon run` before exiting.",
     )
     p_daemon.set_defaults(func=_cmd_daemon)
+
+    p_gate_status = subparsers.add_parser(
+        "gate-status",
+        parents=[common_subparser_opts],
+        help="Inspect BRIEF Approval Gate proposal counts and staged proposals.",
+    )
+    p_gate_status.add_argument("--json", action="store_true", help="Output JSON.")
+    p_gate_status.set_defaults(func=_cmd_gate_status)
+
+    p_gate_scan = subparsers.add_parser(
+        "gate-scan",
+        parents=[common_subparser_opts],
+        help="Expire stale proposals and scan proposals/pending/*.json to stage Decision Cards.",
+    )
+    p_gate_scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Stage cards without posting to Discord.",
+    )
+    p_gate_scan.set_defaults(func=_cmd_gate_scan)
+
+    p_gate_approve = subparsers.add_parser(
+        "gate-approve",
+        parents=[common_subparser_opts],
+        help="Approve and execute a staged BRIEF proposal after SHA-256 verification.",
+    )
+    p_gate_approve.add_argument("proposal_id", help="Proposal ID to approve and execute.")
+    p_gate_approve.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Return synthetic dry-run receipt without calling Google Calendar API.",
+    )
+    p_gate_approve.set_defaults(func=_cmd_gate_approve)
+
+    p_gate_dismiss = subparsers.add_parser(
+        "gate-dismiss",
+        parents=[common_subparser_opts],
+        help="Dismiss a staged BRIEF proposal and emit an internal receipt.",
+    )
+    p_gate_dismiss.add_argument("proposal_id", help="Proposal ID to dismiss.")
+    p_gate_dismiss.add_argument("--note", default="", help="Optional owner preference note.")
+    p_gate_dismiss.set_defaults(func=_cmd_gate_dismiss)
+
+    p_mint_oauth = subparsers.add_parser(
+        "mint-oauth-urls",
+        parents=[common_subparser_opts],
+        help="Print narrow-scoped Google OAuth consent URLs (read-only vs calendar.events write).",
+    )
+    p_mint_oauth.add_argument(
+        "--oauth-client-path",
+        type=Path,
+        default=DEFAULT_GOOGLE_OAUTH_PATH,
+        help="Path to Google OAuth client JSON (default: /secrets/google_oauth.json).",
+    )
+    p_mint_oauth.add_argument(
+        "--redirect-uri",
+        default="http://localhost",
+        help="OAuth redirect URI (default: http://localhost).",
+    )
+    p_mint_oauth.add_argument("--json", action="store_true", help="Output JSON.")
+    p_mint_oauth.set_defaults(func=_cmd_mint_oauth_urls)
 
     return parser
 

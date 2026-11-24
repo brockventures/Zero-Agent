@@ -10403,6 +10403,20 @@ def _ensure_decision_action_clarity(
     elif handler == "forge_enqueue":
         title = p.get("title") or p.get("plan_file") or "build"
         action_text = f"Enqueue FORGE build `{title}`"
+    elif handler == "brief_proposal":
+        cal_action = str(p.get("action") or "").strip()
+        cal_args = p.get("args") if isinstance(p.get("args"), dict) else {}
+        cal_summary = str(cal_args.get("summary") or "").strip()
+        cal_event_id = str(cal_args.get("event_id") or "").strip()
+        if cal_action == "calendar.create":
+            label = cal_summary or "New Event"
+            action_text = f"Create Google Calendar event `{label}` via BRIEF Approval Gate"
+        elif cal_action == "calendar.update":
+            label = cal_summary or cal_event_id or "event"
+            action_text = f"Update Google Calendar event `{label}` via BRIEF Approval Gate"
+        else:
+            proposal_ref = str(p.get("proposal_id") or cal_action or "calendar").strip()
+            action_text = f"Execute BRIEF proposal `{proposal_ref}` via BRIEF Approval Gate"
     elif handler in ("noop", "approval"):
         action_text = str(p.get("action") or p.get("receipt") or p.get("note") or "Approve requested action")
     elif p.get("action"):
@@ -10430,11 +10444,13 @@ def _resolve_decision_channel(channel_id: int) -> tuple[int, Optional[int]]:
     except (ValueError, TypeError):
         return ZERO_CHAT_CHANNEL_ID, None
 
+    BRIEF_CHANNEL_ID = 1574655816236269569
     home_turf_ids: set[int] = {
         ZERO_CHAT_CHANNEL_ID,
         ZERO_OPS_CHANNEL_ID,
         FORGE_CHANNEL_ID,
         BASEBALL_CHANNEL_ID,
+        BRIEF_CHANNEL_ID,
     }
     try:
         from tools.bridge_state import (
@@ -10834,7 +10850,8 @@ def execute_approval_card(
             if cur.rowcount == 0:
                 return {"ok": False, "error": f"Decision {decision_id} is already executing."}
 
-        payload = override_payload if override_payload is not None else json.loads(row["payload_json"] or "{}")
+        original_payload = json.loads(row["payload_json"] or "{}")
+        payload = override_payload if override_payload is not None else original_payload
         if override_payload is not None:
             conn.execute(
                 "UPDATE forge_decisions SET payload_json = ? WHERE id = ?",
@@ -11007,6 +11024,26 @@ def execute_approval_card(
                 else:
                     receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
 
+        elif handler == "brief_proposal":
+            from tools.brief.gate import handle_forge_decision_approve
+
+            gate_res = handle_forge_decision_approve(original_payload, edited_payload=override_payload)
+            ok = bool(gate_res.get("ok"))
+            if ok:
+                rec = gate_res.get("receipt") if isinstance(gate_res.get("receipt"), dict) else {}
+                pid = str(gate_res.get("proposal_id") or original_payload.get("proposal_id") or "")
+                cal_action = str(gate_res.get("action") or original_payload.get("action") or "calendar")
+                event_id = str(rec.get("event_id") or "")
+                summary_txt = str(rec.get("summary") or "")
+                dry_tag = " [DRY-RUN]" if rec.get("dry_run") else ""
+                details = summary_txt or event_id or pid
+                receipt = f"BRIEF `{cal_action}`{dry_tag} executed (`{details}`, event_id=`{event_id}`)"
+            else:
+                receipt = str(
+                    gate_res.get("error")
+                    or f"BRIEF gate execution failed ({gate_res.get('status', 'error')})"
+                )
+
         elif (handler or "").strip().lower() in ("noop", "approval"):
             ok = False
             receipt = f"Unsupported no-op handler_type: {handler} (Decision Cards must execute a real action)"
@@ -11110,6 +11147,14 @@ def dismiss_decision(
                 "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
                 "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
             }
+
+    if row["handler_type"] == "brief_proposal":
+        try:
+            from tools.brief.gate import handle_forge_decision_dismiss
+
+            handle_forge_decision_dismiss(json.loads(row["payload_json"] or "{}"))
+        except Exception:
+            pass
 
     return {
         "ok": True,

@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -31,7 +31,11 @@ from tools.brief.config import (
     BriefConfig,
     ensure_memory_scaffold,
     is_kill_switch_active,
+    touch_heartbeat,
 )
+
+if TYPE_CHECKING:
+    from tools.brief.gate import BriefApprovalGate
 from tools.brief.harness import DryRunHarness
 from tools.brief.queue import BriefQueue
 from tools.brief.router import BriefRouter
@@ -578,6 +582,7 @@ class BriefDaemonRunner:
         calendar_watcher: CalendarWatcher | None = None,
         router: BriefRouter | None = None,
         delivery_gate: BriefDeliveryGate | None = None,
+        approval_gate: BriefApprovalGate | None = None,
         watchdog_fn: Callable[..., dict[str, Any]] | None = None,
         now_fn: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
@@ -623,6 +628,16 @@ class BriefDaemonRunner:
             config,
             now_fn=self._now_fn,
         )
+        if approval_gate is not None:
+            self.approval_gate = approval_gate
+        else:
+            from tools.brief.gate import BriefApprovalGate
+
+            self.approval_gate = BriefApprovalGate(
+                config,
+                queue=self.queue,
+                now_fn=self._now_fn,
+            )
         self._watchdog_fn = watchdog_fn or run_watchdog
 
         self._last_gmail_at: float | None = None
@@ -689,6 +704,7 @@ class BriefDaemonRunner:
             "gmail": None,
             "calendar": None,
             "flushed": None,
+            "gate": None,
             "routed": 0,
             "delivered": 0,
             "outcomes": [],
@@ -761,6 +777,22 @@ class BriefDaemonRunner:
             summary["routed"] = len(outcomes)
             summary["delivered"] = delivered_count
             summary["outcomes"] = outcomes
+
+            try:
+                expired_ids = self.approval_gate.expire_stale_proposals(now=now_ts)
+                scan_res = self.approval_gate.scan_pending_proposals(now=now_ts)
+                touch_heartbeat(self.config.heartbeats_dir, "gate", now=now_ts)
+                summary["gate"] = {
+                    **scan_res,
+                    "expired_staged_ids": expired_ids,
+                    "expired_ids": list(
+                        dict.fromkeys([*expired_ids, *scan_res.get("expired_ids", [])])
+                    ),
+                    "expired": len(expired_ids) + int(scan_res.get("expired", 0)),
+                }
+            except Exception as exc:
+                logger.exception("BriefApprovalGate tick failed")
+                errors["gate"] = str(exc)
 
         if self._is_due(self._last_watchdog_at, _WATCHDOG_INTERVAL_SECONDS, now_ts):
             self._last_watchdog_at = now_ts
