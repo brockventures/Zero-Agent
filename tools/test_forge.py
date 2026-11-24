@@ -7077,5 +7077,52 @@ def test_execute_decision_fails_legacy_noop_and_approval_cards(tmp_path):
         assert row["receipt_text"] == res["receipt"]
 
 
+def test_promote_and_push_other_build_repos_promotes_and_pushes_all_earlier_repos(tmp_path):
+    """Verify multi-repo build promotion advances default_branch and pushes to origin in earlier repos."""
+    def _init_repo_with_origin(name: str) -> tuple[Path, Path]:
+        origin = tmp_path / f"{name}-origin.git"
+        repo = tmp_path / name
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=str(repo), check=True)
+        (repo / "README.md").write_text("init\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=str(repo), check=True, capture_output=True)
+        return repo, origin
+
+    repo_a, origin_a = _init_repo_with_origin("repo-a")
+    release_ref = "forge/release-fg-multirepo-1"
+
+    # Simulate Chunk 0 merging into forge/release-<build_id> in Repo A while main stays behind
+    subprocess.run(["git", "checkout", "-b", release_ref], cwd=str(repo_a), check=True, capture_output=True)
+    (repo_a / "chunk0.txt").write_text("from chunk 0\n", encoding="utf-8")
+    subprocess.run(["git", "add", "chunk0.txt"], cwd=str(repo_a), check=True)
+    subprocess.run(["git", "commit", "-m", "feat: chunk 0 in repo a"], cwd=str(repo_a), check=True, capture_output=True)
+    chunk0_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_a), check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "checkout", "main"], cwd=str(repo_a), check=True, capture_output=True)
+
+    # Confirm main and origin/main do NOT yet have chunk0_sha
+    assert subprocess.run(["git", "rev-parse", "main"], cwd=str(repo_a), check=True, capture_output=True, text=True).stdout.strip() != chunk0_sha
+
+    logs: list[str] = []
+    err = forge_mod._promote_and_push_other_build_repos(
+        [repo_a],
+        release_ref,
+        {"propagate_branches_json": json.dumps(["release-preview"])},
+        log_fn=logs.append,
+    )
+    assert err is None
+    assert any("promoted" in line for line in logs)
+
+    # Local main, origin main, and propagated branch in Repo A must all now be at chunk0_sha
+    assert subprocess.run(["git", "rev-parse", "main"], cwd=str(repo_a), check=True, capture_output=True, text=True).stdout.strip() == chunk0_sha
+    assert subprocess.run(["git", "rev-parse", "refs/heads/main"], cwd=str(origin_a), check=True, capture_output=True, text=True).stdout.strip() == chunk0_sha
+    assert subprocess.run(["git", "rev-parse", "release-preview"], cwd=str(repo_a), check=True, capture_output=True, text=True).stdout.strip() == chunk0_sha
+    assert (repo_a / "chunk0.txt").read_text(encoding="utf-8") == "from chunk 0\n"
+
+
 if __name__ == "__main__":
     unittest.main()

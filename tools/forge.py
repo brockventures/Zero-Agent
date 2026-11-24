@@ -7964,6 +7964,186 @@ def _propagate_build_branches(
     return propagated
 
 
+def _promote_and_push_other_build_repos(
+    other_repo_dirs: list[Path],
+    base_ref: str,
+    build_row: Any,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """Promote and push forge/release-<build_id> into default_branch for earlier repos in a multi-repo build.
+
+    Returns None on success across all repos, or an error string if any repo fails promotion or push.
+    """
+    for other_repo in other_repo_dirs:
+        rp = Path(other_repo).resolve()
+        if not (rp / ".git").exists():
+            continue
+        other_lk = _acquire_repo_git_lock(rp)
+        try:
+            verify_ref = subprocess.run(
+                ["git", "rev-parse", "--verify", f"refs/heads/{base_ref}"],
+                cwd=str(rp),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if verify_ref.returncode != 0 or not verify_ref.stdout.strip():
+                continue
+            ref_sha = verify_ref.stdout.strip()
+            other_default = _get_repo_default_branch(rp)
+            _prepare_clean_repo_and_sync_base(rp, other_default, before_merge=True)
+
+            final_ref = ref_sha
+            sync_err = ""
+            try:
+                cur_b = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=str(rp),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                ).stdout.strip()
+                anc_main = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", other_default, ref_sha],
+                    cwd=str(rp),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if anc_main.returncode == 0:
+                    if cur_b == other_default:
+                        ff_proc = subprocess.run(
+                            ["git", "merge", "--ff-only", ref_sha],
+                            cwd=str(rp),
+                            capture_output=True,
+                            text=True,
+                            timeout=20,
+                        )
+                        if ff_proc.returncode != 0:
+                            cp_proc = subprocess.run(
+                                ["git", "cherry-pick", f"{other_default}..{ref_sha}"],
+                                cwd=str(rp),
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
+                            if cp_proc.returncode != 0:
+                                subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(rp), capture_output=True, timeout=10)
+                                cp_err = f"{cp_proc.stdout}\n{cp_proc.stderr}".strip()
+                                sync_err = (
+                                    f"Multi-repo promote ({rp}): git cherry-pick {other_default}..{base_ref} conflicted:\n"
+                                    f"{cp_err[-1400:]}"
+                                )
+                            else:
+                                new_head = subprocess.run(
+                                    ["git", "rev-parse", "HEAD"],
+                                    cwd=str(rp),
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10,
+                                )
+                                if new_head.returncode == 0 and new_head.stdout.strip():
+                                    final_ref = new_head.stdout.strip()
+                    else:
+                        ff_fetch = subprocess.run(
+                            ["git", "fetch", ".", f"{ref_sha}:refs/heads/{other_default}"],
+                            cwd=str(rp),
+                            capture_output=True,
+                            text=True,
+                            timeout=20,
+                        )
+                        if ff_fetch.returncode != 0:
+                            ff_err = f"{ff_fetch.stdout}\n{ff_fetch.stderr}".strip()
+                            sync_err = (
+                                f"Multi-repo promote ({rp}): fast-forward update of {other_default} failed:\n"
+                                f"{ff_err[-1400:]}"
+                            )
+                else:
+                    if cur_b == other_default:
+                        cp_proc = subprocess.run(
+                            ["git", "cherry-pick", f"{other_default}..{ref_sha}"],
+                            cwd=str(rp),
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        if cp_proc.returncode != 0:
+                            subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(rp), capture_output=True, timeout=10)
+                            cp_err = f"{cp_proc.stdout}\n{cp_proc.stderr}".strip()
+                            sync_err = (
+                                f"Multi-repo promote ({rp}): git cherry-pick {other_default}..{base_ref} onto diverged {other_default} conflicted:\n"
+                                f"{cp_err[-1400:]}"
+                            )
+                        else:
+                            new_head = subprocess.run(
+                                ["git", "rev-parse", "HEAD"],
+                                cwd=str(rp),
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                            )
+                            if new_head.returncode == 0 and new_head.stdout.strip():
+                                final_ref = new_head.stdout.strip()
+                    else:
+                        sync_err = (
+                            f"Multi-repo promote ({rp}): cannot cherry-pick diverged {base_ref} into {other_default} "
+                            f"while repo HEAD is on {cur_b}."
+                        )
+            except Exception as e:
+                subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(rp), capture_output=True, timeout=10)
+                sync_err = f"Multi-repo promote ({rp}) failed/timed out: {e}"
+
+            if sync_err:
+                if log_fn:
+                    log_fn(sync_err)
+                return sync_err
+
+            subprocess.run(
+                ["git", "branch", "-f", base_ref, final_ref],
+                cwd=str(rp),
+                capture_output=True,
+                timeout=10,
+            )
+
+            has_origin = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(rp),
+                capture_output=True,
+                timeout=10,
+            ).returncode == 0
+            if has_origin:
+                try:
+                    push_cmd, push_env = _build_git_push_args_and_env(rp, remote="origin", branch=other_default)
+                    push_proc = subprocess.run(
+                        push_cmd,
+                        cwd=str(rp),
+                        env=push_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    if push_proc.returncode != 0:
+                        p_err = f"{push_proc.stdout}\n{push_proc.stderr}".strip()
+                        err_msg = (
+                            f"Multi-repo promote ({rp}): git push origin {other_default} failed (exit {push_proc.returncode}):\n"
+                            f"{p_err[-1400:]}"
+                        )
+                        if log_fn:
+                            log_fn(err_msg)
+                        return err_msg
+                except Exception as pe:
+                    err_msg = f"Multi-repo promote ({rp}): git push origin {other_default} failed/timed out: {pe}"
+                    if log_fn:
+                        log_fn(err_msg)
+                    return err_msg
+
+            _propagate_build_branches(rp, base_ref, build_row)
+            if log_fn:
+                log_fn(f"Multi-repo promote ({rp}): promoted {base_ref} -> {other_default} ({final_ref[:8]})")
+        finally:
+            _release_file_lock(other_lk)
+    return None
+
+
 def _get_build_target_pairs(
     conn: sqlite3.Connection,
     build_id: str,
@@ -9129,6 +9309,8 @@ class ForgeSupervisor:
                 conflict_retry = False
                 push_failed_err: Optional[str] = None
                 remaining = 1
+                pending_finalize_multi_repo = False
+                other_repo_dirs: list[Path] = []
                 git_lk = _acquire_repo_git_lock(repo_dir)
                 try:
                     diff_proc = subprocess.run(
@@ -9423,25 +9605,68 @@ class ForgeSupervisor:
                         _unlock_and_remove_chunk_worktree(repo_dir, wt_dir)
 
                         if not push_failed_err:
-                            with self._state_lock, get_db_connection(self.db_path) as conn:
-                                conn.execute(
-                                    "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, live_status = '', last_error = '' WHERE id = ?",
-                                    (branch_name, diff_stat, time.time(), chunk_id),
-                                )
-                                remaining = conn.execute(
-                                    "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND status != 'merged'",
-                                    (build_id,),
-                                ).fetchone()["cnt"]
-                                if remaining == 0:
+                            if other_unmerged == 0 and not has_stacked_branches:
+                                # Collect earlier distinct chunk repos so we promote & push them after releasing repo_dir lock.
+                                seen_resolved = {repo_dir.resolve()}
+                                with self._state_lock, get_db_connection(self.db_path) as conn:
+                                    repo_rows = conn.execute(
+                                        "SELECT repo FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+                                        (build_id,),
+                                    ).fetchall()
+                                for rr in repo_rows:
+                                    raw_r = str((rr["repo"] if rr["repo"] else build["repo"]) or "/workspace").strip()
+                                    cand_path = Path(raw_r).resolve()
+                                    if cand_path not in seen_resolved and (cand_path / ".git").exists():
+                                        seen_resolved.add(cand_path)
+                                        other_repo_dirs.append(cand_path)
+                                pending_finalize_multi_repo = True
+                            else:
+                                with self._state_lock, get_db_connection(self.db_path) as conn:
                                     conn.execute(
-                                        "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
-                                        (time.time(), build_id),
+                                        "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, live_status = '', last_error = '' WHERE id = ?",
+                                        (branch_name, diff_stat, time.time(), chunk_id),
                                     )
-
-                            if remaining == 0 and not has_stacked_branches:
-                                _propagate_build_branches(repo_dir, base_ref, build)
+                                    remaining = conn.execute(
+                                        "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND status != 'merged'",
+                                        (build_id,),
+                                    ).fetchone()["cnt"]
+                                    if remaining == 0:
+                                        conn.execute(
+                                            "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+                                            (time.time(), build_id),
+                                        )
                 finally:
                     _release_file_lock(git_lk)
+
+                if pending_finalize_multi_repo and not conflict_retry and not push_failed_err:
+                    if other_repo_dirs:
+                        other_err = _promote_and_push_other_build_repos(
+                            other_repo_dirs,
+                            base_ref,
+                            build,
+                            log_fn=lambda m: _log_build(f"[Attempt {attempt}/{max_attempts}] {m}"),
+                        )
+                        if other_err:
+                            push_failed_err = other_err
+
+                    if not push_failed_err:
+                        with self._state_lock, get_db_connection(self.db_path) as conn:
+                            conn.execute(
+                                "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, live_status = '', last_error = '' WHERE id = ?",
+                                (branch_name, diff_stat, time.time(), chunk_id),
+                            )
+                            remaining = conn.execute(
+                                "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND status != 'merged'",
+                                (build_id,),
+                            ).fetchone()["cnt"]
+                            if remaining == 0:
+                                conn.execute(
+                                    "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+                                    (time.time(), build_id),
+                                )
+
+                        if remaining == 0:
+                            _propagate_build_branches(repo_dir, base_ref, build)
 
                 if conflict_retry:
                     continue
