@@ -7263,5 +7263,196 @@ def test_agora_ticker_heal_checks_nvme_and_tmp_worktrees(tmp_path, monkeypatch):
         shutil.rmtree(tmp_wt, ignore_errors=True)
 
 
+def test_isolation_is_prod_forge_env_and_temp_path_guards(tmp_path, monkeypatch):
+    """Verify _is_temp_path and _is_prod_forge_env prevent test runs or /tmp DBs from being treated as production."""
+    tmp_db = tmp_path / "forge.db"
+    forge_mod.init_forge_db(tmp_db)
+
+    assert forge_mod._is_temp_path(tmp_db) is True
+    assert forge_mod._is_temp_path("/tmp/ephemeral_forge.db") is True
+    assert forge_mod._is_temp_path("/workspace/data/forge.db") is False
+    assert forge_mod._is_temp_path("") is False
+
+    # Monkeypatch FORGE_DB_PATH to tmp_db WITHOUT monkeypatching TASKS_DIR (Root Cause 1 reproduction)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", tmp_db)
+    assert forge_mod._is_prod_forge_env(tmp_db) is False
+    assert forge_mod._is_prod_forge_env() is False
+
+    # Even if FORGE_ALLOW_PROD_IN_TESTS is set, a /tmp DB path must still return False
+    monkeypatch.setenv("FORGE_ALLOW_PROD_IN_TESTS", "1")
+    assert forge_mod._is_prod_forge_env(tmp_db) is False
+    assert forge_mod._is_prod_forge_env() is False
+
+    # With FORGE_ALLOW_PROD_IN_TESTS unset, even a non-temp path returns False under PYTEST_CURRENT_TEST
+    monkeypatch.delenv("FORGE_ALLOW_PROD_IN_TESTS", raising=False)
+    non_temp_db = Path("/workspace/data/forge.db")
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", non_temp_db)
+    assert forge_mod._is_prod_forge_env(non_temp_db) is False
+
+
+def test_isolation_consolidate_legacy_forge_db_refuses_non_temp_legacy(tmp_path, monkeypatch):
+    """Verify consolidate_legacy_forge_db resolves defaults dynamically and refuses to unlink/symlink non-temp legacy DBs."""
+    pri = tmp_path / "primary_forge.db"
+    leg_dir = tmp_path / "simulated_non_temp_data"
+    leg_dir.mkdir(parents=True)
+    leg = leg_dir / "forge.db"
+    forge_mod.init_forge_db(pri)
+    forge_mod.init_forge_db(leg)
+
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", pri)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", leg_dir)
+
+    # 1. Primary is temp, legacy is treated as non-temp -> refused_temp_primary (and legacy_db_path=None resolves from DATA_DIR)
+    orig_is_temp = forge_mod._is_temp_path
+    monkeypatch.setattr(
+        forge_mod,
+        "_is_temp_path",
+        lambda p: False if Path(p) == leg else orig_is_temp(p),
+    )
+    res = forge_mod.consolidate_legacy_forge_db()
+    assert res["symlinked"] is False
+    assert res["status"] == "refused_temp_primary"
+    assert leg.exists() and not leg.is_symlink()
+
+    # 2. Synthetic non-existent non-temp legacy path is refused before .exists() check
+    synthetic_legacy = Path("/workspace/nonexistent_dir/forge.db")
+    res_synth = forge_mod.consolidate_legacy_forge_db(primary_db_path=pri, legacy_db_path=synthetic_legacy)
+    assert res_synth["symlinked"] is False
+    assert res_synth["status"] == "refused_temp_primary"
+
+    # 3. Both primary and legacy treated as non-temp under PYTEST_CURRENT_TEST -> refused_pytest_prod_legacy
+    monkeypatch.setattr(forge_mod, "_is_temp_path", lambda p: False)
+    res_pytest = forge_mod.consolidate_legacy_forge_db(primary_db_path=pri, legacy_db_path=leg)
+    assert res_pytest["symlinked"] is False
+    assert res_pytest["status"] == "refused_pytest_prod_legacy"
+    assert leg.exists() and not leg.is_symlink()
+
+
+def test_isolation_reconcile_forge_on_boot_skips_consolidate_on_tmp_db(tmp_path, monkeypatch):
+    """Verify reconcile_forge_on_boot(db_path=tmp_db) with FORGE_DB_PATH=tmp_db never invokes consolidate_legacy_forge_db."""
+    tmp_db = tmp_path / "forge.db"
+    forge_mod.init_forge_db(tmp_db)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", tmp_db)
+
+    called = []
+    monkeypatch.setattr(
+        forge_mod,
+        "consolidate_legacy_forge_db",
+        lambda *a, **kw: called.append((a, kw)) or {"symlinked": False},
+    )
+
+    res = forge_mod.reconcile_forge_on_boot(db_path=tmp_db)
+    assert isinstance(res, dict)
+    assert called == []
+
+
+def test_live_discord_blocked_guards_unmocked_requests_under_pytest(tmp_path, monkeypatch):
+    """Verify _is_live_discord_blocked blocks real requests.* calls under pytest while allowing MagicMock/custom mocks."""
+    tmp_db = tmp_path / "forge.db"
+    forge_mod.init_forge_db(tmp_db)
+    monkeypatch.delenv("FORGE_ALLOW_LIVE_DISCORD_IN_TESTS", raising=False)
+
+    assert forge_mod._is_live_discord_blocked(forge_mod.requests.get) is True
+    assert forge_mod._is_live_discord_blocked(forge_mod.requests.post) is True
+    assert forge_mod._is_live_discord_blocked(forge_mod.requests.patch) is True
+    assert forge_mod._is_live_discord_blocked(forge_mod.requests.put) is True
+    assert forge_mod._is_live_discord_blocked(forge_mod.requests.delete) is True
+
+    assert forge_mod._is_live_discord_blocked(MagicMock()) is False
+    assert forge_mod._is_live_discord_blocked(lambda *a, **kw: None) is False
+
+    # Fail test immediately if any underlying HTTP request via Session.request is ever attempted
+    monkeypatch.setattr(
+        forge_mod.requests.sessions.Session,
+        "request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Unmocked live Discord HTTP request fired!")),
+    )
+
+    # 1. _get_vulcan_webhook returns None without hitting network even if _is_prod_forge_env is forced True
+    monkeypatch.setattr(forge_mod, "_is_prod_forge_env", lambda *a, **kw: True)
+    monkeypatch.setattr(forge_mod, "VULCAN_WEBHOOK_CACHE_PATHS", (tmp_path / "no_webhook_cache.json",))
+    assert forge_mod._get_vulcan_webhook(db_path=tmp_db) is None
+
+    # 2. _post_forge_channel_message and _patch_forge_channel_message return safe no-ops with bot token
+    assert (
+        forge_mod._post_forge_channel_message(
+            {"content": "test"},
+            forge_mod.FORGE_CHANNEL_ID,
+            token="fake-bot-token",
+            db_path=tmp_db,
+        )
+        is None
+    )
+    assert (
+        forge_mod._patch_forge_channel_message(
+            123456789,
+            {"content": "test"},
+            forge_mod.FORGE_CHANNEL_ID,
+            token="fake-bot-token",
+            db_path=tmp_db,
+        )
+        == (False, 0)
+    )
+
+    # Also verify webhook branch in _post_forge_channel_message and _patch_forge_channel_message is blocked
+    monkeypatch.setattr(
+        forge_mod,
+        "_get_vulcan_webhook",
+        lambda *a, **kw: {"id": "111", "token": "tok", "name": "Vulcan"},
+    )
+    assert (
+        forge_mod._post_forge_channel_message(
+            {"content": "test"},
+            forge_mod.FORGE_CHANNEL_ID,
+            token="fake-bot-token",
+            db_path=tmp_db,
+        )
+        is None
+    )
+    assert (
+        forge_mod._patch_forge_channel_message(
+            123456789,
+            {"content": "test"},
+            forge_mod.FORGE_CHANNEL_ID,
+            token="fake-bot-token",
+            db_path=tmp_db,
+        )
+        == (False, 0)
+    )
+
+    # 3. _post_decision_card_rest returns None without calling requests.post
+    staged = forge_mod.stage_decision(
+        category="ops",
+        title="Test Isolation Decision",
+        summary="Verify live Discord guard.",
+        handler_type="command",
+        payload={"command": "echo ok"},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=tmp_db,
+        post_to_discord=False,
+    )
+    did = staged["decision_id"] if isinstance(staged, dict) else str(staged)
+    assert forge_mod._post_decision_card_rest(did, db_path=tmp_db, token="fake-bot-token") is None
+
+    # 4. _merge_remote_active_embeds_into_header and _sweep_stale_forge_channel_embeds return safe no-ops
+    assert (
+        forge_mod._merge_remote_active_embeds_into_header(
+            "Header Content",
+            forge_mod.FORGE_CHANNEL_ID,
+            "fake-bot-token",
+        )
+        == "Header Content"
+    )
+    assert (
+        forge_mod._sweep_stale_forge_channel_embeds(
+            cutoff=time.time(),
+            forge_channel_id=forge_mod.FORGE_CHANNEL_ID,
+            token="fake-bot-token",
+            db_paths=[tmp_db],
+        )
+        == []
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

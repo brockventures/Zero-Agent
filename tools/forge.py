@@ -38,6 +38,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -629,6 +630,37 @@ run the Mandatory Verification Gate before finishing, and leave verified changes
 """
 
 
+def _is_temp_path(path: Path | str) -> bool:
+    """Return True if path resolves under standard temporary directories (/tmp or tempfile.gettempdir()). Fail-closed on error."""
+    if not path:
+        return False
+    try:
+        resolved = Path(path).resolve()
+        temp_roots = {Path("/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
+        for root in temp_roots:
+            try:
+                if resolved == root or resolved.is_relative_to(root):
+                    return True
+            except AttributeError:
+                root_str = str(root).rstrip("/")
+                res_str = str(resolved)
+                if res_str == root_str or res_str.startswith(root_str + "/"):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_live_discord_blocked(req_fn: Any) -> bool:
+    """Return True when running under pytest and req_fn is an unmocked requests.* function."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    if os.environ.get("FORGE_ALLOW_LIVE_DISCORD_IN_TESTS") == "1":
+        return False
+    mod_name = getattr(req_fn, "__module__", "") or ""
+    return mod_name.startswith("requests")
+
+
 def _get_vulcan_webhook(
     db_path: Path | str = FORGE_DB_PATH,
     forge_channel_id: int = FORGE_CHANNEL_ID,
@@ -644,6 +676,9 @@ def _get_vulcan_webhook(
                     return {"id": str(data["id"]), "token": str(data["token"]), "name": str(data.get("name") or "Vulcan")}
         except Exception:
             pass
+
+    if _is_live_discord_blocked(requests.get):
+        return None
 
     # If cache is missing, attempt to discover the webhook via Discord REST API using available tokens
     candidate_tokens: list[str] = []
@@ -712,6 +747,8 @@ def _post_forge_channel_message(
     """Post a message/embed to #forge using Vulcan's webhook profile (with bot token fallback)."""
     wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
     if wh:
+        if _is_live_discord_blocked(requests.post):
+            return None
         try:
             wh_url = f"https://discord.com/api/v10/webhooks/{wh['id']}/{wh['token']}?wait=true"
             wh_payload = {"username": wh.get("name", "Vulcan"), **payload}
@@ -721,7 +758,7 @@ def _post_forge_channel_message(
         except Exception:
             pass
 
-    if not token:
+    if not token or _is_live_discord_blocked(requests.post):
         return None
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
@@ -741,6 +778,8 @@ def _patch_forge_channel_message(
     """Patch an existing #forge message using Vulcan's webhook (falling back to bot token for legacy messages)."""
     wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
     if wh:
+        if _is_live_discord_blocked(requests.patch):
+            return False, 0
         try:
             wh_url = f"https://discord.com/api/v10/webhooks/{wh['id']}/{wh['token']}/messages/{msg_id}"
             resp = requests.patch(wh_url, json=payload, timeout=10)
@@ -751,7 +790,7 @@ def _patch_forge_channel_message(
         except Exception:
             pass
 
-    if not token:
+    if not token or _is_live_discord_blocked(requests.patch):
         return False, 0
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
@@ -1231,12 +1270,18 @@ except Exception as _init_db_err:
 
 
 def consolidate_legacy_forge_db(
-    primary_db_path: Path | str = FORGE_DB_PATH,
-    legacy_db_path: Path | str = DATA_DIR / "forge.db",
+    primary_db_path: Optional[Path | str] = None,
+    legacy_db_path: Optional[Path | str] = None,
 ) -> dict:
     """Migrate missing rows from legacy_db into primary_db and replace legacy_db with a symlink."""
-    primary = Path(primary_db_path)
-    legacy = Path(legacy_db_path)
+    primary = Path(FORGE_DB_PATH if primary_db_path is None else primary_db_path)
+    legacy = Path((DATA_DIR / "forge.db") if legacy_db_path is None else legacy_db_path)
+
+    if not _is_temp_path(legacy):
+        if _is_temp_path(primary):
+            return {"migrated_rows": {}, "symlinked": False, "status": "refused_temp_primary"}
+        if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("FORGE_ALLOW_PROD_IN_TESTS") != "1":
+            return {"migrated_rows": {}, "symlinked": False, "status": "refused_pytest_prod_legacy"}
 
     if not primary.exists() or not legacy.exists():
         return {"migrated_rows": {}, "symlinked": False, "status": "missing_db"}
@@ -4914,6 +4959,8 @@ def prune_completed_job_widgets(
             msg_id = r["forge_message_id"]
             deleted_ok = not delete_remote
             if delete_remote and token and msg_id:
+                if _is_live_discord_blocked(requests.delete):
+                    continue
                 try:
                     url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
                     resp = requests.delete(url, headers=headers, timeout=10)
@@ -4954,6 +5001,8 @@ def _sweep_stale_forge_channel_embeds(
     immediately delete `cancelled` cards, and immediately delete duplicate or orphaned `STARTING` cards.
     """
     swept_ids: list[str] = []
+    if _is_live_discord_blocked(requests.get):
+        return swept_ids
     headers = {"Authorization": f"Bot {token}"}
     try:
         url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages?limit=50"
@@ -5066,6 +5115,8 @@ def _sweep_stale_forge_channel_embeds(
             )
             if not should_delete:
                 continue
+            if _is_live_discord_blocked(requests.delete):
+                continue
 
             del_url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id_raw}"
             del_resp = requests.delete(del_url, headers=headers, timeout=10)
@@ -5128,6 +5179,8 @@ def prune_completed_build_widgets(
             msg_id = r["forge_message_id"]
             deleted_ok = not delete_remote
             if delete_remote and token and msg_id:
+                if _is_live_discord_blocked(requests.delete):
+                    continue
                 try:
                     url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
                     resp = requests.delete(url, headers=headers, timeout=10)
@@ -9807,11 +9860,16 @@ def _get_job_dir(task_id: str) -> Path:
     return TASKS_DIR / task_id
 
 
-def _is_prod_forge_env(db_path: Path | str = FORGE_DB_PATH) -> bool:
+def _is_prod_forge_env(db_path: Optional[Path | str] = None) -> bool:
     """Return True if executing against the production FORGE SQLite DB and TASKS_DIR."""
     try:
+        target_db = Path(FORGE_DB_PATH if db_path is None else db_path)
+        if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("FORGE_ALLOW_PROD_IN_TESTS") != "1":
+            return False
+        if _is_temp_path(target_db) or _is_temp_path(FORGE_DB_PATH):
+            return False
         return (
-            Path(db_path).resolve() == FORGE_DB_PATH.resolve()
+            target_db.resolve() == Path(FORGE_DB_PATH).resolve()
             and TASKS_DIR.resolve() == (WORKSPACE_DIR / "data" / "detached_tasks").resolve()
         )
     except Exception:
@@ -11030,7 +11088,7 @@ def _post_decision_card_rest(
         for_forge_channel=(int(row["channel_id"]) == FORGE_CHANNEL_ID),
         for_channel_id=int(row["channel_id"]),
     )
-    if not token:
+    if not token or _is_live_discord_blocked(requests.post):
         return None
 
     embed_data = render_decision_card_embed(row)
@@ -11568,6 +11626,8 @@ def expire_stale_decisions(
                     }
                 ]
                 url = f"https://discord.com/api/v10/channels/{ch_id}/messages/{msg_id}"
+                if _is_live_discord_blocked(requests.patch):
+                    continue
                 try:
                     requests.patch(
                         url,
@@ -12083,6 +12143,8 @@ def _merge_remote_active_embeds_into_header(
     token: str,
 ) -> str:
     """Supplement header content with any active build/job embeds currently live in #forge from an unmounted peer container."""
+    if _is_live_discord_blocked(requests.get):
+        return content
     headers = {"Authorization": f"Bot {token}"}
     try:
         resp = requests.get(
@@ -12231,15 +12293,16 @@ def sync_forge_channel_header(
                         pass
                 if token:
                     pin_headers = {"Authorization": f"Bot {token}"}
-                    try:
-                        requests.put(
-                            f"https://discord.com/api/v10/channels/{forge_channel_id}/pins/{new_id}",
-                            headers=pin_headers,
-                            timeout=10,
-                        )
-                    except Exception:
-                        pass
-                    if int(active_header_id) != int(new_id):
+                    if not _is_live_discord_blocked(requests.put):
+                        try:
+                            requests.put(
+                                f"https://discord.com/api/v10/channels/{forge_channel_id}/pins/{new_id}",
+                                headers=pin_headers,
+                                timeout=10,
+                            )
+                        except Exception:
+                            pass
+                    if int(active_header_id) != int(new_id) and not _is_live_discord_blocked(requests.delete):
                         try:
                             requests.delete(
                                 f"https://discord.com/api/v10/channels/{forge_channel_id}/pins/{active_header_id}",
