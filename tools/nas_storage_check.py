@@ -72,51 +72,64 @@ def get_out(ssh_cmd: list, cmd_str: str) -> str:
     return ""
 
 
-def check_host(name: str, ssh_cmd: list, threshold: int = 85) -> tuple[list[str], str]:
-    issues = []
-    usage_str = ""
-
-    # 1. Check storage usage
-    df_out = get_out(ssh_cmd, "df -h /volume1")
+def _parse_df_volume(df_out: str, target_vol: str) -> tuple[int, str, str] | None:
+    """Parse (use_pct, avail, total) for a mounted volume from `df -h` output."""
     for line in df_out.splitlines():
-        if "/volume1" in line:
+        parts = line.split()
+        if len(parts) >= 6 and parts[-1] == target_vol:
+            try:
+                return int(parts[4].rstrip("%")), parts[3], parts[1]
+            except ValueError:
+                pass
+    for line in df_out.splitlines():
+        if target_vol in line:
             parts = line.split()
             if len(parts) >= 5:
-                use_pct_str = parts[4].rstrip("%")
                 try:
-                    use_pct = int(use_pct_str)
-                    avail = parts[3]
-                    total = parts[1]
-                    usage_str = f"{use_pct}% used ({avail} free)"
-                    if use_pct >= threshold:
-                        issues.append(
-                            f"⚠️ **{name} Storage High:** `/volume1` is at **{use_pct}%** capacity ({avail} free of {total})."
-                        )
-                    break
+                    return int(parts[4].rstrip("%")), parts[3], parts[1]
                 except ValueError:
                     pass
-
-    if not usage_str:
+    if target_vol == "/volume1":
         for line in df_out.splitlines():
             if line.startswith("/dev/"):
                 parts = line.split()
                 if len(parts) >= 5:
-                    use_pct_str = parts[4].rstrip("%")
                     try:
-                        use_pct = int(use_pct_str)
-                        avail = parts[3]
-                        total = parts[1]
-                        usage_str = f"{use_pct}% used ({avail} free)"
-                        if use_pct >= threshold:
-                            issues.append(
-                                f"⚠️ **{name} Storage High:** `/volume1` is at **{use_pct}%** capacity ({avail} free of {total})."
-                            )
-                        break
+                        return int(parts[4].rstrip("%")), parts[3], parts[1]
                     except ValueError:
                         pass
+    return None
 
-    if not usage_str:
-        usage_str = "storage status unavailable"
+
+def check_host(
+    name: str,
+    ssh_cmd: list,
+    threshold: int = 85,
+    volumes: tuple[str, ...] = ("/volume1",),
+) -> tuple[list[str], str]:
+    issues = []
+    vol_summaries: list[str] = []
+
+    # 1. Check storage usage across configured volumes
+    for vol in volumes:
+        df_out = get_out(ssh_cmd, f"df -h {vol}")
+        parsed = _parse_df_volume(df_out, vol)
+        if parsed is None:
+            if len(volumes) == 1:
+                vol_summaries.append("storage status unavailable")
+            continue
+        use_pct, avail, total = parsed
+        if len(volumes) == 1:
+            vol_summaries.append(f"{use_pct}% used ({avail} free)")
+        else:
+            label = "NVMe /volume2" if vol == "/volume2" else vol
+            vol_summaries.append(f"{label} {use_pct}% used ({avail} free)")
+        if use_pct >= threshold:
+            issues.append(
+                f"⚠️ **{name} Storage High:** `{vol}` is at **{use_pct}%** capacity ({avail} free of {total})."
+            )
+
+    usage_str = ", ".join(vol_summaries) if vol_summaries else "storage status unavailable"
 
     # 2. Check RAID array health (md2 is the data volume)
     raid_summary = "RAID Healthy"
@@ -154,7 +167,7 @@ def run_storage_check(quiet: bool = False):
     issues.extend(h1_issues)
     statuses.append(h1_stat)
 
-    h2_issues, h2_stat = check_host("Host2 (.84)", SSH_84)
+    h2_issues, h2_stat = check_host("Host2 (.84)", SSH_84, volumes=("/volume1", "/volume2"))
     issues.extend(h2_issues)
     statuses.append(h2_stat)
 

@@ -163,6 +163,44 @@ def test_nas_storage_check_get_out_timeout_and_fallback():
             assert res == ""
 
 
+def test_nas_storage_check_multi_volume_nvme_alert():
+    """Verify Host 2 multi-volume check reports both /volume1 and /volume2 and alerts on high NVMe usage."""
+    df_vol1 = (
+        "Filesystem           Size  Used Avail Use% Mounted on\n"
+        "/dev/vg1/volume_1     14T  7.2T  6.9T  52% /volume1\n"
+    )
+    df_vol2 = (
+        "Filesystem           Size  Used Avail Use% Mounted on\n"
+        "/dev/vg2/volume_2    448G  400G   48G  89% /volume2\n"
+    )
+    mdstat_output = (
+        "md2 : active raid1 sata1p5[2] sata2p5[1]\n"
+        "      15615154816 blocks super 1.2 [2/2] [UU]\n"
+    )
+
+    def fake_get_out(ssh_cmd, cmd_str):
+        if "/volume2" in cmd_str:
+            return df_vol2
+        if "/volume1" in cmd_str:
+            return df_vol1
+        if "proc/mdstat" in cmd_str:
+            return mdstat_output
+        return ""
+
+    with patch.object(nas_storage_check, "get_out", side_effect=fake_get_out):
+        issues, status_line = nas_storage_check.check_host(
+            "NasHost02 (.84)",
+            ["ssh", DOC_HOST_2],
+            threshold=85,
+            volumes=("/volume1", "/volume2"),
+        )
+        assert len(issues) == 1
+        assert "/volume2" in issues[0]
+        assert "89%" in issues[0]
+        assert "/volume1 52% used (6.9T free)" in status_line
+        assert "NVMe /volume2 89% used (48G free)" in status_line
+
+
 def test_run_storage_check_quiet_healthy_silence(capsys):
     """Verify run_storage_check prints nothing when quiet=True and healthy."""
     with patch.object(nas_storage_check, "check_host") as mock_check:
