@@ -680,6 +680,25 @@ class BriefDaemonRunner:
 
         return enqueued
 
+    @staticmethod
+    def _merge_gate_scan_results(
+        accum: dict[str, Any],
+        scan_res: Mapping[str, Any] | None,
+    ) -> None:
+        if not isinstance(scan_res, Mapping):
+            return
+        for key, value in scan_res.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                accum[key] = int(accum.get(key, 0)) + value
+            elif isinstance(value, list):
+                existing = accum.setdefault(key, [])
+                if key.endswith("_ids"):
+                    existing[:] = list(dict.fromkeys([*existing, *value]))
+                else:
+                    existing.extend(value)
+
     def run_tick(self, now: float | None = None) -> dict[str, Any]:
         """Execute one scheduled daemon tick across timers, watchers, router, and watchdog."""
         now_ts = float(self._now_fn() if now is None else now)
@@ -738,6 +757,19 @@ class BriefDaemonRunner:
 
             outcomes: list[dict[str, Any]] = []
             delivered_count = 0
+            gate_scan_accum: dict[str, Any] = {
+                "scanned": 0,
+                "staged": 0,
+                "skipped_existing": 0,
+                "rejected": 0,
+                "expired": 0,
+                "deferred_quiet_hours": 0,
+                "deferred_budget": 0,
+                "staged_ids": [],
+                "rejected_ids": [],
+                "expired_ids": [],
+                "errors": [],
+            }
             for _ in range(_MAX_ROUTER_DRAIN_PER_TICK):
                 try:
                     outcome = self.router.process_one(now=now_ts)
@@ -767,6 +799,13 @@ class BriefDaemonRunner:
                         logger.exception("BriefDeliveryGate.deliver failed")
                         errors["delivery_gate"] = str(exc)
 
+                    try:
+                        immediate_scan = self.approval_gate.scan_pending_proposals(now=now_ts)
+                        self._merge_gate_scan_results(gate_scan_accum, immediate_scan)
+                    except Exception as exc:
+                        logger.exception("BriefApprovalGate.scan_pending_proposals failed")
+                        errors["gate"] = str(exc)
+
                 outcomes.append(
                     {
                         **outcome,
@@ -781,14 +820,15 @@ class BriefDaemonRunner:
             try:
                 expired_ids = self.approval_gate.expire_stale_proposals(now=now_ts)
                 scan_res = self.approval_gate.scan_pending_proposals(now=now_ts)
+                self._merge_gate_scan_results(gate_scan_accum, scan_res)
                 touch_heartbeat(self.config.heartbeats_dir, "gate", now=now_ts)
                 summary["gate"] = {
-                    **scan_res,
+                    **gate_scan_accum,
                     "expired_staged_ids": expired_ids,
                     "expired_ids": list(
-                        dict.fromkeys([*expired_ids, *scan_res.get("expired_ids", [])])
+                        dict.fromkeys([*expired_ids, *gate_scan_accum.get("expired_ids", [])])
                     ),
-                    "expired": len(expired_ids) + int(scan_res.get("expired", 0)),
+                    "expired": len(expired_ids) + int(gate_scan_accum.get("expired", 0)),
                 }
             except Exception as exc:
                 logger.exception("BriefApprovalGate tick failed")

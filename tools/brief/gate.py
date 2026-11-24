@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo
 
 from tools.brief.actions import (
     ALLOWED_GATE_ACTIONS,
-    _format_iso_pt,
     canonical_proposal_hash,
     execute_action,
     validate_action_args,
@@ -414,6 +413,98 @@ def _default_stage_card(
     )
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_readable_pt(raw_value: Any, tz_name: str) -> tuple[datetime | None, bool]:
+    """Parse an ISO-8601 datetime or YYYY-MM-DD date string into local PT datetime."""
+    if not isinstance(raw_value, str):
+        return None, False
+    text = raw_value.strip()
+    if not text:
+        return None, False
+    tz = ZoneInfo(tz_name)
+    if _DATE_ONLY_RE.fullmatch(text):
+        try:
+            dt = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=tz)
+        except ValueError:
+            return None, False
+        return dt, True
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None, False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(tz), False
+
+
+def _fmt_readable_date(dt: datetime) -> str:
+    return f"{dt:%a %b} {dt.day}"
+
+
+def _fmt_readable_time(dt: datetime) -> str:
+    hour12 = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{hour12}:{dt:%M} {ampm}"
+
+
+def _format_readable_pt_range(
+    start_iso: Any,
+    end_iso: Any,
+    tz_name: str = "America/Los_Angeles",
+) -> str:
+    """Format ISO-8601 start/end timestamps into concise, readable Pacific Time."""
+    start_dt, start_date_only = _parse_readable_pt(start_iso, tz_name)
+    end_dt, end_date_only = _parse_readable_pt(end_iso, tz_name)
+
+    if start_dt is None and end_dt is None:
+        parts = [str(v).strip() for v in (start_iso, end_iso) if isinstance(v, str) and v.strip()]
+        return " - ".join(parts)
+
+    ref_dt = start_dt or end_dt
+    assert ref_dt is not None
+    tz_label = "PT" if tz_name == "America/Los_Angeles" else (ref_dt.tzname() or "PT")
+
+    if start_dt is not None and end_dt is not None:
+        if start_date_only and end_date_only:
+            if start_dt.date() == end_dt.date():
+                return f"{_fmt_readable_date(start_dt)} (All day)"
+            return f"{_fmt_readable_date(start_dt)} - {_fmt_readable_date(end_dt)} (All day)"
+        if not start_date_only and not end_date_only:
+            if start_dt.date() == end_dt.date():
+                return (
+                    f"{_fmt_readable_date(start_dt)}, "
+                    f"{_fmt_readable_time(start_dt)} - {_fmt_readable_time(end_dt)} {tz_label}"
+                )
+            return (
+                f"{_fmt_readable_date(start_dt)}, {_fmt_readable_time(start_dt)} - "
+                f"{_fmt_readable_date(end_dt)}, {_fmt_readable_time(end_dt)} {tz_label}"
+            )
+        start_part = (
+            _fmt_readable_date(start_dt)
+            if start_date_only
+            else f"{_fmt_readable_date(start_dt)}, {_fmt_readable_time(start_dt)}"
+        )
+        end_part = (
+            _fmt_readable_date(end_dt)
+            if end_date_only
+            else f"{_fmt_readable_date(end_dt)}, {_fmt_readable_time(end_dt)}"
+        )
+        return f"{start_part} - {end_part} {tz_label}"
+
+    if start_dt is not None:
+        if start_date_only:
+            return f"{_fmt_readable_date(start_dt)} (All day)"
+        return f"{_fmt_readable_date(start_dt)}, {_fmt_readable_time(start_dt)} {tz_label}"
+
+    assert end_dt is not None
+    if end_date_only:
+        return f"Ends {_fmt_readable_date(end_dt)}"
+    return f"Ends {_fmt_readable_date(end_dt)}, {_fmt_readable_time(end_dt)} {tz_label}"
+
+
 def _build_decision_card_copy(
     *,
     proposal_id: str,
@@ -425,38 +516,34 @@ def _build_decision_card_copy(
     tz_name: str,
 ) -> tuple[str, str]:
     """Build mobile-friendly PT summary and explicit '**Approve Action:**' line."""
+    del proposal_id, expires_ts
     summary_text = str(normalized_args.get("summary") or "").strip()
-    calendar_id = str(normalized_args.get("calendar_id") or "primary")
-    start_pt = _format_iso_pt(normalized_args.get("start"), tz_name)
-    end_pt = _format_iso_pt(normalized_args.get("end"), tz_name)
-    expires_pt = _format_pt_timestamp(expires_ts, tz_name=tz_name)
+    when_str = _format_readable_pt_range(
+        normalized_args.get("start"),
+        normalized_args.get("end"),
+        tz_name,
+    )
+    when_suffix = f" ({when_str})" if when_str else ""
 
     if action == "calendar.create":
         title_label = summary_text or "New Event"
-        title = f"Calendar Create: {title_label[:64]}"
-        approve_line = f"Create Google Calendar event `{title_label}` ({start_pt} -> {end_pt})"
+        title = f"Add to Calendar: {title_label[:64]}"
+        approve_line = f'Add "{title_label}" to your calendar{when_suffix}'
     else:
-        event_id = str(normalized_args.get("event_id") or "").strip()
-        title_label = summary_text or event_id
-        title = f"Calendar Update: {title_label[:64]}"
-        approve_line = f"Update Google Calendar event `{event_id}` on `{calendar_id}`"
+        title_label = summary_text or "Calendar Event"
+        title = f"Update Calendar: {title_label[:64]}"
+        approve_line = f'Update "{title_label}" on your calendar{when_suffix}'
 
-    lines = []
+    lines: list[str] = []
     if urgent:
         lines.append("**[URGENT]**")
-    lines.append(f"**Action:** `{action}` (`{calendar_id}`)")
-    if action == "calendar.update":
-        lines.append(f"**Event ID:** `{normalized_args.get('event_id')}`")
-    if summary_text:
-        lines.append(f"**Title:** {summary_text}")
-    if start_pt or end_pt:
-        lines.append(f"**When (PT):** {start_pt or '?'} -> {end_pt or '?'}")
+    if when_str:
+        lines.append(f"**When:** {when_str}")
     if normalized_args.get("location"):
-        lines.append(f"**Location:** {normalized_args['location']}")
+        lines.append(f"**Where:** {normalized_args['location']}")
     if normalized_args.get("attendees"):
-        lines.append(f"**Attendees:** {', '.join(normalized_args['attendees'])}")
-    lines.append(f"**Reason:** {reason}")
-    lines.append(f"**Proposal:** `{proposal_id}` · Expires {expires_pt}")
+        lines.append(f"**With:** {', '.join(normalized_args['attendees'])}")
+    lines.append(f"**Why:** {reason}")
     lines.append("")
     lines.append(f"**Approve Action:** {approve_line}")
 

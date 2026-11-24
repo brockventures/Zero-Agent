@@ -20,6 +20,8 @@ from tools.brief.actions import canonical_proposal_hash, validate_action_args
 from tools.brief.config import BriefConfig
 from tools.brief.gate import (
     BriefApprovalGate,
+    _build_decision_card_copy,
+    _format_readable_pt_range,
     handle_forge_decision_approve,
     handle_forge_decision_dismiss,
     write_proposal_atomic,
@@ -158,8 +160,23 @@ def test_atomic_write_and_ignore_tmp_and_dotfiles(tmp_path: Path) -> None:
     assert res1["staged_ids"] == ["prop-atomic-1"]
     assert len(staged_calls) == 1
     assert staged_calls[0]["handler_type"] == "brief_proposal"
-    assert "**Approve Action:**" in staged_calls[0]["summary"]
-    assert "PT" in staged_calls[0]["summary"]
+    assert staged_calls[0]["title"] == "Add to Calendar: Team Sync"
+    summary_text = staged_calls[0]["summary"]
+    assert "**When:** Wed Nov 25, 10:00 AM - 11:00 AM PT" in summary_text
+    assert "**Where:** Main Field" in summary_text
+    assert "**With:** coach@example.org" in summary_text
+    assert "**Why:** Owner requested scheduling follow-up." in summary_text
+    assert (
+        '**Approve Action:** Add "Team Sync" to your calendar '
+        "(Wed Nov 25, 10:00 AM - 11:00 AM PT)"
+    ) in summary_text
+    assert "prop-atomic-1" not in summary_text
+    assert "calendar.create" not in summary_text
+    assert "primary" not in summary_text
+    assert "2026-11-25T" not in summary_text
+    assert "**Title:**" not in summary_text
+    assert "**Proposal:**" not in summary_text
+    assert "Expires" not in summary_text
 
     # Re-scanning while file remains in pending/ MUST NOT stage duplicate Decision Cards
     res2 = gate.scan_pending_proposals(now=now_ts + 15)
@@ -528,3 +545,95 @@ def test_ttl_bounds_scan_expiry_and_direct_edited_args_entrypoint(tmp_path: Path
     assert approve_res["ok"] is True
     assert approve_res["status"] == "edited_executed"
     assert api.created[0][1]["summary"] == "Direct Edited Sync"
+
+
+def test_readable_pt_range_and_slim_decision_card_variants() -> None:
+    # Same-day timed range
+    assert (
+        _format_readable_pt_range(
+            "2026-12-03T10:30:00-08:00",
+            "2026-12-03T11:30:00-08:00",
+            "America/Los_Angeles",
+        )
+        == "Thu Dec 3, 10:30 AM - 11:30 AM PT"
+    )
+    # Cross-day timed range
+    assert (
+        _format_readable_pt_range(
+            "2026-12-03T10:30:00-08:00",
+            "2026-12-04T09:00:00-08:00",
+            "America/Los_Angeles",
+        )
+        == "Thu Dec 3, 10:30 AM - Fri Dec 4, 9:00 AM PT"
+    )
+    # Date-only all-day events
+    assert (
+        _format_readable_pt_range("2026-12-03", "2026-12-03", "America/Los_Angeles")
+        == "Thu Dec 3 (All day)"
+    )
+    assert (
+        _format_readable_pt_range("2026-12-03", None, "America/Los_Angeles")
+        == "Thu Dec 3 (All day)"
+    )
+    assert (
+        _format_readable_pt_range("2026-12-03", "2026-12-04", "America/Los_Angeles")
+        == "Thu Dec 3 - Fri Dec 4 (All day)"
+    )
+
+    # Non-urgent create without location/attendees -> compact 4-line body
+    title_create, body_create = _build_decision_card_copy(
+        proposal_id="prop-raw-id-99",
+        action="calendar.create",
+        normalized_args={
+            "calendar_id": "primary",
+            "summary": "Dentist Appointment",
+            "start": "2026-12-03T10:30:00-08:00",
+            "end": "2026-12-03T11:30:00-08:00",
+        },
+        reason="Confirmed via office email.",
+        expires_ts=_ts_pt(2026, 12, 5, 18, 0),
+        urgent=False,
+        tz_name="America/Los_Angeles",
+    )
+    assert title_create == "Add to Calendar: Dentist Appointment"
+    assert body_create.splitlines() == [
+        "**When:** Thu Dec 3, 10:30 AM - 11:30 AM PT",
+        "**Why:** Confirmed via office email.",
+        "",
+        '**Approve Action:** Add "Dentist Appointment" to your calendar (Thu Dec 3, 10:30 AM - 11:30 AM PT)',
+    ]
+
+    # Urgent calendar.update without start/end omits parenthetical and includes **[URGENT]**
+    title_update, body_update = _build_decision_card_copy(
+        proposal_id="prop-upd-raw-1",
+        action="calendar.update",
+        normalized_args={
+            "calendar_id": "primary",
+            "event_id": "evt-secret-123",
+            "summary": "Board Call",
+            "location": "Zoom",
+        },
+        reason="Moved to virtual link.",
+        expires_ts=_ts_pt(2026, 12, 5, 18, 0),
+        urgent=True,
+        tz_name="America/Los_Angeles",
+    )
+    assert title_update == "Update Calendar: Board Call"
+    assert body_update.splitlines() == [
+        "**[URGENT]**",
+        "**Where:** Zoom",
+        "**Why:** Moved to virtual link.",
+        "",
+        '**Approve Action:** Update "Board Call" on your calendar',
+    ]
+    assert "prop-upd-raw-1" not in body_update
+    assert "evt-secret-123" not in body_update
+    assert "calendar.update" not in body_update
+    assert "primary" not in body_update
+
+
+def test_base_prompt_includes_brevity_invariant() -> None:
+    base_md = (REPO_ROOT / "prompts" / "brief" / "base.md").read_text(encoding="utf-8")
+    assert "5. **Brevity & Plain English:**" in base_md
+    assert "1–3 short plain-English sentences" in base_md
+    assert "mobile-scannable" in base_md

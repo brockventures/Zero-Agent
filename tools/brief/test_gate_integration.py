@@ -247,9 +247,11 @@ def test_end_to_end_forge_decision_approve_edited_approve_and_dismiss(
     )
 
     stage_results: list[dict[str, Any]] = []
+    stage_kwargs: list[dict[str, Any]] = []
 
     def _stage_in_temp_forge(**kw: Any) -> dict[str, Any]:
         # Force post_to_discord=False during tests while exercising real forge.stage_decision
+        stage_kwargs.append(dict(kw))
         res = forge.stage_decision(
             category=kw["category"],
             title=kw["title"],
@@ -270,10 +272,19 @@ def test_end_to_end_forge_decision_approve_edited_approve_and_dismiss(
     assert scan_res["staged"] == 3
     assert len(stage_results) == 3
 
-    # Verify cards stage directly in #brief without redirecting to #zero-chat
-    for sr in stage_results:
+    # Verify cards stage directly in #brief without redirecting to #zero-chat and use slim copy
+    for sr, kw in zip(stage_results, stage_kwargs, strict=True):
         assert sr["channel_id"] == 1574655816236269569
         assert sr["redirected_to_zero_chat"] is False
+        assert "**Approve Action:**" in kw["summary"]
+        assert "calendar.create" not in kw["summary"]
+        assert "calendar.update" not in kw["summary"]
+        assert "**Proposal:**" not in kw["summary"]
+    by_id = {kw["payload"]["proposal_id"]: kw for kw in stage_kwargs}
+    assert by_id["prop-int-create"]["title"] == "Add to Calendar: Parent Teacher Sync"
+    assert by_id["prop-int-update"]["title"] == "Update Calendar: Initial Title"
+    assert "prop-int-create" not in by_id["prop-int-create"]["summary"]
+    assert "cal-evt-existing-2" not in by_id["prop-int-update"]["summary"]
 
     dec_create = gate.gate_store.get_proposal("prop-int-create")["decision_id"]
     dec_update = gate.gate_store.get_proposal("prop-int-update")["decision_id"]

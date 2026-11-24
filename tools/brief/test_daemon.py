@@ -449,3 +449,218 @@ def test_singleton_lock_and_cli_daemon_commands(
     assert rc_run == 0
     assert ticks_executed == 1
     assert not pid_path.exists()
+
+
+def test_daemon_runner_stages_proposals_immediately_after_each_routed_event(
+    tmp_path: Path,
+) -> None:
+    from tools.brief.gate import BriefApprovalGate, write_proposal_atomic
+
+    cfg = _make_cfg(tmp_path, dry_run=True, quiet_start="00:00", quiet_end="00:00")
+    queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
+    queue.init_db()
+    t0 = _pt_ts(2026, 11, 24, 10, 0)
+
+    ev1_id = queue.enqueue_event(
+        source="gmail",
+        key="thread-ev1",
+        target_tag="intake/gmail/thread-ev1",
+        external_id="msg-ev1",
+        sender="owner@example.com",
+        body="Please schedule event 1",
+        received_at=t0 - 20,
+    )
+    ev2_id = queue.enqueue_event(
+        source="gmail",
+        key="thread-ev2",
+        target_tag="intake/gmail/thread-ev2",
+        external_id="msg-ev2",
+        sender="owner@example.com",
+        body="Please schedule event 2",
+        received_at=t0 - 10,
+    )
+    assert ev1_id is not None and ev2_id is not None
+
+    call_log: list[str] = []
+    staged_cards: list[dict[str, Any]] = []
+
+    class _NoopWatcher:
+        def poll_once(self) -> dict[str, Any]:
+            return {"status": "ok", "enqueued": 0}
+
+    class _ProposalWritingRouter:
+        def __init__(self) -> None:
+            self._idx = 0
+
+        def process_one(self, *, now: float | None = None) -> dict[str, Any] | None:
+            del now
+            self._idx += 1
+            if self._idx == 1:
+                call_log.append("route:ev1")
+                write_proposal_atomic(
+                    cfg.proposals_pending_dir,
+                    {
+                        "id": "prop-from-ev1",
+                        "action": "calendar.create",
+                        "args": {
+                            "summary": "Event One",
+                            "start": "2026-11-25T10:00:00-08:00",
+                            "end": "2026-11-25T11:00:00-08:00",
+                        },
+                        "reason": "Scheduled from event 1.",
+                        "expires_at": "2026-11-26T18:00:00-08:00",
+                        "from_session": "intake/gmail/thread-ev1",
+                        "urgent": False,
+                    },
+                )
+                return {
+                    "status": "done",
+                    "event_id": ev1_id,
+                    "source": "gmail",
+                    "tag": "intake/gmail/thread-ev1",
+                    "response": "INFORM: Proposed Event One.",
+                }
+            if self._idx == 2:
+                call_log.append("route:ev2")
+                write_proposal_atomic(
+                    cfg.proposals_pending_dir,
+                    {
+                        "id": "prop-from-ev2",
+                        "action": "calendar.create",
+                        "args": {
+                            "summary": "Event Two",
+                            "start": "2026-11-25T14:00:00-08:00",
+                            "end": "2026-11-25T15:00:00-08:00",
+                        },
+                        "reason": "Scheduled from event 2.",
+                        "expires_at": "2026-11-26T18:00:00-08:00",
+                        "from_session": "intake/gmail/thread-ev2",
+                        "urgent": False,
+                    },
+                )
+                return {
+                    "status": "done",
+                    "event_id": ev2_id,
+                    "source": "gmail",
+                    "tag": "intake/gmail/thread-ev2",
+                    "response": "INFORM: Proposed Event Two.",
+                }
+            return None
+
+    real_gate = BriefApprovalGate(
+        cfg,
+        queue=queue,
+        stage_card_fn=lambda **kw: staged_cards.append(kw)
+        or {"decision_id": f"dec-{kw['payload']['proposal_id']}"},
+        now_fn=lambda: t0,
+    )
+
+    class _SpyGate:
+        def scan_pending_proposals(self, now: float | None = None) -> dict[str, Any]:
+            res = real_gate.scan_pending_proposals(now=now)
+            call_log.append(f"scan:{','.join(res['staged_ids']) or 'none'}")
+            return res
+
+        def expire_stale_proposals(self, now: float | None = None) -> list[str]:
+            call_log.append("expire")
+            return real_gate.expire_stale_proposals(now=now)
+
+    delivered_msgs: list[tuple[int, str]] = []
+    runner = BriefDaemonRunner(
+        cfg,
+        queue=queue,
+        gmail_watcher=_NoopWatcher(),  # type: ignore[arg-type]
+        calendar_watcher=_NoopWatcher(),  # type: ignore[arg-type]
+        router=_ProposalWritingRouter(),  # type: ignore[arg-type]
+        delivery_gate=BriefDeliveryGate(
+            cfg, post_fn=lambda ch, msg: delivered_msgs.append((ch, msg)) or True
+        ),
+        approval_gate=_SpyGate(),  # type: ignore[arg-type]
+        watchdog_fn=lambda _c, _q, **_kw: {"healthy": True},
+        now_fn=lambda: t0,
+    )
+    # Prevent morning_brief / daily_review timers from enqueuing extra events
+    runner._last_morning_brief_date = "2026-11-24"
+    runner._last_daily_review_date = "2026-11-24"
+
+    tick = runner.run_tick(now=t0)
+    assert tick["errors"] == {}
+    assert tick["routed"] == 2
+    assert tick["delivered"] == 2
+    # Crucial invariant: prop-from-ev1 was scanned & staged immediately after ev1, before ev2 routed
+    assert call_log == [
+        "route:ev1",
+        "scan:prop-from-ev1",
+        "route:ev2",
+        "scan:prop-from-ev2",
+        "expire",
+        "scan:none",
+    ]
+    assert tick["gate"]["staged"] == 2
+    assert tick["gate"]["staged_ids"] == ["prop-from-ev1", "prop-from-ev2"]
+    assert len(staged_cards) == 2
+
+    # Verify per-event scan error does not abort remaining queued events
+    class _FailingOnceGate:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scan_pending_proposals(self, now: float | None = None) -> dict[str, Any]:
+            del now
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient gate scan error")
+            return {
+                "scanned": 1,
+                "staged": 1,
+                "skipped_existing": 0,
+                "rejected": 0,
+                "expired": 0,
+                "deferred_quiet_hours": 0,
+                "deferred_budget": 0,
+                "staged_ids": ["prop-recovered"],
+                "rejected_ids": [],
+                "expired_ids": [],
+                "errors": [],
+            }
+
+        def expire_stale_proposals(self, now: float | None = None) -> list[str]:
+            del now
+            return []
+
+    class _TwoEventRouter:
+        def __init__(self) -> None:
+            self.count = 0
+
+        def process_one(self, *, now: float | None = None) -> dict[str, Any] | None:
+            del now
+            self.count += 1
+            if self.count <= 2:
+                return {
+                    "status": "done",
+                    "event_id": self.count,
+                    "source": "gmail",
+                    "tag": "intake/gmail/t",
+                    "response": "INFORM: ok",
+                }
+            return None
+
+    runner2 = BriefDaemonRunner(
+        cfg,
+        queue=queue,
+        gmail_watcher=_NoopWatcher(),  # type: ignore[arg-type]
+        calendar_watcher=_NoopWatcher(),  # type: ignore[arg-type]
+        router=_TwoEventRouter(),  # type: ignore[arg-type]
+        delivery_gate=BriefDeliveryGate(cfg, post_fn=lambda _ch, _msg: True),
+        approval_gate=_FailingOnceGate(),  # type: ignore[arg-type]
+        watchdog_fn=lambda _c, _q, **_kw: {"healthy": True},
+        now_fn=lambda: t0 + 30.0,
+    )
+    runner2._last_morning_brief_date = "2026-11-24"
+    runner2._last_daily_review_date = "2026-11-24"
+
+    tick_err = runner2.run_tick(now=t0 + 30.0)
+    assert tick_err["routed"] == 2
+    assert "gate" in tick_err["errors"]
+    assert tick_err["gate"]["staged"] >= 1
+    assert "prop-recovered" in tick_err["gate"]["staged_ids"]
