@@ -330,6 +330,46 @@ class TestOutboxSecurityHardening(unittest.TestCase):
         btns = first_body["components"][0]["components"]
         self.assertEqual([b["custom_id"] for b in btns], ["choice:Deploy", "choice:Cancel"])
 
+    @patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "test_bot_token_123"})
+    @patch("tools.outbox.record_dispatched_history")
+    def test_dispatch_via_rest_allows_choices_buttons_on_baseball_channel(self, mock_record):
+        """Verify #baseball (Ivy-owned Brock Guild channel) preserves [CHOICES: ...] buttons."""
+        baseball_cid = 1548196929308065893
+        self.assertTrue(outbox._is_home_turf_channel(baseball_cid))
+        self.assertFalse(outbox._is_home_turf_channel(1534452820995080192))  # #lounge stays external
+
+        omsg = {
+            "id": "outbox-sec-baseball-1",
+            "channel": "baseball",
+            "channel_id": baseball_cid,
+            "content": "Sabermetric R&D Radar ready.\n\n[CHOICES: Run Full Sweep | Skip Today]",
+        }
+        sent_bodies = []
+
+        class MockResp:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def read(self):
+                return json.dumps({"id": "msg-baseball-1"}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=15):
+            sent_bodies.append(json.loads(req.data.decode("utf-8")))
+            return MockResp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            ok = outbox.dispatch_via_rest(omsg)
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(sent_bodies), 1)
+        first_body = sent_bodies[0]
+        self.assertNotIn("[CHOICES:", first_body["content"])
+        self.assertIn("components", first_body)
+        btns = first_body["components"][0]["components"]
+        self.assertEqual([b["custom_id"] for b in btns], ["choice:Run Full Sweep", "choice:Skip Today"])
+
 
 class TestOutboxAtomicPartitioning(unittest.TestCase):
     def setUp(self):

@@ -222,10 +222,20 @@ def _scrub_outbound_text(text: str) -> str:
 
 
 def _is_home_turf_channel(channel_id) -> bool:
-    """Return True strictly if channel_id belongs to Home Turf (fail-closed)."""
+    """Return True strictly if channel_id belongs to Brock Guild Home Turf (fail-closed)."""
     try:
-        from tools.bridge_state import is_home_channel
-        return bool(is_home_channel(channel_id))
+        from tools.bridge_state import (
+            DEFAULT_EXCLUDED_HOME_CHANNELS,
+            FORGE_CHANNEL_ID,
+            is_home_channel,
+        )
+        if is_home_channel(channel_id):
+            return True
+        cid = int(channel_id)
+        # Dedicated/delegated Brock Guild home channels (e.g. #baseball owned by Ivy,
+        # #forge owned by Vulcan) are excluded from Zero's ambient listener, not external
+        # Crab Cavern channels — preserve home safety mode and [CHOICES: ...] buttons.
+        return cid in DEFAULT_EXCLUDED_HOME_CHANNELS or cid == FORGE_CHANNEL_ID
     except Exception:
         return False
 
