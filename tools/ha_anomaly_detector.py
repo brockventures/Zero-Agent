@@ -2,7 +2,7 @@
 """Home Assistant & UniFi Statistical Telemetry Anomaly Detector & Self-Healer (Task #58).
 
 Architecture (adapted from Alex/Arcane & Aerial PR #57):
-- Primary long-term TSDB: VictoriaMetrics on Host 1 (:8428, 5y retention, /api/prometheus scrape).
+- Primary long-term TSDB: VictoriaMetrics on Host 2 (:8428, 5y retention, /api/prometheus scrape).
 - Automatic Day-1 Hybrid Fallback: Queries VictoriaMetrics PromQL range series first and
   transparently supplements from Home Assistant's native /api/history/period + /api/states
   whenever a sensor has <24h of samples in VictoriaMetrics.
@@ -45,9 +45,9 @@ for _p in ("/workspace", "/workspace/tools"):
         sys.path.insert(0, _p)
 
 from tools.ha_battery_check import get_ha_config
-from tools.nas_config import HOST_1_IP
+from tools.nas_config import HOST_2_IP
 
-DEFAULT_VM_URL = os.environ.get("VICTORIAMETRICS_URL", f"http://{HOST_1_IP}:8428")
+DEFAULT_VM_URL = os.environ.get("VICTORIAMETRICS_URL", f"http://{HOST_2_IP}:8428")
 HEAL_STATE_FILE = Path("/workspace/data/ha_anomaly_heal_state.json")
 HEAL_COOLDOWN_SECONDS = 23 * 3600
 ENV_FILE = Path("/secrets/env.json")
@@ -1315,7 +1315,7 @@ def format_report(res: dict[str, Any], quiet: bool = False) -> str:
     lines = ["📡 **Home Assistant & Network Telemetry Anomaly Report**\n"]
 
     if not vm_ok:
-        lines.append("- ⚠️ **VictoriaMetrics TSDB (`:8428`):** Unreachable on Host 1 (falling back to HA 7d recorder).")
+        lines.append("- ⚠️ **VictoriaMetrics TSDB (`:8428`):** Unreachable on Host 2 (falling back to HA 7d recorder).")
 
     if healed:
         lines.append("### 🛠️ Auto-Healed Sensors")
