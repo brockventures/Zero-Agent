@@ -832,3 +832,276 @@ def test_cli_gate_commands_status_and_mint_oauth_urls(
         )
         == 1
     )
+
+
+def test_brief_edit_and_dismiss_modals_integration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Edit/Dismiss modal helpers, args staging, dismissal notes, and bridge modal routing."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import tools.bridge as bridge
+    import tools.forge as live_forge
+
+    cfg = _write_gate_config(tmp_path, dry_run=True)
+    forge_db = tmp_path / "forge.db"
+    live_forge.init_forge_db(forge_db)
+    now_ts = _ts_pt(2026, 11, 24, 10, 0)
+
+    # 1. _parse_brief_edit_modal_time handles ISO, YYYY-MM-DD HH:MM, YYYY-MM-DD HH:MM AM/PM, and date-only
+    assert live_forge._parse_brief_edit_modal_time("2026-12-03T10:30:00-08:00") == "2026-12-03T10:30:00-08:00"
+    assert live_forge._parse_brief_edit_modal_time("2026-12-03") == "2026-12-03"
+    assert live_forge._parse_brief_edit_modal_time("2026-12-03 10:30") == "2026-12-03T10:30:00-08:00"
+    assert live_forge._parse_brief_edit_modal_time("2026-12-03 10:30 AM") == "2026-12-03T10:30:00-08:00"
+    assert live_forge._parse_brief_edit_modal_time("2026-12-03 2:15 PM") == "2026-12-03T14:15:00-08:00"
+    with pytest.raises(ValueError):
+        live_forge._parse_brief_edit_modal_time("not-a-timestamp")
+
+    # 2. Stage two BRIEF proposals and verify scan_pending_proposals includes normalized `args`
+    for pid, summary_title in (
+        ("prop-modal-edit", "Dentist Visit"),
+        ("prop-modal-dismiss", "Dental Cleaning Reminder"),
+    ):
+        write_proposal_atomic(
+            cfg.proposals_pending_dir,
+            {
+                "id": pid,
+                "action": "calendar.create",
+                "args": {
+                    "summary": summary_title,
+                    "start": "2026-12-03T09:00:00-08:00",
+                    "end": "2026-12-03T09:45:00-08:00",
+                    "location": "Downtown Clinic",
+                    "description": "Routine checkup",
+                    "attendees": ["clinic@example.org"],
+                },
+                "reason": "Found reminder in email.",
+                "expires_at": "2026-11-26T18:00:00-08:00",
+                "from_session": f"intake/gmail/{pid}",
+                "urgent": False,
+            },
+        )
+
+    staged_kwargs: list[dict[str, Any]] = []
+    gate = BriefApprovalGate(
+        cfg,
+        stage_card_fn=lambda **kw: staged_kwargs.append(dict(kw))
+        or live_forge.stage_decision(
+            category=kw["category"],
+            title=kw["title"],
+            summary=kw["summary"],
+            handler_type=kw["handler_type"],
+            payload=kw["payload"],
+            channel_id=kw["channel_id"],
+            ttl_seconds=kw["ttl_seconds"],
+            is_private=kw["is_private"],
+            db_path=forge_db,
+            post_to_discord=False,
+        ),
+        now_fn=lambda: now_ts,
+    )
+    scan_res = gate.scan_pending_proposals(now=now_ts)
+    assert scan_res["staged"] == 2
+    by_pid = {kw["payload"]["proposal_id"]: kw for kw in staged_kwargs}
+    assert by_pid["prop-modal-edit"]["payload"]["args"] == {
+        "calendar_id": "primary",
+        "summary": "Dentist Visit",
+        "start": "2026-12-03T09:00:00-08:00",
+        "end": "2026-12-03T09:45:00-08:00",
+        "location": "Downtown Clinic",
+        "description": "Routine checkup",
+        "attendees": ["clinic@example.org"],
+    }
+
+    dec_edit = gate.gate_store.get_proposal("prop-modal-edit")["decision_id"]
+    dec_dismiss = gate.gate_store.get_proposal("prop-modal-dismiss")["decision_id"]
+    assert dec_edit and dec_dismiss
+
+    # 3. _resolve_brief_modal_args returns payload['args'] directly and falls back to gate.db
+    assert live_forge._resolve_brief_modal_args({"args": {"summary": "Direct"}}) == {"summary": "Direct"}
+    fallback_args = live_forge._resolve_brief_modal_args(
+        {"proposal_id": "prop-modal-edit", "state_dir": str(cfg.state_dir)}
+    )
+    assert fallback_args["summary"] == "Dentist Visit"
+    assert fallback_args["attendees"] == ["clinic@example.org"]
+
+    # 4. execute_decision with override_payload={'args': edited_args} preserves metadata and marks edited_executed
+    exec_res = live_forge.execute_decision(
+        dec_edit,
+        override_payload={
+            "args": {
+                "calendar_id": "primary",
+                "summary": "Dentist Visit (Rescheduled)",
+                "start": "2026-12-03T10:30:00-08:00",
+                "end": "2026-12-03T11:15:00-08:00",
+                "location": "Midtown Clinic",
+                "attendees": ["clinic@example.org"],
+            }
+        },
+        db_path=forge_db,
+    )
+    assert exec_res["ok"] is True
+    assert exec_res["status"] == "edited_approved"
+    edit_row = gate.gate_store.get_proposal("prop-modal-edit")
+    assert edit_row is not None
+    assert edit_row["status"] == "edited_executed"
+    assert (cfg.proposals_archive_dir / "prop-modal-edit.edited_executed.json").is_file()
+
+    # 5. dismiss_decision(..., note=...) forwards note to gate receipt and updates forge_decisions.receipt_text
+    dismiss_res = live_forge.dismiss_decision(
+        dec_dismiss,
+        note="Skip dental reminders",
+        db_path=forge_db,
+    )
+    assert dismiss_res["ok"] is True
+    assert dismiss_res["status"] == "dismissed"
+    with live_forge.get_db_connection(forge_db) as conn:
+        dec_row = conn.execute(
+            "SELECT receipt_text FROM forge_decisions WHERE id = ?",
+            (dec_dismiss,),
+        ).fetchone()
+    assert dec_row is not None
+    assert dec_row["receipt_text"] == "Dismissed by user: Skip dental reminders"
+
+    receipts = _fetch_internal_receipts(cfg.db_path)
+    dismiss_receipts = [
+        r for r in receipts if r["external_id"] == "gate-receipt:prop-modal-dismiss:dismissed"
+    ]
+    assert len(dismiss_receipts) == 1
+    assert "Skip dental reminders" in dismiss_receipts[0]["body"]
+
+    # 6. Bridge interaction routing opens BriefProposalEditModal / BriefProposalDismissModal for brief_proposal
+    #    and preserves ForgeDecisionEditModal / instant dismiss for non-BRIEF handlers.
+    dec_shell = live_forge.stage_decision(
+        category="ops",
+        title="Shell Test",
+        summary="Run echo",
+        handler_type="shell",
+        payload={"command": "echo hi"},
+        channel_id=live_forge.ZERO_CHAT_CHANNEL_ID,
+        db_path=forge_db,
+        post_to_discord=False,
+    )["decision_id"]
+    # Re-stage a pending brief_proposal card for modal open checks
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        {
+            "id": "prop-modal-route",
+            "action": "calendar.create",
+            "args": {
+                "summary": "School Pickup",
+                "start": "2026-12-04T15:00:00-08:00",
+                "end": "2026-12-04T15:30:00-08:00",
+            },
+            "reason": "Calendar sync.",
+            "expires_at": "2026-11-27T18:00:00-08:00",
+            "from_session": "intake/gmail/route-1",
+            "urgent": False,
+        },
+    )
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        {
+            "id": "prop-modal-dismiss-submit",
+            "action": "calendar.create",
+            "args": {
+                "summary": "Early Morning Sync",
+                "start": "2026-12-04T07:30:00-08:00",
+                "end": "2026-12-04T08:00:00-08:00",
+            },
+            "reason": "Proposed early check-in.",
+            "expires_at": "2026-11-27T18:00:00-08:00",
+            "from_session": "intake/gmail/route-2",
+            "urgent": False,
+        },
+    )
+    assert gate.scan_pending_proposals(now=now_ts)["staged"] == 2
+    dec_brief = gate.gate_store.get_proposal("prop-modal-route")["decision_id"]
+    dec_brief_dismiss = gate.gate_store.get_proposal("prop-modal-dismiss-submit")["decision_id"]
+    assert dec_brief and dec_brief_dismiss
+
+    monkeypatch.setattr(live_forge, "FORGE_DB_PATH", forge_db)
+
+    def _make_interaction(custom_id: str) -> Any:
+        inter = MagicMock()
+        inter.type = bridge.discord.InteractionType.component
+        inter.data = {"custom_id": custom_id}
+        inter.user = SimpleNamespace(id=live_forge.OWNER_USER_ID)
+        inter.response = MagicMock()
+        inter.response.is_done = MagicMock(return_value=False)
+        inter.response.send_modal = AsyncMock()
+        inter.response.defer = AsyncMock()
+        inter.response.send_message = AsyncMock()
+        inter.followup = MagicMock()
+        inter.followup.send = AsyncMock()
+        inter.message = None
+        return inter
+
+    async def _exercise_bridge_and_modals() -> None:
+        # brief_proposal edit opens BriefProposalEditModal
+        inter_brief_edit = _make_interaction(f"forge_edit:{dec_brief}")
+        await bridge.on_button_interaction(inter_brief_edit)
+        inter_brief_edit.response.send_modal.assert_awaited_once()
+        opened_edit_modal = inter_brief_edit.response.send_modal.call_args[0][0]
+        assert isinstance(opened_edit_modal, live_forge.BriefProposalEditModal)
+        assert opened_edit_modal.summary_input.default == "School Pickup"
+
+        # non-BRIEF edit opens ForgeDecisionEditModal
+        inter_shell_edit = _make_interaction(f"forge_edit:{dec_shell}")
+        await bridge.on_button_interaction(inter_shell_edit)
+        inter_shell_edit.response.send_modal.assert_awaited_once()
+        assert isinstance(inter_shell_edit.response.send_modal.call_args[0][0], live_forge.ForgeDecisionEditModal)
+
+        # brief_proposal dismiss opens BriefProposalDismissModal BEFORE defer()
+        inter_brief_dismiss = _make_interaction(f"forge_dismiss:{dec_brief_dismiss}")
+        await bridge.on_button_interaction(inter_brief_dismiss)
+        inter_brief_dismiss.response.defer.assert_not_awaited()
+        inter_brief_dismiss.response.send_modal.assert_awaited_once()
+        opened_dismiss_modal = inter_brief_dismiss.response.send_modal.call_args[0][0]
+        assert isinstance(opened_dismiss_modal, live_forge.BriefProposalDismissModal)
+
+        # Submit BriefProposalDismissModal with optional note
+        opened_dismiss_modal.db_path = forge_db
+        opened_dismiss_modal.reason_input._value = "No meetings before 9 AM"
+        submit_dismiss_inter = _make_interaction("modal_submit_dismiss")
+        await opened_dismiss_modal.on_submit(submit_dismiss_inter)
+        submit_dismiss_inter.response.defer.assert_awaited_once()
+        dismissed_row = gate.gate_store.get_proposal("prop-modal-dismiss-submit")
+        assert dismissed_row is not None
+        assert dismissed_row["status"] == "dismissed"
+        dismiss_modal_receipts = [
+            r
+            for r in _fetch_internal_receipts(cfg.db_path)
+            if r["external_id"] == "gate-receipt:prop-modal-dismiss-submit:dismissed"
+        ]
+        assert len(dismiss_modal_receipts) == 1
+        assert "No meetings before 9 AM" in dismiss_modal_receipts[0]["body"]
+
+        # Submit BriefProposalEditModal with readable PT time
+        opened_edit_modal.db_path = forge_db
+        opened_edit_modal.summary_input._value = "School Pickup (Updated)"
+        opened_edit_modal.start_input._value = "2026-12-04 3:30 PM"
+        opened_edit_modal.end_input._value = "2026-12-04 16:00"
+        opened_edit_modal.location_input._value = "North Gate"
+        opened_edit_modal.description_input._value = "Early release"
+        submit_edit_inter = _make_interaction("modal_submit")
+        await opened_edit_modal.on_submit(submit_edit_inter)
+        submit_edit_inter.response.defer.assert_awaited_once()
+        route_row = gate.gate_store.get_proposal("prop-modal-route")
+        assert route_row is not None
+        assert route_row["status"] == "edited_executed"
+
+        # non-BRIEF dismiss still performs instant 1-click dismiss without modal
+        inter_shell_dismiss = _make_interaction(f"forge_dismiss:{dec_shell}")
+        await bridge.on_button_interaction(inter_shell_dismiss)
+        inter_shell_dismiss.response.send_modal.assert_not_awaited()
+        inter_shell_dismiss.response.defer.assert_awaited_once()
+        with live_forge.get_db_connection(forge_db) as conn:
+            shell_row = conn.execute("SELECT status FROM forge_decisions WHERE id = ?", (dec_shell,)).fetchone()
+        assert shell_row is not None
+        assert shell_row["status"] == "dismissed"
+
+    asyncio.run(_exercise_bridge_and_modals())

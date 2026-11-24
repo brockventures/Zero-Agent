@@ -923,9 +923,25 @@ async def on_button_interaction(interaction: discord.Interaction):
                 try:
                     import tools.forge
                     with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
-                        row = conn.execute("SELECT payload_json FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+                        row = conn.execute(
+                            "SELECT handler_type, payload_json FROM forge_decisions WHERE id = ?",
+                            (decision_id,),
+                        ).fetchone()
+                    handler_type = (row["handler_type"] or "") if row else ""
                     cur_payload = json.loads(row["payload_json"]) if row and row["payload_json"] else {}
-                    await interaction.response.send_modal(tools.forge.ForgeDecisionEditModal(decision_id, cur_payload))
+                    if handler_type == "brief_proposal":
+                        modal = tools.forge.BriefProposalEditModal(
+                            decision_id,
+                            cur_payload,
+                            db_path=tools.forge.FORGE_DB_PATH,
+                        )
+                    else:
+                        modal = tools.forge.ForgeDecisionEditModal(
+                            decision_id,
+                            cur_payload,
+                            db_path=tools.forge.FORGE_DB_PATH,
+                        )
+                    await interaction.response.send_modal(modal)
                 except Exception as me:
                     try:
                         is_done = interaction.response.is_done()
@@ -936,6 +952,39 @@ async def on_button_interaction(interaction: discord.Interaction):
                     except Exception:
                         pass
                 return
+
+            if action_prefix == "forge_dismiss":
+                handler_type = ""
+                try:
+                    import tools.forge
+                    with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
+                        row = conn.execute(
+                            "SELECT handler_type FROM forge_decisions WHERE id = ?",
+                            (decision_id,),
+                        ).fetchone()
+                    handler_type = (row["handler_type"] or "") if row else ""
+                except Exception:
+                    handler_type = ""
+
+                if handler_type == "brief_proposal":
+                    try:
+                        import tools.forge
+                        await interaction.response.send_modal(
+                            tools.forge.BriefProposalDismissModal(
+                                decision_id,
+                                db_path=tools.forge.FORGE_DB_PATH,
+                            )
+                        )
+                    except Exception as me:
+                        try:
+                            is_done = interaction.response.is_done()
+                            if asyncio.iscoroutine(is_done):
+                                is_done = await is_done
+                            if not is_done:
+                                await interaction.response.send_message(f"⚠️ Could not open dismiss modal: {me}", ephemeral=True)
+                        except Exception:
+                            pass
+                    return
 
             try:
                 is_done = interaction.response.is_done()
@@ -984,9 +1033,19 @@ async def on_button_interaction(interaction: discord.Interaction):
             import tools.forge
             try:
                 if action_prefix == "forge_approve":
-                    res = await asyncio.to_thread(tools.forge.execute_decision, decision_id, interaction.user.id)
+                    res = await asyncio.to_thread(
+                        tools.forge.execute_decision,
+                        decision_id,
+                        interaction.user.id,
+                        db_path=tools.forge.FORGE_DB_PATH,
+                    )
                 else:
-                    res = await asyncio.to_thread(tools.forge.dismiss_decision, decision_id, interaction.user.id)
+                    res = await asyncio.to_thread(
+                        tools.forge.dismiss_decision,
+                        decision_id,
+                        interaction.user.id,
+                        db_path=tools.forge.FORGE_DB_PATH,
+                    )
             except Exception as exc:
                 res = {"ok": False, "error": str(exc)}
 

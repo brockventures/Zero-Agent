@@ -11122,20 +11122,23 @@ execute_decision_card = execute_decision
 def dismiss_decision(
     decision_id: str,
     user_id: int = OWNER_USER_ID,
+    note: str = "",
     db_path: Path | str = FORGE_DB_PATH,
 ) -> dict:
     """Dismiss a pending Decision Card without executing its payload."""
     if int(user_id) != OWNER_USER_ID:
         return {"ok": False, "error": "Unauthorized user ID."}
+    clean_note = str(note or "").strip()
+    receipt_text = f"Dismissed by user: {clean_note[:200]}" if clean_note else "Dismissed by user"
     now = time.time()
     with get_db_connection(db_path) as conn:
         row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
         if not row:
             return {"ok": False, "error": "Decision not found."}
         cur = conn.execute(
-            "UPDATE forge_decisions SET status = 'dismissed', resolved_at = ?, receipt_text = 'Dismissed by user' "
+            "UPDATE forge_decisions SET status = 'dismissed', resolved_at = ?, receipt_text = ? "
             "WHERE id = ? AND status = 'pending'",
-            (now, decision_id),
+            (now, receipt_text, decision_id),
         )
         updated_row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
         if cur.rowcount == 0:
@@ -11152,7 +11155,7 @@ def dismiss_decision(
         try:
             from tools.brief.gate import handle_forge_decision_dismiss
 
-            handle_forge_decision_dismiss(json.loads(row["payload_json"] or "{}"))
+            handle_forge_decision_dismiss(json.loads(row["payload_json"] or "{}"), note=clean_note)
         except Exception:
             pass
 
@@ -11160,6 +11163,7 @@ def dismiss_decision(
         "ok": True,
         "decision_id": decision_id,
         "status": "dismissed",
+        "note": clean_note,
         "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
         "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
     }
@@ -11355,6 +11359,288 @@ class ForgeDecisionEditModal(discord.ui.Modal):
                     await interaction.message.edit(content=res["formatted_card"], view=view)
             except Exception:
                 pass
+
+
+_DATE_ONLY_MODAL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_brief_edit_modal_time(raw_text: str, tz_name: str = "America/Los_Angeles") -> str:
+    """Parse ISO-8601, date-only YYYY-MM-DD, or readable PT date/time into normalized ISO-8601 (or YYYY-MM-DD)."""
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("Timestamp must be a non-empty string.")
+    text = raw_text.strip()
+    tz = ZoneInfo(tz_name)
+
+    if _DATE_ONLY_MODAL_RE.fullmatch(text):
+        datetime.strptime(text, "%Y-%m-%d")
+        return text
+
+    iso_candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        dt = datetime.fromisoformat(iso_candidate)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt.isoformat()
+    except ValueError:
+        pass
+
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned_ampm = re.sub(r"(?i)(?<=\d)(am|pm)$", r" \1", cleaned).upper()
+    for fmt in ("%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M:%S %p", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(cleaned_ampm, fmt).replace(tzinfo=tz)
+            return dt.isoformat()
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"Invalid date/time {raw_text!r}. Use YYYY-MM-DD HH:MM, YYYY-MM-DD HH:MM AM/PM, YYYY-MM-DD, or ISO-8601."
+    )
+
+
+def _format_brief_modal_time_default(raw_value: Any, tz_name: str = "America/Los_Angeles") -> str:
+    """Format stored ISO-8601 or date-only value cleanly for BRIEF Edit modal pre-fill."""
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return ""
+    text = raw_value.strip()
+    if _DATE_ONLY_MODAL_RE.fullmatch(text):
+        return text
+    iso_candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        dt = datetime.fromisoformat(iso_candidate)
+        tz = ZoneInfo(tz_name)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        else:
+            dt = dt.astimezone(tz)
+        return dt.strftime("%Y-%m-%d %H:%M:%S" if dt.second else "%Y-%m-%d %H:%M")
+    except ValueError:
+        return text
+
+
+def _resolve_brief_modal_args(current_payload: dict) -> dict:
+    """Return pre-filled BRIEF calendar args from payload['args'] or fall back to BriefGateStore."""
+    if not isinstance(current_payload, dict):
+        return {}
+    direct_args = current_payload.get("args")
+    if isinstance(direct_args, dict) and direct_args:
+        return dict(direct_args)
+
+    proposal_id = str(current_payload.get("proposal_id") or "").strip()
+    state_dir = current_payload.get("state_dir")
+    if proposal_id and state_dir:
+        gate_db_path = Path(str(state_dir)) / "gate.db"
+        if gate_db_path.is_file():
+            try:
+                from tools.brief.gate import BriefGateStore
+
+                row = BriefGateStore(gate_db_path).get_proposal(proposal_id)
+                if row and row.get("args_json"):
+                    parsed = json.loads(str(row["args_json"]))
+                    if isinstance(parsed, dict):
+                        return parsed
+            except Exception:
+                pass
+    return dict(direct_args) if isinstance(direct_args, dict) else {}
+
+
+async def _disable_decision_card_buttons(message: Optional[discord.Message]) -> None:
+    if not message:
+        return
+    try:
+        view = discord.ui.View.from_message(message)
+        for item in view.children:
+            item.disabled = True
+        await message.edit(view=view)
+    except Exception:
+        pass
+
+
+async def _finalize_decision_card_message(message: Optional[discord.Message], res: dict) -> None:
+    if not message:
+        return
+    try:
+        view = discord.ui.View.from_message(message)
+        for item in view.children:
+            item.disabled = True
+        if res.get("formatted_embed"):
+            embed = discord.Embed.from_dict(res["formatted_embed"])
+            await message.edit(content="", embed=embed, view=view)
+        elif res.get("formatted_card"):
+            await message.edit(content=res["formatted_card"], view=view)
+        else:
+            await message.edit(view=view)
+    except Exception:
+        pass
+
+
+class BriefProposalEditModal(discord.ui.Modal):
+    """Native Discord Modal for editing BRIEF calendar proposal fields before execution."""
+
+    def __init__(self, decision_id: str, current_payload: dict, db_path: Path | str = FORGE_DB_PATH):
+        super().__init__(title=f"Edit BRIEF Event ({decision_id[:12]})")
+        self.decision_id = decision_id
+        self.db_path = db_path
+        self._current_payload = dict(current_payload or {})
+        self._action = str(self._current_payload.get("action") or "calendar.create").strip()
+        self._base_args = _resolve_brief_modal_args(self._current_payload)
+
+        summary_default = str(self._base_args.get("summary") or "")[:300]
+        start_default = _format_brief_modal_time_default(self._base_args.get("start"))[:100]
+        end_default = _format_brief_modal_time_default(self._base_args.get("end"))[:100]
+        location_default = str(self._base_args.get("location") or "")[:300]
+        desc_default = str(self._base_args.get("description") or "")[:2000]
+        is_update = self._action == "calendar.update"
+
+        self.summary_input = discord.ui.TextInput(
+            label="Title",
+            style=discord.TextStyle.short,
+            default=summary_default,
+            required=(not is_update or bool(summary_default)),
+        )
+        self.start_input = discord.ui.TextInput(
+            label="Start (PT, YYYY-MM-DD HH:MM or ISO)",
+            style=discord.TextStyle.short,
+            default=start_default,
+            required=(not is_update or bool(start_default)),
+        )
+        self.end_input = discord.ui.TextInput(
+            label="End (PT, YYYY-MM-DD HH:MM or ISO)",
+            style=discord.TextStyle.short,
+            default=end_default,
+            required=(not is_update or bool(end_default)),
+        )
+        self.location_input = discord.ui.TextInput(
+            label="Location",
+            style=discord.TextStyle.short,
+            default=location_default,
+            required=False,
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description",
+            style=discord.TextStyle.paragraph,
+            default=desc_default,
+            required=False,
+        )
+        for field in (
+            self.summary_input,
+            self.start_input,
+            self.end_input,
+            self.location_input,
+            self.description_input,
+        ):
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != OWNER_USER_ID:
+            await interaction.response.send_message(
+                "⛔ Only the system owner may edit and approve FORGE Decision Cards.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+
+        merged_args = dict(self._base_args)
+        try:
+            summary_val = (self.summary_input.value or "").strip()
+            if summary_val:
+                merged_args["summary"] = summary_val
+            elif self._action != "calendar.update" or "summary" in merged_args:
+                raise ValueError("Title cannot be empty.")
+
+            start_raw = (self.start_input.value or "").strip()
+            if start_raw:
+                merged_args["start"] = _parse_brief_edit_modal_time(start_raw)
+            elif self._action != "calendar.update" or "start" in merged_args:
+                raise ValueError("Start time cannot be empty.")
+
+            end_raw = (self.end_input.value or "").strip()
+            if end_raw:
+                merged_args["end"] = _parse_brief_edit_modal_time(end_raw)
+            elif self._action != "calendar.update" or "end" in merged_args:
+                raise ValueError("End time cannot be empty.")
+
+            loc_val = (self.location_input.value or "").strip()
+            if loc_val:
+                merged_args["location"] = loc_val
+            elif "location" in merged_args:
+                if self._action == "calendar.update":
+                    merged_args["location"] = ""
+                else:
+                    merged_args.pop("location", None)
+
+            desc_val = (self.description_input.value or "").strip()
+            if desc_val:
+                merged_args["description"] = desc_val
+            elif "description" in merged_args:
+                if self._action == "calendar.update":
+                    merged_args["description"] = ""
+                else:
+                    merged_args.pop("description", None)
+
+            if self._action in ("calendar.create", "calendar.update"):
+                from tools.brief.actions import validate_action_args
+
+                merged_args = validate_action_args(self._action, merged_args)
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Invalid BRIEF event fields: `{e}`", ephemeral=True)
+            return
+
+        await _disable_decision_card_buttons(interaction.message)
+        res = await asyncio.to_thread(
+            execute_decision,
+            self.decision_id,
+            user_id=interaction.user.id,
+            override_payload={"args": merged_args},
+            db_path=self.db_path,
+        )
+        await _finalize_decision_card_message(interaction.message, res)
+        if not res.get("ok"):
+            await interaction.followup.send(
+                f"⚠️ Could not execute edited BRIEF proposal: {res.get('error', 'unknown error')}",
+                ephemeral=True,
+            )
+
+
+class BriefProposalDismissModal(discord.ui.Modal):
+    """Native Discord Modal capturing optional dismissal feedback to teach BRIEF."""
+
+    def __init__(self, decision_id: str, db_path: Path | str = FORGE_DB_PATH):
+        super().__init__(title=f"Dismiss BRIEF Proposal ({decision_id[:12]})")
+        self.decision_id = decision_id
+        self.db_path = db_path
+        self.reason_input = discord.ui.TextInput(
+            label="Why? (Optional - teaches BRIEF)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=300,
+            placeholder="e.g. No meetings before 9 AM, or skip school reminders",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != OWNER_USER_ID:
+            await interaction.response.send_message(
+                "⛔ Only the system owner may dismiss FORGE Decision Cards.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        await _disable_decision_card_buttons(interaction.message)
+        note_val = (self.reason_input.value or "").strip()
+        res = await asyncio.to_thread(
+            dismiss_decision,
+            self.decision_id,
+            user_id=interaction.user.id,
+            note=note_val,
+            db_path=self.db_path,
+        )
+        await _finalize_decision_card_message(interaction.message, res)
+        if not res.get("ok"):
+            await interaction.followup.send(
+                f"⚠️ Could not dismiss BRIEF proposal: {res.get('error', 'unknown error')}",
+                ephemeral=True,
+            )
 
 
 # ---------------------------------------------------------------------------
