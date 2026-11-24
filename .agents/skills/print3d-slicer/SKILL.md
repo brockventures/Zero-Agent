@@ -107,11 +107,13 @@ When scaling down full-size models (e.g. 50% scale from 120.0mm down to 60.0mm h
 
 ---
 
-## ⚙️ Slicing Execution Engine (OrcaSlicer on Host 2)
+## ⚙️ Slicing Execution Engine (OrcaSlicer on Host 2 — On-Demand Lifecycle)
 
-OrcaSlicer runs headlessly inside Docker on Host 2 (`<HOST_2_IP>`):
+OrcaSlicer runs **on-demand** inside Docker on Host 2 (`<HOST_2_IP>`, `$NAS_HOST_2_DOCKER_ROOT/orcaslicer`, `restart: "no"`, **2 GB** memory cap) so its desktop GUI never idles in RAM between prints:
 
-### 1. Slicing Command Pattern & Weekly (7-Day) Bed Mesh Probing Policy:
+### 1. Mandatory On-Demand Start → Slice → Stop Pattern & Weekly (7-Day) Bed Mesh Probing Policy:
+- **Start Before Slicing, Stop Immediately After:** Before running `orca-slicer`, start the container via Compose (`docker compose -f $NAS_HOST_2_DOCKER_ROOT/orcaslicer/docker-compose.yml start orcaslicer`), run the headless CLI slice, and immediately stop it (`docker compose -f $NAS_HOST_2_DOCKER_ROOT/orcaslicer/docker-compose.yml stop orcaslicer`) once the `.gcode` is written.
+- **Automated 30-Minute Idle Auto-Stop Safety Net (`orcaslicer_idle_reaper`):** A scheduled sidecar checks OrcaSlicer every 10 minutes for CPU activity, active web UI sessions, CLI slicing, or recent `/prints` writes, and automatically stops the container via Docker Compose after 30 minutes of continuous inactivity (covering manual web UI sessions or interrupted turns).
 - **Default Fast Start (`my_machine.json` — `G28` + `M420 S1` EEPROM Recall):**
   - Standard prints load `/prints/my_machine.json`, which homes via CR-Touch at the center of the heated 60°C bed (`G28`) and immediately restores the saved twist-compensated mesh from EEPROM (`M420 S1` in 0.1s), skipping the 2-minute 16-point `G29` probe.
 - **Weekly Full Calibration (`my_machine_probe.json` — 7-Day TTL in `bed_mesh_state.json`):**
@@ -119,12 +121,19 @@ OrcaSlicer runs headlessly inside Docker on Host 2 (`<HOST_2_IP>`):
   - Check `/workspace/data/3dprint/bed_mesh_state.json` (`python3 /workspace/tools/zero_printer_watcher.py --check-mesh` or `select_machine_profile()`): if `now >= next_probe_due_epoch`, slice with `/prints/my_machine_probe.json` and update `bed_mesh_state.json`; otherwise slice with `/prints/my_machine.json`.
 
 ```bash
+# 1. Start on-demand container on Host 2
+docker compose -f "$NAS_HOST_2_DOCKER_ROOT/orcaslicer/docker-compose.yml" start orcaslicer
+
+# 2. Slice headlessly at low CPU/IO priority
 nice -n 19 sudo docker exec orcaslicer /opt/orcaslicer/bin/orca-slicer \
   --load-settings "/prints/my_machine.json;/prints/zero_figurine_process.json" \
   --load-filaments "/prints/my_filament.json" \
   --slice 0 \
   --outputdir /prints \
   /prints/model.stl
+
+# 3. Stop immediately after slicing to reclaim RAM (30m idle reaper acts as backup)
+docker compose -f "$NAS_HOST_2_DOCKER_ROOT/orcaslicer/docker-compose.yml" stop orcaslicer
 ```
 
 ### 2. Autonomous Slicing Parameter Profiles:
