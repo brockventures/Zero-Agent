@@ -10711,6 +10711,9 @@ def _resolve_decision_channel(channel_id: int) -> tuple[int, Optional[int]]:
     return ZERO_CHAT_CHANNEL_ID, cid
 
 
+DEFAULT_DECISION_TTL_SECONDS = 259200.0  # 72 hours
+
+
 def stage_decision(
     category: str,
     title: str,
@@ -10718,7 +10721,7 @@ def stage_decision(
     handler_type: str,
     payload: dict,
     channel_id: int = ZERO_CHAT_CHANNEL_ID,
-    ttl_seconds: float = 7200.0,
+    ttl_seconds: float = DEFAULT_DECISION_TTL_SECONDS,
     is_private: Optional[bool] = None,
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = False,
@@ -10802,7 +10805,7 @@ def stage_decision_card(
     handler_type: str,
     payload: dict,
     channel_id: int = ZERO_CHAT_CHANNEL_ID,
-    ttl_seconds: float = 7200.0,
+    ttl_seconds: float = DEFAULT_DECISION_TTL_SECONDS,
     is_private: Optional[bool] = None,
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = False,
@@ -12225,7 +12228,7 @@ def main():
     p_dec.add_argument("--handler", required=True)
     p_dec.add_argument("--payload", required=True, help="JSON string payload")
     p_dec.add_argument("--channel-id", type=int, default=ZERO_CHAT_CHANNEL_ID)
-    p_dec.add_argument("--ttl", type=float, default=7200.0)
+    p_dec.add_argument("--ttl", type=float, default=DEFAULT_DECISION_TTL_SECONDS)
     p_dec.add_argument("--post", action="store_true", help="Post immediately via Discord REST API")
 
     sub.add_parser("reconcile", help="Run boot reconciliation and worktree cleanup")
