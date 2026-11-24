@@ -15,6 +15,7 @@ DEFAULT_CHANNEL_ID = 1574655816236269569
 DEFAULT_STATE_DIR = Path("/workspace/data/brief")
 DEFAULT_MEMORY_DIR = Path("/workspace/memory/private/brief")
 DEFAULT_SECRETS_PATH = Path("/secrets/env.json")
+DEFAULT_GATE_WRITE_TOKEN_PATH = Path("/secrets/brief_write_token.json")
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts" / "brief"
 
 
@@ -111,6 +112,12 @@ class BriefConfig:
     max_retries: int = 3
     stuck_delivery_seconds: int = 300
 
+    # [gate]
+    gate_write_token_path: Path = DEFAULT_GATE_WRITE_TOKEN_PATH
+    gate_allow_shared_oauth_fallback: bool = False
+    gate_max_proposal_ttl_seconds: int = 604800
+    gate_default_calendar_id: str = "primary"
+
     # Runtime filesystem directories
     state_dir: Path = DEFAULT_STATE_DIR
     memory_dir: Path = DEFAULT_MEMORY_DIR
@@ -121,6 +128,12 @@ class BriefConfig:
         self.state_dir = Path(self.state_dir)
         self.memory_dir = Path(self.memory_dir)
         self.prompts_dir = Path(self.prompts_dir)
+        self.gate_write_token_path = Path(self.gate_write_token_path)
+        self.gate_allow_shared_oauth_fallback = bool(self.gate_allow_shared_oauth_fallback)
+        self.gate_max_proposal_ttl_seconds = int(self.gate_max_proposal_ttl_seconds)
+        self.gate_default_calendar_id = (
+            str(self.gate_default_calendar_id or "primary").strip() or "primary"
+        )
         if self.config_path is not None:
             self.config_path = Path(self.config_path)
         self.allowlisted_emails = _merge_unique_emails(self.allowlisted_emails)
@@ -128,6 +141,10 @@ class BriefConfig:
     @property
     def db_path(self) -> Path:
         return self.state_dir / "inbox.db"
+
+    @property
+    def gate_db_path(self) -> Path:
+        return self.state_dir / "gate.db"
 
     @property
     def cursors_path(self) -> Path:
@@ -227,11 +244,31 @@ class BriefConfig:
         limits = data.get("limits", {})
         sessions = data.get("sessions", {})
         safety = data.get("safety", {})
+        gate = data.get("gate", {})
+        if not isinstance(gate, dict):
+            gate = {}
 
         toml_emails = _parse_email_list(owner.get("allowlisted_emails", []))
         env_emails = _parse_email_list(os.environ.get("BRIEF_OWNER_EMAILS", ""))
         resolved_secrets = Path(secrets_path) if secrets_path is not None else None
         secret_emails = _load_secrets_owner_emails(resolved_secrets)
+
+        raw_write_token_path = gate.get(
+            "write_token_path",
+            gate.get("gate_write_token_path", DEFAULT_GATE_WRITE_TOKEN_PATH),
+        )
+        raw_allow_fallback = gate.get(
+            "allow_shared_oauth_fallback",
+            gate.get("gate_allow_shared_oauth_fallback", False),
+        )
+        raw_max_ttl = gate.get(
+            "max_proposal_ttl_seconds",
+            gate.get("gate_max_proposal_ttl_seconds", 604800),
+        )
+        raw_default_cal_id = gate.get(
+            "default_calendar_id",
+            gate.get("gate_default_calendar_id", "primary"),
+        )
 
         return cls(
             channel_id=int(channel.get("channel_id", DEFAULT_CHANNEL_ID)),
@@ -252,6 +289,10 @@ class BriefConfig:
             dry_run=bool(safety.get("dry_run", True)),
             max_retries=int(safety.get("max_retries", 3)),
             stuck_delivery_seconds=int(safety.get("stuck_delivery_seconds", 300)),
+            gate_write_token_path=Path(raw_write_token_path),
+            gate_allow_shared_oauth_fallback=bool(raw_allow_fallback),
+            gate_max_proposal_ttl_seconds=int(raw_max_ttl),
+            gate_default_calendar_id=str(raw_default_cal_id),
             state_dir=resolved_state,
             memory_dir=resolved_memory,
             prompts_dir=resolved_prompts,

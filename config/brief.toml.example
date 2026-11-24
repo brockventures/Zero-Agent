@@ -31,3 +31,9 @@ task_model = "gemini-4-neon-medium"
 dry_run = true
 max_retries = 3
 stuck_delivery_seconds = 300
+
+[gate]
+write_token_path = "/secrets/brief_write_token.json"
+allow_shared_oauth_fallback = false
+max_proposal_ttl_seconds = 604800
+default_calendar_id = "primary"
