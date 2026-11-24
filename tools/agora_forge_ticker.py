@@ -10,6 +10,7 @@ Checks:
 """
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -38,10 +39,25 @@ def heal_and_check_active_forge_build() -> str | None:
         rows = cur.fetchall()
         now = time.time()
         active_label = None
+        wt_roots: list[Path] = []
+        seen_roots: set[str] = set()
+        env_wt_root = os.environ.get("FORGE_WORKTREE_ROOT", "").strip()
+        raw_roots = ([Path(env_wt_root)] if env_wt_root else []) + [
+            Path("/workspace/data/forge-worktrees"),
+            Path("/tmp"),
+        ]
+        for cand_root in raw_roots:
+            norm_root = os.path.normpath(os.path.abspath(str(cand_root)))
+            if norm_root not in seen_roots:
+                seen_roots.add(norm_root)
+                wt_roots.append(cand_root)
         for bid, title, status, updated_at in rows:
             age = now - float(updated_at or now)
             # Check if a running build was orphaned by a container restart (>25 min stale or missing worktree)
-            wt_exists = any(Path("/tmp").glob(f"forge-wt-{bid}*"))
+            wt_exists = any(
+                root.is_dir() and any(root.glob(f"forge-wt-{bid}*"))
+                for root in wt_roots
+            )
             if status == "running" and (age > 1500 or (age > 180 and not wt_exists)):
                 cur.execute("UPDATE forge_builds SET status = 'failed' WHERE id = ?", (bid,))
                 cur.execute(

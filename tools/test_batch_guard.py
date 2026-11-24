@@ -15,6 +15,9 @@ if os.path.isfile(os.path.join(_TOOLS_DIR, "batch_guard.py")):
 sys.path.insert(0, _REPO_ROOT)
 from batch_guard import (
     STATE_FILE,
+    _extract_forge_worktree_relpath,
+    _is_forge_worktree_path,
+    _is_safe_tmp_sql_target,
     check_batching,
     check_destructive_system_and_exposure_gate,
     check_forge_post_offload_lock,
@@ -23,6 +26,7 @@ from batch_guard import (
     check_secrets_mutation_gate,
     check_tool_use,
     has_forge_job_start_command,
+    is_destructive_git_working_tree_wipe,
     is_exempt_from_investigation_gate,
     load_state,
     FORGE_CHANNEL_ID_STR,
@@ -35,6 +39,7 @@ def isolate_forge_worker_env(monkeypatch):
     monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
     monkeypatch.delenv("FORGE_PROHIBITED_FILES", raising=False)
     monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    monkeypatch.delenv("FORGE_WORKTREE_ROOT", raising=False)
     monkeypatch.delenv("DISCORD_CHANNEL_ID", raising=False)
     monkeypatch.setattr("batch_guard.IN_FLIGHT_TURN_FILE", "/nonexistent_in_flight_turn.json")
 
@@ -1769,7 +1774,7 @@ def test_tools_and_hooks_batch_guard_copies_are_identical(tmp_path):
     assert tools_copy.is_file(), f"Missing {tools_copy}"
     assert hooks_copy.is_file(), f"Missing {hooks_copy}"
     if (
-        str(Path(_REPO_ROOT).resolve()).startswith("/tmp/forge-wt-")
+        _is_forge_worktree_path(str(Path(_REPO_ROOT).resolve()))
         and tools_copy.read_bytes() != hooks_copy.read_bytes()
     ):
         hooks_copy.write_bytes(tools_copy.read_bytes())
@@ -2249,7 +2254,6 @@ def test_vulcan_in_flight_turn_file_selection_and_turn_anchor_offload_reset(tmp_
 
 
 def test_ensure_canary_honeypot_file(tmp_path):
-    from pathlib import Path
     from batch_guard import ensure_canary_honeypot_file
 
     decoy_file = tmp_path / "decoy" / "passwords.txt"
@@ -2575,7 +2579,6 @@ def test_airgap_and_web_taint_reject_comment_and_chained_forge_propose_bypass(tm
 
 
 def test_airgap_and_web_taint_block_dotdot_traversal_and_symlinks(tmp_path, monkeypatch):
-    from pathlib import Path
     from batch_guard import check_crab_cavern_airgap_guard, check_web_ipi_taint_gate, _norm_posix
 
     monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
@@ -2793,5 +2796,80 @@ def test_forge_prohibited_file_gate_noop_when_inactive_empty_or_invalid(monkeypa
         ok_noop, reason_noop = check_forge_prohibited_file_gate("edit_file", {"Path": "tools/forge.py"}, cwd=wt_cwd)
         assert ok_noop is True, f"Expected no-op for FORGE_PROHIBITED_FILES={raw_val!r}, got: {reason_noop}"
         assert reason_noop == ""
+
+
+def test_nvme_forge_worktree_recognition_and_guards(tmp_path, monkeypatch):
+    """Verify /workspace/data/forge-worktrees/forge-wt-* and FORGE_WORKTREE_ROOT match legacy /tmp/forge-wt-* guard semantics."""
+    from batch_guard import check_crab_cavern_airgap_guard
+
+    nvme_wt = "/workspace/data/forge-worktrees/forge-wt-fg-123-c0"
+    legacy_wt = "/tmp/forge-wt-fg-123-c0"
+
+    assert _is_forge_worktree_path(nvme_wt) is True
+    assert _is_forge_worktree_path(f"{nvme_wt}/tools/forge.py") is True
+    assert _is_forge_worktree_path(legacy_wt) is True
+    assert _is_forge_worktree_path("/workspace/data/forge-worktrees") is False
+    assert _extract_forge_worktree_relpath(nvme_wt) is None
+    assert _extract_forge_worktree_relpath(f"{nvme_wt}/") is None
+    assert _extract_forge_worktree_relpath(f"{nvme_wt}/tools/forge.py") == "tools/forge.py"
+    assert _extract_forge_worktree_relpath(f"{legacy_wt}/tools/forge.py") == "tools/forge.py"
+
+    custom_root = str(tmp_path / "custom-wts")
+    monkeypatch.setenv("FORGE_WORKTREE_ROOT", custom_root)
+    assert _is_forge_worktree_path(f"{custom_root}/forge-wt-fg-9-c0") is True
+    assert _extract_forge_worktree_relpath(f"{custom_root}/forge-wt-fg-9-c0/tools/x.py") == "tools/x.py"
+    assert _extract_forge_worktree_relpath(f"{custom_root}/forge-wt-fg-9-c0") is None
+    monkeypatch.delenv("FORGE_WORKTREE_ROOT", raising=False)
+
+    # 1. Worktree exemptions (investigation gate, destructive git wipe, inline multi-file edit)
+    assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "ls"}, cwd=nvme_wt) is True
+    assert is_destructive_git_working_tree_wipe("git reset --hard", cwd=nvme_wt) is False
+    state_file = str(tmp_path / "nvme_wt_state.json")
+    with unittest.mock.patch("os.access", return_value=True):
+        for fname in ("alpha.py", "beta.py", "gamma.py"):
+            assert check_tool_use("edit_file", {"Path": f"/workspace/tools/{fname}"}, state_file=state_file, agy_pid=99101)[0] is True
+        ok_wt_edit, reason_wt_edit = check_tool_use(
+            "edit_file",
+            {"Path": f"{nvme_wt}/tools/delta.py"},
+            state_file=state_file,
+            cwd=nvme_wt,
+            agy_pid=99101,
+        )
+        assert ok_wt_edit is True, f"Expected NVMe worktree edit exemption, got: {reason_wt_edit}"
+
+    # 2. Prohibited-file relative path enforcement inside NVMe worktree
+    monkeypatch.setenv("FORGE_WORKER_ACTIVE", "1")
+    monkeypatch.setenv("FORGE_PROHIBITED_FILES", json.dumps(["tools/forge.py"]))
+    ok_proh, reason_proh = check_forge_prohibited_file_gate(
+        "edit_file",
+        {"Path": f"{nvme_wt}/tools/forge.py"},
+        cwd="/workspace",
+    )
+    assert ok_proh is False
+    assert "FORGE Boundary Guard Triggered" in reason_proh
+
+    ok_proh_rel, _ = check_forge_prohibited_file_gate("edit_file", {"Path": "tools/forge.py"}, cwd=nvme_wt)
+    assert ok_proh_rel is False
+    ok_allowed, _ = check_forge_prohibited_file_gate(
+        "edit_file",
+        {"Path": f"{nvme_wt}/tools/batch_guard.py"},
+        cwd=nvme_wt,
+    )
+    assert ok_allowed is True
+
+    # 3. SQLite /tmp fixture exclusion for custom FORGE_WORKTREE_ROOT under /tmp and NVMe worktree
+    monkeypatch.setenv("FORGE_WORKTREE_ROOT", "/tmp/custom-wt-root")
+    assert _is_safe_tmp_sql_target("/tmp/custom-wt-root/forge-wt-fg-1-c0/data/forge.db", cwd="/workspace") is False
+    monkeypatch.delenv("FORGE_WORKTREE_ROOT", raising=False)
+    assert _is_safe_tmp_sql_target("data/forge.db", cwd=nvme_wt) is False
+
+    # 4. Non-bypass of destructive, secrets, and Crab Cavern airgap guards inside NVMe worktree
+    assert check_destructive_system_and_exposure_gate('sqlite3 /workspace/data/forge.db "DROP TABLE builds"', cwd=nvme_wt)[0] is False
+    assert check_secrets_mutation_gate("/secrets/env.json", cwd=nvme_wt)[0] is False
+
+    monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", "1534452820995080192")
+    assert check_crab_cavern_airgap_guard("read_file", {"Path": "/secrets/env.json"}, cwd=nvme_wt)[0] is False
+    assert check_crab_cavern_airgap_guard("run_command", {"CommandLine": "cat /secrets/env.json"}, cwd=nvme_wt)[0] is False
 
 

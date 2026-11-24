@@ -68,6 +68,21 @@ FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 TASKS_DIR = DATA_DIR / "detached_tasks"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def get_forge_worktree_root() -> Path:
+    """Resolve root directory for isolated FORGE chunk worktrees (NVMe /workspace/data/forge-worktrees by default, /tmp fallback)."""
+    env_root = os.environ.get("FORGE_WORKTREE_ROOT", "").strip()
+    if env_root:
+        return Path(env_root)
+    if DATA_DIR.is_dir() and os.access(DATA_DIR, os.W_OK):
+        return DATA_DIR / "forge-worktrees"
+    return Path("/tmp")
+
+
+def get_chunk_worktree_dir(chunk_id: str) -> Path:
+    """Return the isolated git worktree directory path for a given chunk_id."""
+    return get_forge_worktree_root() / f"forge-wt-{chunk_id}"
+
 DEFAULT_BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
@@ -7292,7 +7307,7 @@ def _get_active_build_worker_ids(db_path: Path | str = FORGE_DB_PATH) -> set[str
 
 
 def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
-    """Clean up stale /tmp/forge-wt-* worktrees and reset interrupted running chunks on startup, preserving active worker worktrees."""
+    """Clean up stale FORGE worktrees (/workspace/data/forge-worktrees/forge-wt-* and legacy /tmp/forge-wt-*) and reset interrupted running chunks on startup, preserving active worker worktrees."""
     if _is_prod_forge_env(db_path):
         try:
             consolidate_legacy_forge_db(primary_db_path=db_path)
@@ -7322,11 +7337,42 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
 
     active_build_ids = locked_build_ids | db_active_build_ids
     cleaned_wts = []
-    cur_cwd = os.getcwd()
-    for wt_path in glob.glob("/tmp/forge-wt-*"):
-        if wt_path == cur_cwd or cur_cwd.startswith(wt_path.rstrip("/") + "/"):
+    cur_cwd = os.path.normpath(os.path.abspath(os.getcwd()))
+    cur_cwd_real = os.path.realpath(cur_cwd)
+    wt_roots: list[Path] = []
+    seen_roots: set[str] = set()
+    for cand_root in (get_forge_worktree_root(), Path("/tmp")):
+        norm_root = os.path.normpath(os.path.abspath(str(cand_root)))
+        if norm_root not in seen_roots:
+            seen_roots.add(norm_root)
+            wt_roots.append(Path(cand_root))
+
+    wt_candidates: list[Path] = []
+    seen_wt_paths: set[str] = set()
+    for wt_root in wt_roots:
+        if not wt_root.is_dir():
             continue
-        wt_base = os.path.basename(wt_path)
+        for wt_p in wt_root.glob("forge-wt-*"):
+            norm_wt = os.path.normpath(os.path.abspath(str(wt_p)))
+            real_wt = os.path.realpath(norm_wt)
+            dedup_key = real_wt if os.path.exists(real_wt) else norm_wt
+            if dedup_key in seen_wt_paths:
+                continue
+            seen_wt_paths.add(dedup_key)
+            wt_candidates.append(wt_p)
+
+    for wt_p in wt_candidates:
+        wt_path = str(wt_p)
+        norm_wt = os.path.normpath(os.path.abspath(wt_path))
+        real_wt = os.path.realpath(norm_wt)
+        if (
+            norm_wt == cur_cwd
+            or cur_cwd.startswith(norm_wt.rstrip("/") + "/")
+            or real_wt == cur_cwd_real
+            or cur_cwd_real.startswith(real_wt.rstrip("/") + "/")
+        ):
+            continue
+        wt_base = wt_p.name
         if any(wt_base.startswith(f"forge-wt-{bid}-") for bid in active_build_ids):
             continue
         try:
@@ -8892,7 +8938,12 @@ class ForgeSupervisor:
         effective_repo = (chunk_row["repo"] if "repo" in chunk_row.keys() and chunk_row["repo"] else build["repo"]) or "/workspace"
         repo_dir = Path(effective_repo).resolve()
         default_branch = _get_repo_default_branch(repo_dir)
-        wt_dir = Path(f"/tmp/forge-wt-{chunk_id}")
+        wt_root = get_forge_worktree_root()
+        try:
+            wt_root.mkdir(parents=True, exist_ok=True)
+            wt_dir = get_chunk_worktree_dir(chunk_id)
+        except OSError:
+            wt_dir = Path(f"/tmp/forge-wt-{chunk_id}")
         ch_target_branch = str(
             (chunk_row["target_branch"] if ("target_branch" in chunk_row.keys() and chunk_row["target_branch"]) else "")
             or ""

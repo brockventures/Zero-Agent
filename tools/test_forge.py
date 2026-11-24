@@ -7124,5 +7124,144 @@ def test_promote_and_push_other_build_repos_promotes_and_pushes_all_earlier_repo
     assert (repo_a / "chunk0.txt").read_text(encoding="utf-8") == "from chunk 0\n"
 
 
+def test_get_forge_worktree_root_and_chunk_dir(tmp_path, monkeypatch):
+    """Verify get_forge_worktree_root/get_chunk_worktree_dir respect FORGE_WORKTREE_ROOT, writable DATA_DIR, and /tmp fallback."""
+    monkeypatch.delenv("FORGE_WORKTREE_ROOT", raising=False)
+
+    # 1. Writable DATA_DIR -> <DATA_DIR>/forge-worktrees without eager creation
+    data_dir = tmp_path / "nvme_data"
+    data_dir.mkdir(parents=True)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", data_dir)
+    assert forge_mod.get_forge_worktree_root() == data_dir / "forge-worktrees"
+    assert not (data_dir / "forge-worktrees").exists()
+    assert forge_mod.get_chunk_worktree_dir("fg-123-c0") == data_dir / "forge-worktrees" / "forge-wt-fg-123-c0"
+
+    # 2. Missing DATA_DIR -> /tmp fallback
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path / "missing_data")
+    assert forge_mod.get_forge_worktree_root() == Path("/tmp")
+    assert forge_mod.get_chunk_worktree_dir("fg-123-c0") == Path("/tmp/forge-wt-fg-123-c0")
+
+    # 3. FORGE_WORKTREE_ROOT env var overrides everything (with whitespace stripped)
+    custom_root = tmp_path / "custom_wt_root"
+    monkeypatch.setenv("FORGE_WORKTREE_ROOT", f"  {custom_root}  ")
+    assert forge_mod.get_forge_worktree_root() == custom_root
+    assert forge_mod.get_chunk_worktree_dir("fg-456-c1") == custom_root / "forge-wt-fg-456-c1"
+
+
+def test_reconcile_forge_on_boot_cleans_nvme_and_legacy_tmp_worktrees(tmp_path, monkeypatch):
+    """Verify reconcile_forge_on_boot cleans stale worktrees in both NVMe worktree root and legacy /tmp while preserving active builds."""
+    import shutil
+
+    db_path = tmp_path / "forge_reconcile_wt.db"
+    forge_mod.init_forge_db(db_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", data_dir)
+    monkeypatch.setattr(forge_mod, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.delenv("FORGE_WORKTREE_ROOT", raising=False)
+
+    nvme_root = data_dir / "forge-worktrees"
+    nvme_stale = nvme_root / "forge-wt-fg-stale-nvme-c0"
+    nvme_active = nvme_root / "forge-wt-fg-active-nvme-c0"
+    nvme_stale.mkdir(parents=True)
+    nvme_active.mkdir(parents=True)
+
+    pid = os.getpid()
+    tmp_stale = Path(f"/tmp/forge-wt-fg-test-stale-{pid}-c0")
+    tmp_active = Path(f"/tmp/forge-wt-fg-test-active-{pid}-c0")
+    tmp_stale.mkdir(parents=True, exist_ok=True)
+    tmp_active.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with forge_mod.get_db_connection(db_path) as conn:
+            for active_bid in ("fg-active-nvme", f"fg-test-active-{pid}"):
+                conn.execute(
+                    """
+                    INSERT INTO forge_builds (id, title, objective, origin_channel_id, repo, status, created_at, updated_at)
+                    VALUES (?, 'Active Test', 'Keep active wt', 1, '/workspace', 'running', ?, ?)
+                    """,
+                    (active_bid, time.time(), time.time()),
+                )
+
+        res = forge_mod.reconcile_forge_on_boot(db_path=db_path)
+        cleaned = set(res["cleaned_worktrees"])
+        assert str(nvme_stale) in cleaned
+        assert str(tmp_stale) in cleaned
+        assert not nvme_stale.exists()
+        assert not tmp_stale.exists()
+        assert nvme_active.exists()
+        assert tmp_active.exists()
+    finally:
+        shutil.rmtree(tmp_stale, ignore_errors=True)
+        shutil.rmtree(tmp_active, ignore_errors=True)
+
+
+def test_agora_ticker_heal_checks_nvme_and_tmp_worktrees(tmp_path, monkeypatch):
+    """Verify agora_forge_ticker.heal_and_check_active_forge_build recognizes worktrees under NVMe root, FORGE_WORKTREE_ROOT, and /tmp."""
+    import shutil
+    import tools.agora_forge_ticker as ticker_mod
+
+    db_path = tmp_path / "forge_ticker.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(ticker_mod, "FORGE_DB", db_path)
+
+    custom_root = tmp_path / "forge-worktrees"
+    custom_root.mkdir(parents=True)
+    monkeypatch.setenv("FORGE_WORKTREE_ROOT", str(custom_root))
+
+    stale_ts = time.time() - 300.0  # >180s without worktree -> auto-healed; with worktree -> kept active
+    bid_with_wt = "fg-agora-live-wt"
+    bid_orphan = "fg-agora-orphan"
+    (custom_root / f"forge-wt-{bid_with_wt}-c0").mkdir(parents=True)
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        for bid, title in ((bid_with_wt, "AGORA-F1 Live"), (bid_orphan, "AGORA-F2 Orphan")):
+            conn.execute(
+                """
+                INSERT INTO forge_builds (id, title, objective, origin_channel_id, repo, status, created_at, updated_at)
+                VALUES (?, ?, 'Ticker test', 1, '/workspace/agora-roguelike', 'running', ?, ?)
+                """,
+                (bid, title, stale_ts, stale_ts),
+            )
+            conn.execute(
+                """
+                INSERT INTO forge_chunks (id, build_id, chunk_index, title, instructions, status)
+                VALUES (?, ?, 0, 'Chunk 0', 'Verify ticker heal', 'running')
+                """,
+                (f"{bid}-c0", bid),
+            )
+
+    active_label = ticker_mod.heal_and_check_active_forge_build()
+    assert active_label is not None and bid_with_wt in active_label
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        live_row = conn.execute("SELECT status FROM forge_builds WHERE id = ?", (bid_with_wt,)).fetchone()
+        orphan_row = conn.execute("SELECT status FROM forge_builds WHERE id = ?", (bid_orphan,)).fetchone()
+    assert live_row["status"] == "running"
+    assert orphan_row["status"] == "failed"
+
+    # Also verify legacy /tmp fallback when FORGE_WORKTREE_ROOT is unset
+    monkeypatch.delenv("FORGE_WORKTREE_ROOT", raising=False)
+    pid = os.getpid()
+    tmp_wt = Path(f"/tmp/forge-wt-fg-agora-tmp-{pid}-c0")
+    tmp_wt.mkdir(parents=True, exist_ok=True)
+    try:
+        with forge_mod.get_db_connection(db_path) as conn:
+            conn.execute("UPDATE forge_builds SET status = 'failed' WHERE id = ?", (bid_with_wt,))
+            conn.execute(
+                """
+                INSERT INTO forge_builds (id, title, objective, origin_channel_id, repo, status, created_at, updated_at)
+                VALUES (?, 'AGORA-F3 Legacy Tmp', 'Ticker tmp test', 1, '/workspace/agora-roguelike', 'running', ?, ?)
+                """,
+                (f"fg-agora-tmp-{pid}", stale_ts, stale_ts),
+            )
+        label_tmp = ticker_mod.heal_and_check_active_forge_build()
+        assert label_tmp is not None and f"fg-agora-tmp-{pid}" in label_tmp
+    finally:
+        shutil.rmtree(tmp_wt, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

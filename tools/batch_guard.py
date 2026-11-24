@@ -296,6 +296,72 @@ def _is_outbound_curl_or_wget(cmd: str) -> bool:
     return False
 
 
+def _is_forge_worktree_path(path_str: str) -> bool:
+    """Return True if path_str points to or inside a FORGE worktree (/workspace/data/forge-worktrees/forge-wt-*, legacy /tmp/forge-wt-*, or FORGE_WORKTREE_ROOT)."""
+    raw = (path_str or "").strip().replace("\\", "/")
+    if not raw:
+        return False
+    norm = posixpath.normpath(raw)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    if norm.startswith("/tmp/forge-wt-"):
+        return True
+    if norm.startswith("/workspace/data/forge-worktrees/forge-wt-"):
+        return True
+    if "/forge-worktrees/forge-wt-" in norm:
+        return True
+    env_root = os.environ.get("FORGE_WORKTREE_ROOT", "").strip().replace("\\", "/")
+    if env_root:
+        norm_root = posixpath.normpath(env_root).rstrip("/")
+        if norm_root.startswith("//"):
+            norm_root = "/" + norm_root.lstrip("/")
+        if norm_root:
+            if norm.startswith(f"{norm_root}/forge-wt-"):
+                return True
+            if os.name != "nt" and norm_root.startswith("/") and os.path.exists(norm_root):
+                try:
+                    real_root = os.path.realpath(norm_root).replace("\\", "/").rstrip("/")
+                    if real_root and norm.startswith(f"{real_root}/forge-wt-"):
+                        return True
+                except Exception:
+                    pass
+    return False
+
+
+def _extract_forge_worktree_relpath(path_str: str) -> str | None:
+    """Extract the repository-relative path inside a FORGE worktree, or None if no subpath follows."""
+    raw = (path_str or "").strip().replace("\\", "/")
+    if not raw:
+        return None
+    norm = posixpath.normpath(raw)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    env_root = os.environ.get("FORGE_WORKTREE_ROOT", "").strip().replace("\\", "/")
+    if env_root:
+        norm_root = posixpath.normpath(env_root).rstrip("/")
+        if norm_root.startswith("//"):
+            norm_root = "/" + norm_root.lstrip("/")
+        root_candidates = [norm_root] if norm_root else []
+        if os.name != "nt" and norm_root.startswith("/") and os.path.exists(norm_root):
+            try:
+                real_root = os.path.realpath(norm_root).replace("\\", "/").rstrip("/")
+                if real_root and real_root not in root_candidates:
+                    root_candidates.append(real_root)
+            except Exception:
+                pass
+        for r_cand in root_candidates:
+            m_env = re.match(rf"^{re.escape(r_cand)}/forge-wt-[^/]+/(.+)$", norm)
+            if m_env and m_env.group(1):
+                return m_env.group(1)
+    m_tmp = re.match(r"^/tmp/forge-wt-[^/]+/(.+)$", norm)
+    if m_tmp and m_tmp.group(1):
+        return m_tmp.group(1)
+    m_nvme = re.match(r"^(?:.*/)?forge-worktrees/forge-wt-[^/]+/(.+)$", norm)
+    if m_nvme and m_nvme.group(1):
+        return m_nvme.group(1)
+    return None
+
+
 def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") -> bool:
     """Return True if target_file is inside a FORGE worktree, scratch, memory, data, or unit test file."""
     if not target_file:
@@ -303,9 +369,11 @@ def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") 
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True
     norm_target = _norm_posix(target_file, cwd or "/workspace")
+    if _is_forge_worktree_path(norm_target):
+        return True
     # On local Windows laptop standby replica (when not testing simulated /workspace, /baseball, /docker, or /tmp paths), exempt from container FORGE worktree gate
     if os.name == "nt" and not norm_target.startswith(("/workspace/", "/baseball/", "/docker/", "/tmp/", "/app/")):
         return True
@@ -676,7 +744,7 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True
     if name in ("edit_file", "replace_file_content", "write_file", "write_to_file"):
         return True
@@ -752,7 +820,7 @@ def check_interactive_investigation_gate(
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True, ""
 
     if not in_flight_file or not os.path.exists(in_flight_file):
@@ -928,7 +996,7 @@ def _is_safe_ephemeral_delete_target(token: str, cwd: str = "/workspace") -> boo
     if clean.endswith((".tmp", ".pyc", ".pyo")) or "__pycache__" in clean:
         return True
     norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True
     abs_p = os.path.abspath(os.path.join(norm_cwd, clean)).replace("\\", "/")
     if abs_p.startswith(("/tmp/", "/workspace/scratch/")):
@@ -1108,10 +1176,10 @@ def check_forge_prohibited_file_gate(name: str, args: dict, cwd: str = "/workspa
         pass
 
     for p_cand in (norm_target, lex_target_norm):
-        m_wt = re.match(r"^/tmp/forge-wt-[^/]+/(.+)$", p_cand)
-        if m_wt:
-            candidates.append(m_wt.group(1))
-        if p_cand.startswith("/workspace/"):
+        wt_rel = _extract_forge_worktree_relpath(p_cand)
+        if wt_rel:
+            candidates.append(wt_rel)
+        elif p_cand.startswith("/workspace/"):
             candidates.append(p_cand[len("/workspace/"):])
 
     for cand in candidates:
@@ -1306,7 +1374,7 @@ def _extract_sqlite_targets_from_segment(seg: str) -> list[str]:
 
 
 def _is_safe_tmp_sql_target(raw_target: str, cwd: str = "/workspace") -> bool:
-    """Return True only if raw_target is an ephemeral :memory: or /tmp/* SQLite test fixture (excluding /tmp/forge-wt-*)."""
+    """Return True only if raw_target is an ephemeral :memory: or /tmp/* SQLite test fixture (excluding FORGE worktrees)."""
     clean = _strip_outer_quotes(raw_target)
     if not clean:
         return False
@@ -1320,14 +1388,14 @@ def _is_safe_tmp_sql_target(raw_target: str, cwd: str = "/workspace") -> bool:
     if "{" in clean or "$" in clean:
         return (
             clean.startswith("/tmp/")
-            and not clean.startswith("/tmp/forge-wt-")
+            and not _is_forge_worktree_path(clean)
             and ".." not in clean
         )
     norm_t = posixpath.normpath(_norm_posix(clean, cwd or "/workspace"))
     in_tmp = (
         norm_t.startswith("/tmp/")
         or (bool(tmp_root) and norm_t.startswith(tmp_root + "/"))
-    ) and not norm_t.startswith("/tmp/forge-wt-")
+    ) and not _is_forge_worktree_path(norm_t)
     if not in_tmp:
         return False
     try:
@@ -1336,7 +1404,7 @@ def _is_safe_tmp_sql_target(raw_target: str, cwd: str = "/workspace") -> bool:
             if not (
                 real_t.startswith("/tmp/")
                 or (bool(tmp_root) and real_t.startswith(tmp_root + "/"))
-            ) or real_t.startswith("/tmp/forge-wt-"):
+            ) or _is_forge_worktree_path(real_t):
                 return False
     except Exception:
         return False
@@ -1750,7 +1818,7 @@ def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, s
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
     norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True, ""
 
     # 1. Block direct SQL/shell tampering with decision_cards / forge_decisions approval status
@@ -2072,7 +2140,7 @@ _DESTRUCTIVE_GIT_WIPE_RE = re.compile(
 def is_destructive_git_working_tree_wipe(cmd: str, cwd: str = "/workspace") -> bool:
     """Block destructive git working-tree wipes in /workspace (e.g. git reset --hard, git checkout-index -f, blanket directory checkout)."""
     norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return False
     unquoted = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", cmd)
     return bool(_DESTRUCTIVE_GIT_WIPE_RE.search(unquoted))
@@ -2212,7 +2280,7 @@ def _check_inline_production_edit_gate(
     state_file: str,
     now: float = 0.0,
 ) -> tuple[bool, str]:
-    """Enforce FORGE Tier 2/3 Gate: block interactive turns outside /tmp/forge-wt-* from mutating >2 production files inline or mutating after >90s calibration."""
+    """Enforce FORGE Tier 2/3 Gate: block interactive turns outside FORGE worktrees from mutating >2 production files inline or mutating after >90s calibration."""
     if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
         return True, ""
     if is_forge_worktree_or_exempt_path(target_file, cwd=cwd):
@@ -2271,7 +2339,7 @@ def check_inline_production_shell_mutation(
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True, ""
     if "forge.py" in cmd or "detached_runner.py" in cmd:
         return True, ""
@@ -2319,7 +2387,7 @@ def check_forge_post_offload_lock(
     if (
         not state.get("offload_dispatched")
         or os.environ.get("FORGE_WORKER_ACTIVE") == "1"
-        or _norm_posix(cwd or "/workspace", "/").startswith("/tmp/forge-wt-")
+        or _is_forge_worktree_path(_norm_posix(cwd or "/workspace", "/"))
     ):
         return True, ""
 
@@ -2358,7 +2426,7 @@ def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") ->
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return False
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return False
     if "forge.py" in cmd or "detached_runner.py" in cmd or "modal_harness.py" in cmd:
         return False
@@ -2602,7 +2670,7 @@ def check_baseball_heavy_sweep_and_migration_guard(cmd: str, cwd: str = "/worksp
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
+    if _is_forge_worktree_path(norm_cwd):
         return True, ""
 
     outer_segments = [s.strip() for s in re.split(r"\s*(?:&&|\|\||;|\n)\s*", cmd) if s.strip()]
@@ -3314,7 +3382,7 @@ def check_tool_use(
             )
 
         # A00b. Repeated Same-Scratch-Script, Inline Heredoc & >90s Calibration / Command Loop Gate
-        if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
+        if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not _is_forge_worktree_path(os.path.abspath(cwd or "/workspace").replace("\\", "/")):
             if (
                 "forge.py" not in cmd
                 and "detached_runner.py" not in cmd
@@ -3327,7 +3395,7 @@ def check_tool_use(
                 turn_elapsed = now - float(state.get("turn_start_time", now) or now)
 
                 scratch_m = _SCRATCH_SCRIPT_EXEC_RE.search(cmd)
-                if scratch_m:
+                if scratch_m and not _is_forge_worktree_path(scratch_m.group("script")):
                     raw_script = scratch_m.group("script")
                     norm_script = os.path.abspath(os.path.join(cwd or "/workspace", raw_script)).replace("\\", "/")
                     runs_map = dict(state.get("scratch_script_runs", {}))
