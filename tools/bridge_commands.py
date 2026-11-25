@@ -40,6 +40,7 @@ from tools.bridge_state import (
     is_container_restart_intent,
     is_home_channel,
     is_reload_intent,
+    is_vulcan_agent,
     mark_pending_choice_button_turn,
     record_restart_intent,
     set_active_model,
@@ -233,6 +234,17 @@ class QuickChoiceView(discord.ui.View):
                 self.add_item(ChoiceButton(label=btn_label, custom_id=f"choice:{btn_label}"))
 
 
+def _agent_display_name() -> str:
+    """Return the active bot display name ('Vulcan' in discord-vulcan-agent, else 'Zero')."""
+    default_name = "Vulcan" if is_vulcan_agent() else "Zero"
+    return os.getenv("AGENT_NAME", default_name).strip() or default_name
+
+
+def _docker_container_name() -> str:
+    """Return the active Host 2 Docker container name for this agent."""
+    return "discord-vulcan-agent" if is_vulcan_agent() else "discord-antigravity-agent"
+
+
 async def execute_bridge_reload(
     bot: Optional[discord.Client] = None,
     channel: Optional[discord.abc.Messageable] = None,
@@ -252,7 +264,7 @@ async def execute_bridge_reload(
         record_restart_intent(reason, initiator=initiator)
         if channel and announce:
             try:
-                await channel.send("🔄 Reloading Zero bridge in-place...")
+                await channel.send(f"🔄 Reloading {_agent_display_name()} bridge in-place...")
             except Exception:
                 pass
 
@@ -374,10 +386,12 @@ async def execute_container_restart(
     reason: str = "Manual Docker container restart requested"
 ):
     """Execute detached Docker container restart on Host 2 via SSH."""
+    agent_name = _agent_display_name()
+    container_name = _docker_container_name()
     record_restart_intent(reason, initiator=initiator)
     if channel:
         try:
-            await channel.send("🔄 **Restarting Zero Docker container on Host 2 over SSH...**\n• Full cgroup wipe & clean PID 1 reinitialization.")
+            await channel.send(f"🔄 **Restarting {agent_name} Docker container on Host 2 over SSH...**\n• Full cgroup wipe & clean PID 1 reinitialization.")
         except Exception:
             pass
 
@@ -403,7 +417,7 @@ async def execute_container_restart(
     restart_cmd = [
         "ssh", "-i", ssh_key, "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
         f"{ssh_user}@{host_2}",
-        "nohup sh -c 'sleep 3 && docker restart discord-antigravity-agent' >/dev/null 2>&1 &"
+        f"nohup sh -c 'sleep 3 && docker restart {container_name}' >/dev/null 2>&1 &"
     ]
     try:
         subprocess.run(restart_cmd, timeout=10, check=True)

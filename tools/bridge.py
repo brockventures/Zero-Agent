@@ -64,6 +64,7 @@ from tools.bridge_state import (  # noqa: F401
     is_container_restart_intent,
     is_crab_cavern_silenced,
     is_home_channel,
+    is_vulcan_agent,
     parse_silence_until,
     sync_credentials,
     clear_channel_session_id,
@@ -528,7 +529,10 @@ async def slash_quota_autocomplete(interaction: discord.Interaction, current: st
     return [app_commands.Choice(name=label, value=val) for label, val in options if not cur or cur in label.lower() or cur in val.lower()]
 
 
-@bot.tree.command(name="reload", description="Reload Zero bridge in-place or restart the Docker container")
+@bot.tree.command(
+    name="reload",
+    description=f"Reload {'Vulcan' if is_vulcan_agent() else 'Zero'} bridge in-place or restart the Docker container",
+)
 @app_commands.describe(mode="in-place (fast execv reload) or container (full Docker restart)")
 async def slash_reload(interaction: discord.Interaction, mode: str = "in-place"):
     ok, err = _check_slash_authorized(interaction)
@@ -537,13 +541,15 @@ async def slash_reload(interaction: discord.Interaction, mode: str = "in-place")
         return
     await interaction.response.defer()
     initiator_name = interaction.user.display_name or interaction.user.name
+    default_agent = "Vulcan" if is_vulcan_agent() else "Zero"
+    agent_name = os.getenv("AGENT_NAME", default_agent).strip() or default_agent
     m = mode.lower().strip()
     if m in ("container", "docker"):
-        await interaction.followup.send("🔄 Dispatching full Zero Docker container restart on Host 2...")
+        await interaction.followup.send(f"🔄 Dispatching full {agent_name} Docker container restart on Host 2...")
         await execute_container_restart(interaction.channel, initiator=initiator_name, reason="Slash command /reload container")
         return
 
-    await interaction.followup.send("🔄 Reloading Zero bridge in-place...")
+    await interaction.followup.send(f"🔄 Reloading {agent_name} bridge in-place...")
     await _execute_reload(channel=interaction.channel, initiator=initiator_name, force=True, reason="Slash command /reload in-place", announce=False)
 
 

@@ -536,6 +536,45 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             br.active_proc = orig_active_proc
             br.ext_active_proc = orig_ext_proc
 
+    async def test_execute_bridge_reload_uses_active_agent_display_name(self):
+        """Verify execute_bridge_reload and execute_container_restart use Vulcan/Zero dynamically."""
+        import os
+        import tools.bridge_commands as bc
+
+        mock_bot = MagicMock()
+        mock_bot.close = AsyncMock()
+
+        for is_vulc, expected_name, expected_container in (
+            (True, "Vulcan", "discord-vulcan-agent"),
+            (False, "Zero", "discord-antigravity-agent"),
+        ):
+            mock_channel = MagicMock()
+            mock_channel.send = AsyncMock()
+            with patch.dict(os.environ, {}, clear=False), \
+                 patch("tools.bridge_commands.is_vulcan_agent", return_value=is_vulc), \
+                 patch("tools.bridge_commands.record_restart_intent"), \
+                 patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"clean": True, "message": "Clean"}), \
+                 patch("tools.bridge_daemons.daemon_manager.shutdown_all", new_callable=AsyncMock), \
+                 patch("tools.classifier.warm_classifier.shutdown"), \
+                 patch("os.execv"):
+                os.environ.pop("AGENT_NAME", None)
+                await bc.execute_bridge_reload(bot=mock_bot, channel=mock_channel, announce=True)
+            mock_channel.send.assert_awaited_with(f"🔄 Reloading {expected_name} bridge in-place...")
+
+            mock_restart_ch = MagicMock()
+            mock_restart_ch.send = AsyncMock()
+            with patch.dict(os.environ, {}, clear=False), \
+                 patch("tools.bridge_commands.is_vulcan_agent", return_value=is_vulc), \
+                 patch("tools.bridge_commands.record_restart_intent"), \
+                 patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"clean": True, "message": "Clean"}), \
+                 patch("tools.bridge_commands.subprocess.run") as mock_sub:
+                os.environ.pop("AGENT_NAME", None)
+                await bc.execute_container_restart(channel=mock_restart_ch)
+            sent_text = mock_restart_ch.send.call_args.args[0]
+            self.assertIn(f"Restarting {expected_name} Docker container", sent_text)
+            ssh_cmd = mock_sub.call_args.args[0][-1]
+            self.assertIn(f"docker restart {expected_container}", ssh_cmd)
+
     async def test_execute_bridge_reload_single_flight_and_early_flag_clear(self):
         """Verify concurrent execute_bridge_reload calls execute once, unlink reload_bridge.flag before sync_git_on_reload, and reset _reload_in_progress."""
         import shutil
