@@ -5312,6 +5312,18 @@ def _is_explicit_approval_prompt(prompt_text: str) -> bool:
     pt = prompt_text.strip().lower()
     if "[forge build failure envelope" in pt:
         return True
+    # If this is a mid-turn steering envelope, check whether the original in-flight task
+    # was an explicit approval/button directive (so an additive follow-up doesn't lose approval).
+    if "[user mid-turn steering update]" in pt and "[original in-flight task being executed]:" in pt:
+        m = re.search(
+            r"\[original in-flight task being executed\]:\s*\"?(.+?)\"?\s*(?:\[new directive received mid-turn\]|$)",
+            pt,
+            flags=re.DOTALL,
+        )
+        if m:
+            orig_task = m.group(1).strip().strip('"').strip()
+            if orig_task and orig_task != pt and _is_explicit_approval_prompt(orig_task):
+                return True
     question_markers = (
         "?",
         "should we",
@@ -5320,28 +5332,50 @@ def _is_explicit_approval_prompt(prompt_text: str) -> bool:
     )
     if any(qm in pt for qm in question_markers):
         return False
+    exact_affirmatives = {
+        "yes",
+        "yes please",
+        "yes, please",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "sounds good",
+        "do it",
+        "ok",
+        "okay",
+    }
+    if pt.rstrip(".!") in exact_affirmatives:
+        return True
     directives = (
         "queue fix",
+        "queue forge",
         "queue build",
         "queue this",
+        "queue it",
         "queue plan",
         "queue retry",
         "queue wave",
+        "enqueue",
         "approve",
         "approved",
         "ship it",
         "do it",
+        "do both",
         "fix it",
         "fix both",
         "fix this",
         "build it",
         "build this",
         "run it",
+        "run both",
         "patch it",
         "patch both",
         "let's do",
         "lets do",
         "let us do",
+        "let's go",
+        "lets go",
         "go ahead",
         "go for it",
         "make it happen",
@@ -5352,6 +5386,7 @@ def _is_explicit_approval_prompt(prompt_text: str) -> bool:
         "lgtm",
         "retry",
         "re-try",
+        "yes please",
         "[forge build failure envelope",
     )
     return any(d in pt for d in directives)

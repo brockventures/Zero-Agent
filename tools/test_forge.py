@@ -7575,7 +7575,11 @@ def test_explicit_approval_prompt_natural_directives_and_questions(tmp_path):
         "wire it up",
         "kick it off",
         "queue wave 2",
+        "queue forge fix now",
+        "yes please",
+        "Yes",
         "persist the state fix",
+        '[USER MID-TURN STEERING UPDATE]\n\n[ORIGINAL IN-FLIGHT TASK BEING EXECUTED]:\n"Queue FORGE Fix Now"\n\n[NEW DIRECTIVE RECEIVED MID-TURN]:\n"Can you also make sure audio keeps playing when I swipe away?"',
     ]
     for directive in natural_directives:
         assert forge_mod._is_explicit_approval_prompt(directive) is True, f"Expected '{directive}' to match"
