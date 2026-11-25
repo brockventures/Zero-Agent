@@ -1278,17 +1278,24 @@ class TestForgeEngine(unittest.TestCase):
         self.assertEqual(exec_res["status"], "approved")
         self.assertIn("2 chunk(s)", exec_res["receipt"])
 
-        # 3. Wide blast radius (>=4 files) or core bridge or >90s calibration also triggers approval gate
+        # 3. Wide blast radius (>=6 production files) or core bridge or >180s (>=4 scratch runs) calibration also triggers approval gate
         wide_plan = {
-            "title": "Four File Refactor",
+            "title": "Six File Refactor",
             "repo": "/workspace",
             "origin_channel_id": ZERO_OPS_CHANNEL_ID,
-            "context_fact_sheet": ["4 files"],
+            "context_fact_sheet": ["6 files"],
             "chunks": [
                 {
                     "title": "Wide Chunk",
-                    "target_files": ["tools/w1.py", "tools/w2.py", "tools/w3.py", "tools/w4.py"],
-                    "instructions": "Refactor 4 files.",
+                    "target_files": [
+                        "tools/w1.py",
+                        "tools/w2.py",
+                        "tools/w3.py",
+                        "tools/w4.py",
+                        "tools/w5.py",
+                        "tools/w6.py",
+                    ],
+                    "instructions": "Refactor 6 files.",
                 }
             ],
         }
@@ -1300,12 +1307,12 @@ class TestForgeEngine(unittest.TestCase):
             db_path=self.db_path,
         )
         self.assertTrue(req_wide)
-        self.assertTrue(any("4 target files" in r for r in reasons_wide))
+        self.assertTrue(any("6 target files" in r for r in reasons_wide))
 
         bs_file = Path(self.tmp_dir.name) / "calib_state.json"
         now_ts = time.time()
         bs_file.write_text(
-            json.dumps({"last_time": now_ts, "turn_start_time": now_ts - 120.0, "total_scratch_runs": 3}),
+            json.dumps({"last_time": now_ts, "turn_start_time": now_ts - 200.0, "total_scratch_runs": 4}),
             encoding="utf-8",
         )
         req_cal, reasons_cal = forge_mod.evaluate_plan_approval_gate(
@@ -7452,6 +7459,212 @@ def test_live_discord_blocked_guards_unmocked_requests_under_pytest(tmp_path, mo
         )
         == []
     )
+
+
+def test_choice_button_in_flight_bypasses_approval_gate_for_home_channels(tmp_path, monkeypatch):
+    """Verify from_choice_button=True in in_flight_turn.json bypasses evaluate_plan_approval_gate for home channels (even multi-chunk / core-bridge) unless requires_approval=True."""
+    import tools.forge as forge_mod
+    import tools.bridge_state as bstate
+
+    db_path = tmp_path / "forge_choice_btn.db"
+    forge_mod.init_forge_db(db_path)
+    ifp = tmp_path / "in_flight_turn.json"
+    monkeypatch.setattr(bstate, "IN_FLIGHT_FILE", ifp)
+
+    # Record in-flight with from_choice_button=True via bridge_state.record_in_flight
+    seq1 = bstate.record_in_flight(
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        prompt="Fix Test Isolation First",
+        conv_id="conv-choice-1",
+        from_choice_button=True,
+    )
+    assert seq1 is not None
+    # Verify retry attempt of same prompt preserves from_choice_button=True even if omitted on second call
+    seq2 = bstate.record_in_flight(
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        prompt="Fix Test Isolation First",
+        conv_id="conv-choice-1",
+        pid=12345,
+    )
+    assert seq2 is not None
+    if_data = json.loads(ifp.read_text(encoding="utf-8"))
+    assert if_data[str(forge_mod.ZERO_CHAT_CHANNEL_ID)]["from_choice_button"] is True
+    assert if_data["from_choice_button"] is True
+
+    # 1. Home channel multi-chunk + core-bridge plan bypasses approval gate when from_choice_button=True
+    core_multi_plan = {
+        "title": "Fix Test Isolation & Core Bridge",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.ZERO_CHAT_CHANNEL_ID,
+        "touches_core_bridge": True,
+        "chunks": [
+            {"title": "Chunk 1", "target_files": ["tools/bridge.py"], "instructions": "Update bridge.py."},
+            {"title": "Chunk 2", "target_files": ["tools/forge.py"], "instructions": "Update forge.py."},
+        ],
+    }
+    req_home, reasons_home = forge_mod.evaluate_plan_approval_gate(
+        core_multi_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=ifp,
+        db_path=db_path,
+    )
+    assert req_home is False
+    assert reasons_home == []
+
+    # 2. Explicit requires_approval=True is NEVER bypassed even with from_choice_button=True
+    explicit_req_plan = dict(core_multi_plan, requires_approval=True)
+    req_explicit, reasons_explicit = forge_mod.evaluate_plan_approval_gate(
+        explicit_req_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=ifp,
+        db_path=db_path,
+    )
+    assert req_explicit is True
+    assert any("Explicit requires_approval" in r for r in reasons_explicit)
+
+    # 3. Non-home / Crab Cavern channel is NEVER bypassed by from_choice_button=True
+    crab_channel_id = 1534452820995080192  # #lounge
+    bstate.record_in_flight(
+        channel_id=crab_channel_id,
+        prompt="Fix Test Isolation First",
+        conv_id="conv-crab-1",
+        from_choice_button=True,
+    )
+    crab_plan = dict(core_multi_plan, origin_channel_id=crab_channel_id)
+    req_crab, reasons_crab = forge_mod.evaluate_plan_approval_gate(
+        crab_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=ifp,
+        db_path=db_path,
+    )
+    assert req_crab is True
+    assert len(reasons_crab) > 0
+
+
+def test_explicit_approval_prompt_natural_directives_and_questions(tmp_path):
+    """Verify natural directives ('build it', 'fix both', 'let's do that') bypass, while questions ('should we build it?') do NOT bypass."""
+    import tools.forge as forge_mod
+
+    db_path = tmp_path / "forge_directives.db"
+    forge_mod.init_forge_db(db_path)
+    ifp = tmp_path / "in_flight_turn.json"
+
+    multi_plan = {
+        "title": "Wave 2 Pipeline",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.ZERO_CHAT_CHANNEL_ID,
+        "chunks": [
+            {"title": "Chunk 1", "target_files": ["tools/a.py"], "instructions": "Update a.py."},
+            {"title": "Chunk 2", "target_files": ["tools/b.py"], "instructions": "Update b.py."},
+        ],
+    }
+
+    natural_directives = [
+        "build it",
+        "build this now",
+        "run it",
+        "fix both",
+        "fix this",
+        "patch it",
+        "patch both",
+        "let's do that",
+        "lets do wave 2",
+        "let us do both",
+        "go for it",
+        "make it happen",
+        "wire it up",
+        "kick it off",
+        "queue wave 2",
+        "persist the state fix",
+    ]
+    for directive in natural_directives:
+        assert forge_mod._is_explicit_approval_prompt(directive) is True, f"Expected '{directive}' to match"
+        ifp.write_text(
+            json.dumps({str(forge_mod.ZERO_CHAT_CHANNEL_ID): {"prompt": directive}}),
+            encoding="utf-8",
+        )
+        req, reasons = forge_mod.evaluate_plan_approval_gate(
+            multi_plan,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=ifp,
+            db_path=db_path,
+        )
+        assert req is False, f"Directive '{directive}' should bypass approval gate"
+        assert reasons == []
+
+    questions_and_non_directives = [
+        "should we build it?",
+        "should we fix both",
+        "what if we patch it",
+        "tell me more about how we wire it up",
+        "why did we build this?",
+        "Fix Test Isolation First",
+        "Quiet Wave 2 (No Prep Pings)",
+    ]
+    for q in questions_and_non_directives:
+        assert forge_mod._is_explicit_approval_prompt(q) is False, f"Expected '{q}' NOT to match"
+        ifp.write_text(
+            json.dumps({str(forge_mod.ZERO_CHAT_CHANNEL_ID): {"prompt": q}}),
+            encoding="utf-8",
+        )
+        req_q, reasons_q = forge_mod.evaluate_plan_approval_gate(
+            multi_plan,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=ifp,
+            db_path=db_path,
+        )
+        assert req_q is True, f"Question/non-directive '{q}' should NOT bypass approval gate"
+        assert len(reasons_q) > 0
+
+
+def test_approval_gate_excludes_test_doc_prompt_files_from_blast_radius(tmp_path):
+    """Verify test/doc/prompt/example files do not trigger the wide-blast-radius file count gate and routine 2-step scratch probes do not trigger post-calibration gate."""
+    import tools.forge as forge_mod
+
+    db_path = tmp_path / "forge_blast.db"
+    forge_mod.init_forge_db(db_path)
+    nonexistent_ifp = tmp_path / "nonexistent_if.json"
+
+    # 5 production files + 4 test/doc/prompt/example files = 9 total files, but <6 production files -> no wide blast radius gate
+    plan_with_tests_and_docs = {
+        "title": "Feature With Tests and Docs",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "chunks": [
+            {
+                "title": "Single Chunk",
+                "target_files": [
+                    "tools/prod_a.py",
+                    "tools/prod_b.py",
+                    "tools/prod_c.py",
+                    "tools/prod_d.py",
+                    "tools/prod_e.py",
+                    "tools/test_prod_a.py",
+                    "tools/prod_b_test.py",
+                    "docs/architecture.md",
+                    "config/settings.example",
+                ],
+                "instructions": "Implement prod_a..e and update tests/docs.",
+            }
+        ],
+    }
+
+    # Routine 2-step read-only diagnostic scratch probe over 120s should also NOT trigger post-calibration gate
+    bs_routine = tmp_path / "batch_routine.json"
+    now_ts = time.time()
+    bs_routine.write_text(
+        json.dumps({"last_time": now_ts, "turn_start_time": now_ts - 120.0, "total_scratch_runs": 2}),
+        encoding="utf-8",
+    )
+
+    req, reasons = forge_mod.evaluate_plan_approval_gate(
+        plan_with_tests_and_docs,
+        batch_state_path=bs_routine,
+        in_flight_path=nonexistent_ifp,
+        db_path=db_path,
+    )
+    assert req is False, f"Expected no approval required, got reasons: {reasons}"
+    assert reasons == []
 
 
 if __name__ == "__main__":

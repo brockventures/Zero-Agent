@@ -40,6 +40,7 @@ from tools.bridge_state import (
     is_container_restart_intent,
     is_home_channel,
     is_reload_intent,
+    mark_pending_choice_button_turn,
     record_restart_intent,
     set_active_model,
 )
@@ -551,6 +552,13 @@ async def handle_button_choice(
     except Exception:
         pass
     selected_msg = await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
+    from_choice_button = turn_mode != "external"
+    if from_choice_button:
+        mark_pending_choice_button_turn(interaction.channel_id, choice_text)
+        try:
+            setattr(selected_msg, "from_choice_button", True)
+        except Exception:
+            pass
     await turn_queue.put({
         "prompt": choice_text,
         "status_msg": None,
@@ -560,6 +568,7 @@ async def handle_button_choice(
         "mode": turn_mode,
         "channel_id": interaction.channel_id,
         "queued_at": time.perf_counter(),
+        "from_choice_button": from_choice_button,
     })
 
 

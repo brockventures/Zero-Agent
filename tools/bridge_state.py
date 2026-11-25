@@ -427,6 +427,24 @@ def _allocate_next_turn_seq(lock_fd, data: dict) -> int:
     return next_seq
 
 
+_PENDING_CHOICE_BUTTON_TURNS: set[tuple[str, str]] = set()
+
+
+def mark_pending_choice_button_turn(channel_id: int | str, prompt: str) -> None:
+    """Record that an upcoming turn for (channel_id, prompt) was triggered by a home choice button click."""
+    if channel_id is not None and prompt:
+        _PENDING_CHOICE_BUTTON_TURNS.add((str(channel_id), str(prompt)))
+
+
+def consume_pending_choice_button_turn(channel_id: int | str, prompt: str) -> bool:
+    """Return True and clear if (channel_id, prompt) was triggered by a home choice button click."""
+    key = (str(channel_id), str(prompt))
+    if key in _PENDING_CHOICE_BUTTON_TURNS:
+        _PENDING_CHOICE_BUTTON_TURNS.discard(key)
+        return True
+    return False
+
+
 def _sync_top_level_in_flight_fields(data: dict, entry: dict, fallback_ts: float) -> None:
     """Update top-level legacy mirror fields on in_flight_turn.json from a representative channel entry."""
     data["prompt"] = entry.get("prompt", "")
@@ -435,6 +453,7 @@ def _sync_top_level_in_flight_fields(data: dict, entry: dict, fallback_ts: float
     data["attempts"] = entry.get("attempts", 1)
     data["ts"] = entry.get("ts", fallback_ts)
     data["status_msg_id"] = entry.get("status_msg_id")
+    data["from_choice_button"] = bool(entry.get("from_choice_button", False))
     if entry.get("pid") is not None:
         data["pid"] = entry["pid"]
     else:
@@ -445,7 +464,14 @@ def _sync_top_level_in_flight_fields(data: dict, entry: dict, fallback_ts: float
         data.pop("turn_seq", None)
 
 
-def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, status_msg_id: int = None, pid: int = None) -> int | None:
+def record_in_flight(
+    channel_id: int | str,
+    prompt: str,
+    conv_id: str = None,
+    status_msg_id: int = None,
+    pid: int = None,
+    from_choice_button: bool = False,
+) -> int | None:
     """Atomically record an in-flight turn with monotonic turn_seq under fcntl.flock."""
     try:
         with _in_flight_file_lock() as lock_fd:
@@ -453,8 +479,11 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
             cid_str = str(channel_id)
             prev = data.get(cid_str) or {}
             attempts = 1
+            effective_from_choice = bool(from_choice_button)
             if isinstance(prev, dict) and prev.get("prompt") == prompt:
                 attempts = prev.get("attempts", 1) + 1
+                if prev.get("from_choice_button") is True:
+                    effective_from_choice = True
 
             effective_pid = pid if pid is not None else (prev.get("pid") if isinstance(prev, dict) else None)
             turn_seq = _allocate_next_turn_seq(lock_fd, data)
@@ -468,6 +497,7 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
                 "attempts": attempts,
                 "ts": now,
                 "turn_seq": turn_seq,
+                "from_choice_button": effective_from_choice,
             }
             if effective_pid is not None:
                 entry["pid"] = effective_pid
@@ -1203,6 +1233,7 @@ class PersistentTurnQueue:
                         "mode": it.get("mode"),
                         "author_name": it.get("author_name", ""),
                         "is_thread_task": bool(it.get("is_thread_task", False)),
+                        "from_choice_button": bool(it.get("from_choice_button", False)),
                     })
             tmp = self.filepath.with_suffix(".tmp")
             with open(tmp, "w") as f:
@@ -1215,6 +1246,11 @@ class PersistentTurnQueue:
         if isinstance(item, dict):
             item.setdefault("queued_at", time.perf_counter())
             item.setdefault("queued_at_epoch", time.time())
+            if item.get("from_choice_button") and item.get("mode", "home") != "external":
+                mark_pending_choice_button_turn(
+                    item.get("channel_id", TARGET_CHANNEL_ID),
+                    item.get("prompt", ""),
+                )
         self.pending_items.append(item)
         self._persist()
         await self.queue.put(item)

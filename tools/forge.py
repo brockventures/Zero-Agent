@@ -5225,23 +5225,129 @@ def prune_completed_build_widgets(
     return all_pruned
 
 
+def _is_home_turf_channel(channel_id: int | str | None) -> bool:
+    """Return True if channel_id belongs to a home channel (and not Crab Cavern / external)."""
+    if channel_id is None or str(channel_id).strip() == "":
+        return False
+    try:
+        cid = int(channel_id)
+    except (ValueError, TypeError):
+        return False
+
+    brief_channel_id = 1574655816236269569
+    home_turf_ids: set[int] = {
+        ZERO_CHAT_CHANNEL_ID,
+        ZERO_OPS_CHANNEL_ID,
+        FORGE_CHANNEL_ID,
+        BASEBALL_CHANNEL_ID,
+        brief_channel_id,
+    }
+    crab_ids: set[int] = set()
+    is_home_fn = None
+    try:
+        from tools.bridge_state import (
+            CRAB_CAVERN_CHANNEL_IDS,
+            DEFAULT_HOME_CHANNELS,
+            get_runtime_rules,
+            is_home_channel,
+        )
+        crab_ids.update(int(x) for x in CRAB_CAVERN_CHANNEL_IDS)
+        home_turf_ids.update(int(x) for x in DEFAULT_HOME_CHANNELS)
+        home_turf_ids.update(int(x) for x in get_runtime_rules().get("home_channel_ids", []))
+        is_home_fn = is_home_channel
+    except ImportError:
+        try:
+            from bridge_state import (
+                CRAB_CAVERN_CHANNEL_IDS,
+                DEFAULT_HOME_CHANNELS,
+                get_runtime_rules,
+                is_home_channel,
+            )
+            crab_ids.update(int(x) for x in CRAB_CAVERN_CHANNEL_IDS)
+            home_turf_ids.update(int(x) for x in DEFAULT_HOME_CHANNELS)
+            home_turf_ids.update(int(x) for x in get_runtime_rules().get("home_channel_ids", []))
+            is_home_fn = is_home_channel
+        except ImportError:
+            pass
+
+    if cid in crab_ids:
+        return False
+    if cid in home_turf_ids:
+        return True
+    if is_home_fn is not None:
+        try:
+            return bool(is_home_fn(cid))
+        except Exception:
+            pass
+    return False
+
+
+def _is_non_blast_radius_file(filepath: str) -> bool:
+    """Return True if filepath is a pure test, markdown/prompt doc, or example config file."""
+    if not filepath:
+        return True
+    p = Path(filepath)
+    name = p.name.lower()
+    parts = [part.lower() for part in p.parts]
+    if (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith("_test.go")
+        or ".test." in name
+        or ".spec." in name
+        or "tests" in parts
+    ):
+        return True
+    if name.endswith(".md") or name.endswith(".example") or ".example." in name:
+        return True
+    if "prompts" in parts or "docs" in parts:
+        return True
+    return False
+
+
 def _is_explicit_approval_prompt(prompt_text: str) -> bool:
     """Return True if prompt_text matches an explicit approval/enqueue directive or build failure envelope."""
     if not prompt_text:
         return False
     pt = prompt_text.strip().lower()
+    if "[forge build failure envelope" in pt:
+        return True
+    question_markers = (
+        "?",
+        "should we",
+        "what if",
+        "tell me more",
+    )
+    if any(qm in pt for qm in question_markers):
+        return False
     directives = (
         "queue fix",
         "queue build",
         "queue this",
         "queue plan",
         "queue retry",
+        "queue wave",
         "approve",
         "approved",
         "ship it",
         "do it",
         "fix it",
+        "fix both",
+        "fix this",
+        "build it",
+        "build this",
+        "run it",
+        "patch it",
+        "patch both",
+        "let's do",
+        "lets do",
+        "let us do",
         "go ahead",
+        "go for it",
+        "make it happen",
+        "wire it up",
+        "kick it off",
+        "persist ",
         "proceed",
         "lgtm",
         "retry",
@@ -5260,17 +5366,17 @@ def evaluate_plan_approval_gate(
     """Evaluate whether a ForgePlan requires an interactive Approve | Edit | Dismiss Decision Card before execution.
 
     Thresholds:
-    - Auto-Execute Immediately (Fast Tier 2): 1 chunk, <=3 target files, touches_core_bridge=False, no >90s calibration pass.
+    - Auto-Execute Immediately (Fast Tier 2): 1 chunk, <6 production target files, touches_core_bridge=False, no >180s (>=4 scratch runs) calibration pass.
     - Explicit Bypass:
       1. plan['approved'] is True or plan['skip_approval'] is True ONLY when FORGE_APPROVED_CARD_EXECUTION=1.
       2. Plan is a retry: plan['is_retry'] is True or bool(str(plan.get('retry_of_build_id') or '').strip()).
-      3. Active in-flight turn prompt contains '[FORGE BUILD FAILURE ENVELOPE' or matches an explicit approval directive.
+      3. Active in-flight turn in a home channel has from_choice_button=True, contains '[FORGE BUILD FAILURE ENVELOPE', or matches an explicit approval directive.
       4. Recent failed build in forge_builds for the same origin_channel_id and repo updated within 7200s.
     - Require Approval (Stage Decision Card):
       1. Explicit requires_approval=True (overrides retry bypass).
       2. Multi-chunk pipeline (>=2 chunks or tier >= 3).
-      3. Wide blast radius (>=4 distinct target files across chunks) or touches_core_bridge=True.
-      4. Enqueued after a >90s calibration/analysis pass in the current turn.
+      3. Wide blast radius (>=6 distinct production target files across chunks) or touches_core_bridge=True.
+      4. Enqueued after a >180s (>=4 scratch runs) calibration/analysis pass in the current turn.
     """
     if (
         os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1"
@@ -5284,17 +5390,33 @@ def evaluate_plan_approval_gate(
         if plan.get("is_retry") is True or bool(str(plan.get("retry_of_build_id") or "").strip()):
             return False, []
 
-        # 2. Check for failure envelope or approval directives in in_flight_turn.json
+        # 2. Check for choice-button provenance, failure envelope, or approval directives in in_flight_turn.json
         try:
             ifp = Path(in_flight_path)
             if ifp.exists():
                 st_raw = ifp.read_text(encoding="utf-8")
                 if_data = json.loads(st_raw) if st_raw.strip() else {}
                 if isinstance(if_data, dict):
+                    origin_cid_raw = plan.get("origin_channel_id")
+                    origin_cid_str = str(origin_cid_raw or "")
+                    target_cid = str(plan.get("origin_thread_id") or origin_cid_raw or "")
+                    is_home_origin = _is_home_turf_channel(origin_cid_raw)
+
+                    if is_home_origin:
+                        for cid_key in (target_cid, origin_cid_str):
+                            if cid_key and isinstance(if_data.get(cid_key), dict):
+                                if if_data[cid_key].get("from_choice_button") is True:
+                                    return False, []
+                        if if_data.get("from_choice_button") is True:
+                            top_cid = str(if_data.get("channel_id") or "")
+                            if not top_cid or top_cid in {target_cid, origin_cid_str}:
+                                return False, []
+
                     prompts_to_check: list[str] = []
-                    target_cid = str(plan.get("origin_thread_id") or plan.get("origin_channel_id") or "")
                     if target_cid and isinstance(if_data.get(target_cid), dict):
                         prompts_to_check.append(str(if_data[target_cid].get("prompt") or ""))
+                    if origin_cid_str and origin_cid_str != target_cid and isinstance(if_data.get(origin_cid_str), dict):
+                        prompts_to_check.append(str(if_data[origin_cid_str].get("prompt") or ""))
                     if if_data.get("prompt"):
                         prompts_to_check.append(str(if_data["prompt"]))
                     for k, v in if_data.items():
@@ -5345,13 +5467,13 @@ def evaluate_plan_approval_gate(
     if len(chunks) >= 2 or tier >= 3:
         reasons.append(f"Multi-chunk Tier 3 pipeline ({len(chunks)} chunks)")
 
-    all_files: list[str] = []
+    prod_files: list[str] = []
     for ch in chunks:
         for tf in _normalize_file_list(ch.get("target_files", [])):
-            if tf not in all_files:
-                all_files.append(tf)
-    if len(all_files) >= 4:
-        reasons.append(f"Wide file blast radius ({len(all_files)} target files)")
+            if not _is_non_blast_radius_file(tf) and tf not in prod_files:
+                prod_files.append(tf)
+    if len(prod_files) >= 6:
+        reasons.append(f"Wide file blast radius ({len(prod_files)} target files)")
 
     if _detect_touches_core_bridge(plan):
         reasons.append("Touches core bridge or hook infrastructure")
@@ -5364,7 +5486,7 @@ def evaluate_plan_approval_gate(
             last_t = float(st.get("last_time", 0.0) or 0.0)
             start_t = float(st.get("turn_start_time", now_ts) or now_ts)
             total_scratch = int(st.get("total_scratch_runs", 0) or 0)
-            if (now_ts - last_t) <= 900.0 and (now_ts - start_t) > 90.0 and total_scratch >= 2:
+            if (now_ts - last_t) <= 900.0 and (now_ts - start_t) > 180.0 and total_scratch >= 4:
                 reasons.append(
                     f"Post-calibration code changes ({total_scratch} calibration/scratch runs over {int(now_ts - start_t)}s)"
                 )

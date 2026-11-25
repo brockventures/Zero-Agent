@@ -28,6 +28,7 @@ from tools.bridge_state import (
     get_active_model,
     update_beacon,
     record_in_flight,
+    consume_pending_choice_button_turn,
     record_daemon_pids,
 )
 from tools.bridge_formatting import (
@@ -491,6 +492,7 @@ class PersistentChannelWorker:
         is_physical_mention: bool = False,
         pre_settle_text: str | None = None,
         is_ambient_chime_in: bool = False,
+        from_choice_button: bool = False,
         **kwargs,
     ):
         """Execute a conversational turn on the persistent warm worker via stdin/stdout streaming."""
@@ -514,6 +516,7 @@ class PersistentChannelWorker:
                 is_physical_mention=is_physical_mention,
                 pre_settle_text=pre_settle_text,
                 is_ambient_chime_in=is_ambient_chime_in,
+                from_choice_button=from_choice_button,
             )
 
         async with self.lock:
@@ -536,6 +539,7 @@ class PersistentChannelWorker:
                 is_physical_mention=is_physical_mention,
                 pre_settle_text=pre_settle_text,
                 is_ambient_chime_in=is_ambient_chime_in,
+                from_choice_button=from_choice_button,
             )
         self._schedule_post_turn_compaction()
         return result
@@ -560,6 +564,7 @@ class PersistentChannelWorker:
         is_physical_mention: bool = False,
         pre_settle_text: str | None = None,
         is_ambient_chime_in: bool = False,
+        from_choice_button: bool = False,
     ):
         from tools.bridge_runner import (
             steering_channels,
@@ -696,6 +701,16 @@ class PersistentChannelWorker:
         timer.mark_ctx_end()
 
         # 4. Set global process hooks for mid-turn steering and presence
+        effective_from_choice = bool(
+            from_choice_button
+            or getattr(reply_target, "from_choice_button", False)
+            or (
+                self.mode == "home"
+                and isinstance(getattr(reply_target, "content", None), str)
+                and getattr(reply_target, "content", "").startswith("🔘 **Selected:**")
+            )
+            or (self.mode == "home" and consume_pending_choice_button_turn(self.channel_id, prompt))
+        )
         channel_active_procs[self.channel_id] = self.proc
         channel_active_prompts[self.channel_id] = prompt
         update_beacon("PROCESSING", prompt, channel_id=self.channel_id)
@@ -705,6 +720,7 @@ class PersistentChannelWorker:
             conv_id=self.conv_id,
             status_msg_id=status_msg.id if status_msg else None,
             pid=self.proc.pid if self.proc else None,
+            from_choice_button=effective_from_choice,
         )
         if self.mode == "home" and self.channel_id == TARGET_CHANNEL_ID:
             br.active_proc = self.proc

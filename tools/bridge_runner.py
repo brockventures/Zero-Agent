@@ -32,6 +32,7 @@ from tools.bridge_state import (
     update_beacon,
     sync_credentials,
     record_in_flight,
+    consume_pending_choice_button_turn,
     PersistentSessionKeySet,
     get_reset_session_keys,
 )
@@ -125,10 +126,21 @@ async def execute_agy_turn(
     model_override: str | None = None,
     pre_settle_text: str | None = None,
     is_ambient_chime_in: bool = False,
+    from_choice_button: bool = False,
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
     channel_active_reply_targets[channel_id] = reply_target
+    from_choice_button = bool(
+        from_choice_button
+        or getattr(reply_target, "from_choice_button", False)
+        or (
+            mode == "home"
+            and isinstance(getattr(reply_target, "content", None), str)
+            and getattr(reply_target, "content", "").startswith("🔘 **Selected:**")
+        )
+        or (mode == "home" and consume_pending_choice_button_turn(channel_id, prompt))
+    )
 
     # Thread Escalation State (Home Turf Root Channel Only) - preserved across retry attempts
     from tools.bridge_daemons import daemon_manager
@@ -156,6 +168,7 @@ async def execute_agy_turn(
                     is_physical_mention=is_physical_mention,
                     pre_settle_text=pre_settle_text,
                     is_ambient_chime_in=is_ambient_chime_in,
+                    from_choice_button=from_choice_button,
                 )
             except Exception as pe:
                 if channel_id in steering_channels:
@@ -293,7 +306,8 @@ async def execute_agy_turn(
                 channel_id=channel_id,
                 prompt=prompt,
                 conv_id=conv_id,
-                status_msg_id=status_msg.id if status_msg else None
+                status_msg_id=status_msg.id if status_msg else None,
+                from_choice_button=from_choice_button,
             )
 
         timer.mark_boot_start()
@@ -322,6 +336,7 @@ async def execute_agy_turn(
                     conv_id=conv_id,
                     status_msg_id=status_msg.id if status_msg else None,
                     pid=proc.pid,
+                    from_choice_button=from_choice_button,
                 )
             except Exception:
                 pass
