@@ -9,7 +9,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -52,10 +52,230 @@ __all__ = [
     "GATE_STATUSES",
     "BriefApprovalGate",
     "BriefGateStore",
+    "_extract_dismissal_keys",
     "handle_forge_decision_approve",
     "handle_forge_decision_dismiss",
     "write_proposal_atomic",
 ]
+
+_EMAIL_EXTRACT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_AT_DOMAIN_EXTRACT_RE = re.compile(
+    r"@([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)"
+)
+_BARE_DOMAIN_EXTRACT_RE = re.compile(
+    r"\b([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)\b"
+)
+_KNOWN_DOMAIN_TLDS = frozenset(
+    {
+        "com",
+        "org",
+        "net",
+        "edu",
+        "gov",
+        "mil",
+        "io",
+        "co",
+        "ai",
+        "app",
+        "dev",
+        "me",
+        "us",
+        "uk",
+        "ca",
+        "de",
+        "fr",
+        "jp",
+        "au",
+        "info",
+        "biz",
+        "xyz",
+        "tech",
+        "cloud",
+        "club",
+        "online",
+        "site",
+        "store",
+        "shop",
+        "tv",
+        "cc",
+        "gg",
+        "ly",
+        "to",
+        "fm",
+        "news",
+        "media",
+        "email",
+        "work",
+        "agency",
+        "ventures",
+        "school",
+        "health",
+        "care",
+        "bank",
+        "finance",
+        "legal",
+        "law",
+        "tax",
+        "team",
+        "support",
+        "help",
+        "test",
+        "example",
+        "invalid",
+    }
+)
+_NON_DOMAIN_SUFFIXES = (
+    ".create",
+    ".update",
+    ".delete",
+    ".send",
+    ".json",
+    ".tmp",
+    ".md",
+    ".py",
+    ".db",
+    ".toml",
+    ".txt",
+    ".log",
+)
+
+
+def _extract_email_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        match = _EMAIL_EXTRACT_RE.search(value)
+        if match:
+            return match.group(0).strip().lower()
+        return ""
+    if isinstance(value, Mapping):
+        for key in ("email", "sender", "from", "organizer", "address"):
+            found = _extract_email_from_value(value.get(key))
+            if found:
+                return found
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            found = _extract_email_from_value(item)
+            if found:
+                return found
+    return ""
+
+
+def _extract_domain_from_value(value: Any, *, allow_any_tld: bool = False) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        email_found = _extract_email_from_value(text)
+        if email_found:
+            return email_found
+        at_match = _AT_DOMAIN_EXTRACT_RE.search(text)
+        if at_match:
+            cand = at_match.group(1).strip().lower().strip(".")
+            if cand and not cand.endswith(_NON_DOMAIN_SUFFIXES):
+                return cand
+        for match in _BARE_DOMAIN_EXTRACT_RE.finditer(text):
+            cand = match.group(1).strip().lower().strip(".")
+            if not cand or cand in ALLOWED_GATE_ACTIONS or cand.endswith(_NON_DOMAIN_SUFFIXES):
+                continue
+            parts = cand.split(".")
+            tld = parts[-1]
+            if allow_any_tld or len(parts) >= 3 or tld in _KNOWN_DOMAIN_TLDS:
+                return cand
+        return ""
+    if isinstance(value, Mapping):
+        for key in ("domain", "sender_domain", "sender", "email"):
+            found = _extract_domain_from_value(value.get(key), allow_any_tld=allow_any_tld)
+            if found:
+                return found
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            found = _extract_domain_from_value(item, allow_any_tld=allow_any_tld)
+            if found:
+                return found
+    return ""
+
+
+def _extract_dismissal_keys(row: Mapping[str, Any]) -> tuple[str, str]:
+    """Derive normalized (sender_key, category_key) from a proposal row or dict safely."""
+    if not isinstance(row, Mapping):
+        return "", ""
+
+    raw_action = str(row.get("action") or "").strip().lower()
+    raw_category = str(row.get("category_key") or row.get("category") or "").strip().lower()
+    from_session = str(row.get("from_session") or "").strip()
+    reason = str(row.get("reason") or "").strip()
+
+    if raw_category:
+        category_key = raw_category
+    elif raw_action:
+        category_key = raw_action
+    elif from_session:
+        parts = [p.strip().lower() for p in from_session.split("/") if p.strip()]
+        category_key = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+    else:
+        category_key = ""
+
+    args_map: Mapping[str, Any] = {}
+    raw_args = row.get("args")
+    if isinstance(raw_args, Mapping):
+        args_map = raw_args
+    else:
+        raw_args_json = row.get("args_json")
+        if isinstance(raw_args_json, str) and raw_args_json.strip():
+            try:
+                loaded = json.loads(raw_args_json)
+                if isinstance(loaded, Mapping):
+                    args_map = loaded
+            except (json.JSONDecodeError, TypeError, ValueError):
+                args_map = {}
+
+    # 1. Explicit sender / domain fields on row or args
+    for explicit_val in (
+        row.get("sender_key"),
+        row.get("sender"),
+        row.get("from"),
+        row.get("domain"),
+        args_map.get("sender_key"),
+        args_map.get("sender"),
+        args_map.get("from"),
+        args_map.get("organizer"),
+        args_map.get("sender_email"),
+        args_map.get("domain"),
+        args_map.get("sender_domain"),
+    ):
+        if explicit_val:
+            found = _extract_domain_from_value(explicit_val, allow_any_tld=True)
+            if found:
+                return found, category_key
+
+    # 2. Attendees list in args
+    attendees = args_map.get("attendees")
+    if attendees:
+        found = _extract_email_from_value(attendees) or _extract_domain_from_value(
+            attendees, allow_any_tld=True
+        )
+        if found:
+            return found, category_key
+
+    # 3. Email addresses anywhere in reason, from_session, summary, or description
+    for text_field in (
+        reason,
+        from_session,
+        args_map.get("summary"),
+        args_map.get("description"),
+    ):
+        found_email = _extract_email_from_value(text_field)
+        if found_email:
+            return found_email, category_key
+
+    # 4. Domain names in reason or from_session
+    for text_field in (reason, from_session):
+        found_domain = _extract_domain_from_value(text_field, allow_any_tld=False)
+        if found_domain:
+            return found_domain, category_key
+
+    return "", category_key
 
 
 def _validate_proposal_id(raw_id: Any) -> str:
@@ -181,6 +401,20 @@ class BriefGateStore:
 
                 CREATE INDEX IF NOT EXISTS idx_gate_proposals_status_expires
                     ON gate_proposals(status, expires_at);
+
+                CREATE TABLE IF NOT EXISTS brief_dismissal_strikes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposal_id TEXT UNIQUE NOT NULL,
+                    action TEXT NOT NULL,
+                    sender_key TEXT NOT NULL DEFAULT '',
+                    category_key TEXT NOT NULL DEFAULT '',
+                    dismissed_at REAL NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    surfaced_in_review_at REAL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_brief_dismissal_strikes_review
+                    ON brief_dismissal_strikes(surfaced_in_review_at, dismissed_at);
                 """
             )
 
@@ -388,6 +622,230 @@ class BriefGateStore:
             ).fetchall():
                 counts[str(row["status"])] = int(row["cnt"])
         return counts
+
+    def record_dismissal_strike(
+        self,
+        proposal_id: str,
+        action: str,
+        sender_key: str = "",
+        category_key: str = "",
+        dismissed_at: float | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Idempotently record a proposal dismissal strike for 3-strike mute evaluation."""
+        clean_pid = str(proposal_id or "").strip()
+        if not clean_pid:
+            raise ValueError("proposal_id must be a non-empty string")
+        clean_action = str(action or "").strip().lower()
+        clean_sender = str(sender_key or "").strip().lower().lstrip("@")
+        clean_category = str(category_key or clean_action or "").strip().lower()
+        ts = time.time() if dismissed_at is None else float(dismissed_at)
+        clean_note = str(note or "").strip()
+
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO brief_dismissal_strikes (
+                    proposal_id, action, sender_key, category_key,
+                    dismissed_at, note, surfaced_in_review_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    action = excluded.action,
+                    sender_key = excluded.sender_key,
+                    category_key = excluded.category_key,
+                    dismissed_at = excluded.dismissed_at,
+                    note = excluded.note
+                """,
+                (clean_pid, clean_action, clean_sender, clean_category, ts, clean_note),
+            )
+        return {
+            "proposal_id": clean_pid,
+            "action": clean_action,
+            "sender_key": clean_sender,
+            "category_key": clean_category,
+            "dismissed_at": ts,
+            "note": clean_note,
+        }
+
+    def list_three_strike_candidates(
+        self,
+        threshold: int = 3,
+        window_days: int = 30,
+        now: float | None = None,
+        muted_domains: Sequence[str] | set[str] | tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Return unsurfaced sender_key or category_key entries reaching >= threshold dismissals in window."""
+        now_ts = time.time() if now is None else float(now)
+        min_strikes = max(1, int(threshold))
+        cutoff_ts = now_ts - (max(1, int(window_days)) * 86400.0)
+
+        muted_exact: set[str] = set()
+        muted_doms: set[str] = set()
+        for raw_domain in muted_domains or ():
+            cleaned = str(raw_domain or "").strip().lower().lstrip("@.").rstrip(".")
+            if not cleaned:
+                continue
+            muted_exact.add(cleaned)
+            dom_part = cleaned.rsplit("@", 1)[-1].lstrip("@.").rstrip(".")
+            if dom_part:
+                muted_doms.add(dom_part)
+
+        with self._tx() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, proposal_id, action, sender_key, category_key, dismissed_at, note
+                FROM brief_dismissal_strikes
+                WHERE surfaced_in_review_at IS NULL
+                  AND dismissed_at >= ?
+                ORDER BY dismissed_at ASC, id ASC
+                """,
+                (cutoff_ts,),
+            ).fetchall()
+
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            s_key = str(row["sender_key"] or "").strip().lower().lstrip("@")
+            c_key = str(row["category_key"] or row["action"] or "").strip().lower()
+            if s_key:
+                s_dom = s_key.rsplit("@", 1)[-1].lstrip("@.").rstrip(".")
+                is_muted = (
+                    s_key in muted_exact
+                    or s_dom in muted_exact
+                    or any(s_dom == md or s_dom.endswith(f".{md}") for md in muted_doms)
+                )
+                if is_muted:
+                    continue
+                group_id = ("sender", s_key)
+            elif c_key:
+                if c_key in muted_exact:
+                    continue
+                group_id = ("category", c_key)
+            else:
+                continue
+            grouped.setdefault(group_id, []).append(row)
+
+        candidates: list[dict[str, Any]] = []
+        for (kind, key), group_rows in grouped.items():
+            if len(group_rows) < min_strikes:
+                continue
+            s_val = key if kind == "sender" else ""
+            dom_val = s_val.rsplit("@", 1)[-1].lstrip("@.").rstrip(".") if s_val else ""
+            cat_val = (
+                str(group_rows[-1]["category_key"] or group_rows[-1]["action"] or "")
+                if kind == "sender"
+                else key
+            )
+            candidates.append(
+                {
+                    "kind": kind,
+                    "key": key,
+                    "sender_key": s_val,
+                    "domain": dom_val,
+                    "category_key": cat_val,
+                    "action": str(group_rows[-1]["action"]),
+                    "count": len(group_rows),
+                    "strike_count": len(group_rows),
+                    "proposal_ids": [str(r["proposal_id"]) for r in group_rows],
+                    "strike_ids": [int(r["id"]) for r in group_rows],
+                    "first_dismissed_at": float(group_rows[0]["dismissed_at"]),
+                    "last_dismissed_at": float(group_rows[-1]["dismissed_at"]),
+                    "notes": [
+                        str(r["note"]).strip()
+                        for r in group_rows
+                        if str(r["note"] or "").strip()
+                    ],
+                }
+            )
+        return candidates
+
+    def mark_strikes_surfaced(
+        self,
+        candidates: Sequence[Any],
+        now: float | None = None,
+    ) -> int:
+        """Mark dismissal strikes matching `candidates` as surfaced in daily review."""
+        if not candidates:
+            return 0
+        now_ts = time.time() if now is None else float(now)
+
+        strike_ids: set[int] = set()
+        proposal_ids: set[str] = set()
+        sender_keys: set[str] = set()
+        category_only_keys: set[str] = set()
+
+        for item in candidates:
+            if isinstance(item, int):
+                strike_ids.add(int(item))
+            elif isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    proposal_ids.add(cleaned)
+                    sender_keys.add(cleaned.lower().lstrip("@"))
+            elif isinstance(item, Mapping):
+                for sid in item.get("strike_ids") or ():
+                    try:
+                        strike_ids.add(int(sid))
+                    except (TypeError, ValueError):
+                        pass
+                if item.get("id") is not None:
+                    try:
+                        strike_ids.add(int(item["id"]))
+                    except (TypeError, ValueError):
+                        pass
+                for pid in item.get("proposal_ids") or ():
+                    if str(pid or "").strip():
+                        proposal_ids.add(str(pid).strip())
+                if item.get("proposal_id"):
+                    proposal_ids.add(str(item["proposal_id"]).strip())
+
+                s_key = str(item.get("sender_key") or "").strip().lower().lstrip("@")
+                c_key = str(item.get("category_key") or "").strip().lower()
+                kind = str(item.get("kind") or "").strip().lower()
+                key = str(item.get("key") or "").strip().lower().lstrip("@")
+
+                if s_key:
+                    sender_keys.add(s_key)
+                elif kind == "sender" and key:
+                    sender_keys.add(key)
+                elif (kind == "category" or not s_key) and (c_key or key):
+                    category_only_keys.add(c_key or key)
+
+        clauses: list[str] = []
+        params: list[Any] = [now_ts]
+
+        if strike_ids:
+            placeholders = ", ".join("?" for _ in strike_ids)
+            clauses.append(f"id IN ({placeholders})")
+            params.extend(sorted(strike_ids))
+        if proposal_ids:
+            placeholders = ", ".join("?" for _ in proposal_ids)
+            clauses.append(f"proposal_id IN ({placeholders})")
+            params.extend(sorted(proposal_ids))
+        if sender_keys:
+            placeholders = ", ".join("?" for _ in sender_keys)
+            clauses.append(f"sender_key IN ({placeholders})")
+            params.extend(sorted(sender_keys))
+        if category_only_keys:
+            placeholders = ", ".join("?" for _ in category_only_keys)
+            clauses.append(f"(sender_key = '' AND category_key IN ({placeholders}))")
+            params.extend(sorted(category_only_keys))
+
+        if not clauses:
+            return 0
+
+        where_expr = " OR ".join(clauses)
+        with self._tx() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE brief_dismissal_strikes
+                SET surfaced_in_review_at = ?
+                WHERE surfaced_in_review_at IS NULL
+                  AND ({where_expr})
+                """,
+                tuple(params),
+            )
+            return int(cur.rowcount)
 
 
 def _default_stage_card(
@@ -1368,6 +1826,16 @@ class BriefApprovalGate:
         archived_path = self._archive_file(pending_path, f"{pid}.dismissed.json")
         if archived_path is not None:
             self.gate_store.set_archived_path(pid, archived_path)
+
+        sender_key, category_key = _extract_dismissal_keys(row)
+        self.gate_store.record_dismissal_strike(
+            proposal_id=pid,
+            action=str(row["action"]),
+            sender_key=sender_key,
+            category_key=category_key,
+            dismissed_at=now_ts,
+            note=clean_note,
+        )
 
         receipt_ev = self._emit_receipt(
             proposal_id=pid,

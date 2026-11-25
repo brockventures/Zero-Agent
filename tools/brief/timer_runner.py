@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.brief.config import BriefConfig
 from tools.brief.queue import BriefQueue
+from tools.brief.tasks import scan_tasks_for_daily_review
 
 
 def _resolve_pt_datetime(
@@ -66,20 +68,97 @@ def enqueue_daily_review(
     now: float | datetime | None = None,
     *,
     tz_name: str = "America/Los_Angeles",
+    task_dir: Path | str | None = None,
+    gate_store: Any | None = None,
+    config: BriefConfig | None = None,
+    skip_if_empty: bool = False,
 ) -> int | None:
     """Enqueue today's internal daily task review event idempotently (zero LLM calls)."""
-    dt = _resolve_pt_datetime(now, tz_name=tz_name)
+    effective_tz = tz_name or (config.timezone if config is not None else "America/Los_Angeles")
+    dt = _resolve_pt_datetime(now, tz_name=effective_tz)
     date_str = dt.strftime("%Y-%m-%d")
     ts = dt.timestamp()
-    payload = json.dumps(
-        {
-            "type": "daily_review",
-            "date": date_str,
-            "triggered_at_pt": f"{dt.strftime('%Y-%m-%d %H:%M')} PT",
-        },
-        sort_keys=True,
+
+    payload_dict: dict[str, Any] = {
+        "type": "daily_review",
+        "date": date_str,
+        "triggered_at_pt": f"{dt.strftime('%Y-%m-%d %H:%M')} PT",
+    }
+
+    has_scan_context = (
+        task_dir is not None
+        or gate_store is not None
+        or config is not None
+        or skip_if_empty
     )
-    return queue.enqueue_event(
+    three_strike_candidates: list[dict[str, Any]] = []
+    resolved_gate_store = gate_store
+
+    if has_scan_context:
+        resolved_task_dir = (
+            Path(task_dir)
+            if task_dir is not None
+            else (config.task_dir if config is not None else None)
+        )
+        if resolved_task_dir is not None:
+            open_stale_days = config.task_open_stale_days if config is not None else 3
+            blocked_stale_days = config.task_blocked_stale_days if config is not None else 6
+            backoff_days = (
+                config.task_staleness_backoff_days if config is not None else (3, 7, 14)
+            )
+            task_scan = scan_tasks_for_daily_review(
+                resolved_task_dir,
+                now=ts,
+                open_stale_days=open_stale_days,
+                blocked_stale_days=blocked_stale_days,
+                backoff_days=backoff_days,
+                tz_name=effective_tz,
+            )
+        else:
+            task_scan = {
+                "open_count": 0,
+                "blocked_count": 0,
+                "due_tasks": [],
+                "stale_tasks": [],
+                "actionable_tasks": [],
+                "has_actionable_items": False,
+            }
+
+        if (
+            resolved_gate_store is None
+            and config is not None
+            and config.gate_db_path.is_file()
+        ):
+            from tools.brief.gate import BriefGateStore
+
+            resolved_gate_store = BriefGateStore(config.gate_db_path)
+            resolved_gate_store.init_db()
+
+        if resolved_gate_store is not None and hasattr(
+            resolved_gate_store, "list_three_strike_candidates"
+        ):
+            threshold = config.dismissal_mute_strikes if config is not None else 3
+            window_days = config.dismissal_window_days if config is not None else 30
+            muted_domains = config.blocked_domains if config is not None else ()
+            three_strike_candidates = resolved_gate_store.list_three_strike_candidates(
+                threshold=threshold,
+                window_days=window_days,
+                now=ts,
+                muted_domains=muted_domains,
+            )
+
+        has_actionable_items = bool(
+            task_scan.get("has_actionable_items") or three_strike_candidates
+        )
+        if skip_if_empty and not has_actionable_items:
+            return None
+
+        payload_dict["task_scan"] = task_scan
+        payload_dict["three_strike_mute_candidates"] = three_strike_candidates
+        payload_dict["has_actionable_items"] = has_actionable_items
+
+    payload = json.dumps(payload_dict, sort_keys=True)
+    ev_id = queue.enqueue_event(
         source="internal",
         key="review",
         target_tag="internal/review",
@@ -88,6 +167,14 @@ def enqueue_daily_review(
         body=payload,
         received_at=ts,
     )
+    if (
+        ev_id is not None
+        and three_strike_candidates
+        and resolved_gate_store is not None
+        and hasattr(resolved_gate_store, "mark_strikes_surfaced")
+    ):
+        resolved_gate_store.mark_strikes_surfaced(three_strike_candidates, now=ts)
+    return ev_id
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,7 +202,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.kind in ("morning-brief", "both"):
         enqueued["morning_brief"] = enqueue_morning_brief(queue, now=now_ts, tz_name=cfg.timezone)
     if args.kind in ("daily-review", "both"):
-        enqueued["daily_review"] = enqueue_daily_review(queue, now=now_ts, tz_name=cfg.timezone)
+        gate_store = None
+        if cfg.gate_db_path.is_file():
+            from tools.brief.gate import BriefGateStore
+
+            gate_store = BriefGateStore(cfg.gate_db_path)
+            gate_store.init_db()
+        enqueued["daily_review"] = enqueue_daily_review(
+            queue,
+            now=now_ts,
+            tz_name=cfg.timezone,
+            task_dir=cfg.task_dir,
+            gate_store=gate_store,
+            config=cfg,
+            skip_if_empty=cfg.skip_empty_daily_review,
+        )
 
     print(json.dumps(enqueued, sort_keys=True))
     return 0

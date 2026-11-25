@@ -20,7 +20,9 @@ from tools.brief.actions import canonical_proposal_hash, validate_action_args
 from tools.brief.config import BriefConfig
 from tools.brief.gate import (
     BriefApprovalGate,
+    BriefGateStore,
     _build_decision_card_copy,
+    _extract_dismissal_keys,
     _format_readable_pt_range,
     handle_forge_decision_approve,
     handle_forge_decision_dismiss,
@@ -719,3 +721,135 @@ def test_base_prompt_includes_brevity_invariant() -> None:
     assert "5. **Brevity & Plain English:**" in base_md
     assert "1–3 short plain-English sentences" in base_md
     assert "mobile-scannable" in base_md
+
+
+def test_extract_dismissal_keys_and_three_strike_silent_dismissal_lifecycle(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path)
+    queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
+    queue.init_db()
+    now_ts = _ts_pt(2026, 11, 24, 10, 0)
+
+    # Verify _extract_dismissal_keys derivations
+    assert _extract_dismissal_keys(
+        {
+            "action": "calendar.create",
+            "args": {"attendees": ["Coach <Coach@School.Example.ORG>"]},
+            "reason": "Practice sync",
+            "from_session": "intake/gmail/thread-1",
+        }
+    ) == ("coach@school.example.org", "calendar.create")
+    assert _extract_dismissal_keys(
+        {
+            "action": "calendar.update",
+            "args_json": json.dumps({"summary": "Promo Webinar"}),
+            "reason": "Invite from events.vendor.example.com",
+            "from_session": "intake/gmail/thread-2",
+        }
+    ) == ("events.vendor.example.com", "calendar.update")
+    assert _extract_dismissal_keys(
+        {
+            "action": "calendar.create",
+            "args": {"summary": "Deep Work Block"},
+            "reason": "Hold focus block",
+            "from_session": "intake/gmail/thread-3",
+        }
+    ) == ("", "calendar.create")
+
+    cards: dict[str, dict[str, Any]] = {}
+    gate = BriefApprovalGate(
+        cfg,
+        queue=queue,
+        stage_card_fn=lambda **kw: cards.setdefault(
+            kw["payload"]["proposal_id"],
+            {"decision_id": f"dec-{kw['payload']['proposal_id']}", **kw},
+        ),
+        api_client=_FakeCalendarApi(),
+        now_fn=lambda: now_ts,
+    )
+
+    for idx in (1, 2, 3):
+        pid = f"prop-strike-{idx}"
+        prop = _sample_create_proposal(
+            pid,
+            summary=f"Practice {idx}",
+            from_session=f"intake/gmail/thread-strike-{idx}",
+        )
+        write_proposal_atomic(cfg.proposals_pending_dir, prop)
+
+    scan_res = gate.scan_pending_proposals(now=now_ts)
+    assert scan_res["staged"] == 3
+
+    # 1st silent dismissal -> 0 mute candidates
+    d1 = gate.dismiss_proposal("prop-strike-1", note="", now=now_ts + 10)
+    assert d1["ok"] is True
+    assert gate.gate_store.list_three_strike_candidates(now=now_ts + 10) == []
+
+    # 2nd silent dismissal -> 0 mute candidates
+    d2 = gate.dismiss_proposal("prop-strike-2", note="", now=now_ts + 20)
+    assert d2["ok"] is True
+    assert gate.gate_store.list_three_strike_candidates(now=now_ts + 20) == []
+
+    # 3rd silent dismissal -> returns the candidate
+    d3 = gate.dismiss_proposal("prop-strike-3", note="", now=now_ts + 30)
+    assert d3["ok"] is True
+    candidates = gate.gate_store.list_three_strike_candidates(now=now_ts + 30)
+    assert len(candidates) == 1
+    cand = candidates[0]
+    assert cand["sender_key"] == "coach@example.org"
+    assert cand["domain"] == "example.org"
+    assert cand["category_key"] == "calendar.create"
+    assert cand["strike_count"] == 3
+    assert cand["proposal_ids"] == ["prop-strike-1", "prop-strike-2", "prop-strike-3"]
+
+    # Already-muted domains (exact domain or parent domain) are excluded
+    assert (
+        gate.gate_store.list_three_strike_candidates(
+            now=now_ts + 30,
+            muted_domains=("example.org",),
+        )
+        == []
+    )
+    assert (
+        gate.gate_store.list_three_strike_candidates(
+            now=now_ts + 30,
+            muted_domains=("coach@example.org",),
+        )
+        == []
+    )
+
+    # mark_strikes_surfaced prevents re-asking on subsequent daily reviews
+    marked = gate.gate_store.mark_strikes_surfaced(candidates, now=now_ts + 60)
+    assert marked == 3
+    assert gate.gate_store.list_three_strike_candidates(now=now_ts + 65) == []
+
+    # One more dismissal after surfacing does not re-trigger (only 1 unsurfaced strike < 3)
+    gate.gate_store.record_dismissal_strike(
+        proposal_id="prop-strike-4",
+        action="calendar.create",
+        sender_key="coach@example.org",
+        category_key="calendar.create",
+        dismissed_at=now_ts + 120,
+        note="",
+    )
+    assert gate.gate_store.list_three_strike_candidates(now=now_ts + 125) == []
+
+    # Direct BriefGateStore category-only 3-strike tracking when sender_key is empty
+    direct_store = BriefGateStore(cfg.gate_db_path)
+    direct_store.init_db()
+    for idx in (1, 2, 3):
+        direct_store.record_dismissal_strike(
+            f"prop-cat-{idx}",
+            "calendar.update",
+            "",
+            "calendar.update",
+            now_ts + 200 + idx,
+        )
+    cat_cands = direct_store.list_three_strike_candidates(now=now_ts + 210)
+    assert len(cat_cands) == 1
+    assert cat_cands[0]["kind"] == "category"
+    assert cat_cands[0]["category_key"] == "calendar.update"
+    assert direct_store.mark_strikes_surfaced(cat_cands, now=now_ts + 220) == 3
+    assert direct_store.list_three_strike_candidates(now=now_ts + 225) == []
+

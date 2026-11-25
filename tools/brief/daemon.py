@@ -814,7 +814,13 @@ class BriefDaemonRunner:
         if dt.hour >= _DAILY_REVIEW_HOUR_PT and self._last_daily_review_date != date_str:
             try:
                 ev_id = enqueue_daily_review(
-                    self.queue, now=now_ts, tz_name=self.config.timezone
+                    self.queue,
+                    now=now_ts,
+                    tz_name=self.config.timezone,
+                    task_dir=self.config.task_dir,
+                    gate_store=getattr(self.approval_gate, "gate_store", None),
+                    config=self.config,
+                    skip_if_empty=self.config.skip_empty_daily_review,
                 )
                 self._last_daily_review_date = date_str
                 enqueued["daily_review"] = ev_id

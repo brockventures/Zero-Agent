@@ -497,6 +497,7 @@ def test_daemon_runner_kill_switch_pauses_cleanly(tmp_path: Path) -> None:
 
 def test_daemon_runner_single_tick_cadence_and_error_isolation(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
+    cfg.skip_empty_daily_review = False
     queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
     queue.init_db()
     cursors = CursorStore(cfg.cursors_path)
@@ -893,3 +894,116 @@ def test_daemon_runner_stages_proposals_immediately_after_each_routed_event(
     assert "gate" in tick_err["errors"]
     assert tick_err["gate"]["staged"] >= 1
     assert "prop-recovered" in tick_err["gate"]["staged_ids"]
+
+
+def test_quiet_daily_review_skips_when_empty_and_enqueues_on_strikes_or_stale_tasks(
+    tmp_path: Path,
+) -> None:
+    from tools.brief.gate import BriefApprovalGate
+    from tools.brief.tasks import create_or_update_task_handoff, mark_tasks_nudged
+
+    cfg = _make_cfg(tmp_path)
+    assert cfg.skip_empty_daily_review is True
+    queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
+    queue.init_db()
+    approval_gate = BriefApprovalGate(
+        cfg,
+        queue=queue,
+        stage_card_fn=lambda **_kw: {"decision_id": "dec-noop"},
+    )
+
+    class _NoopWatcher:
+        def poll_once(self) -> dict[str, Any]:
+            return {"status": "ok", "enqueued": 0}
+
+    t_day1 = _pt_ts(2026, 11, 24, 18, 5)
+    runner = BriefDaemonRunner(
+        cfg,
+        queue=queue,
+        gmail_watcher=_NoopWatcher(),  # type: ignore[arg-type]
+        calendar_watcher=_NoopWatcher(),  # type: ignore[arg-type]
+        router=BriefRouter(cfg, queue=queue, harness=DryRunHarness(), now_fn=lambda: t_day1),
+        delivery_gate=BriefDeliveryGate(cfg, post_fn=lambda _ch, _msg: True),
+        approval_gate=approval_gate,
+        watchdog_fn=lambda _c, _q, **_kw: {"healthy": True},
+        now_fn=lambda: t_day1,
+    )
+    # Suppress morning brief so we isolate daily_review behavior
+    runner._last_morning_brief_date = "2026-11-24"
+
+    # (a) Empty task_dir + 0 strikes -> daily_review is skipped completely (zero events queued)
+    tick_empty = runner.run_tick(now=t_day1)
+    assert tick_empty["timers"]["daily_review"] is None
+    assert tick_empty["routed"] == 0
+    assert queue.get_queue_stats()["total"] == 0
+
+    # (b1) 3-strike dismissal candidate enqueues daily_review with structured payload
+    # and marks strikes surfaced so subsequent review stays silent.
+    t_day2 = _pt_ts(2026, 11, 25, 18, 5)
+    runner._last_morning_brief_date = "2026-11-25"
+    for idx in (1, 2, 3):
+        approval_gate.gate_store.record_dismissal_strike(
+            proposal_id=f"prop-mute-{idx}",
+            action="calendar.create",
+            sender_key="promo@deals.example.com",
+            category_key="calendar.create",
+            dismissed_at=t_day2 - (idx * 60),
+            note="",
+        )
+
+    enqueued_day2 = runner._run_timers(t_day2)
+    rev_ev_id = enqueued_day2["daily_review"]
+    assert rev_ev_id is not None
+
+    with queue._tx() as conn:
+        row = conn.execute("SELECT body FROM events WHERE id = ?", (rev_ev_id,)).fetchone()
+    assert row is not None
+    payload_day2 = json.loads(row["body"])
+    assert payload_day2["type"] == "daily_review"
+    assert payload_day2["has_actionable_items"] is True
+    assert payload_day2["task_scan"]["has_actionable_items"] is False
+    assert len(payload_day2["three_strike_mute_candidates"]) == 1
+    assert (
+        payload_day2["three_strike_mute_candidates"][0]["sender_key"]
+        == "promo@deals.example.com"
+    )
+
+    # Strikes were marked surfaced at enqueue time -> next day with no due tasks stays silent!
+    assert approval_gate.gate_store.list_three_strike_candidates(now=t_day2 + 10) == []
+    t_day3 = _pt_ts(2026, 11, 26, 18, 5)
+    runner._last_morning_brief_date = "2026-11-26"
+    enqueued_day3 = runner._run_timers(t_day3)
+    assert enqueued_day3["daily_review"] is None
+
+    # (b2) Stale task past backoff DOES enqueue daily_review, while backoff-suppressed task stays silent.
+    t_day4 = _pt_ts(2026, 11, 27, 18, 5)
+    runner._last_morning_brief_date = "2026-11-27"
+    create_or_update_task_handoff(
+        cfg.task_dir,
+        "20261120-vendor-contract",
+        status="open",
+        waiting_on="Vendor legal",
+        next_check="2026-12-10T09:00:00-08:00",
+        summary="Sent redlines",
+        now=t_day4 - (4 * 86400),  # 4 days old >= 3d open threshold
+    )
+
+    enqueued_day4 = runner._run_timers(t_day4)
+    rev_ev_day4 = enqueued_day4["daily_review"]
+    assert rev_ev_day4 is not None
+    with queue._tx() as conn:
+        row4 = conn.execute("SELECT body FROM events WHERE id = ?", (rev_ev_day4,)).fetchone()
+    assert row4 is not None
+    payload_day4 = json.loads(row4["body"])
+    assert payload_day4["has_actionable_items"] is True
+    assert payload_day4["task_scan"]["has_actionable_items"] is True
+    assert len(payload_day4["task_scan"]["stale_tasks"]) == 1
+    assert payload_day4["task_scan"]["stale_tasks"][0]["slug"] == "20261120-vendor-contract"
+
+    # Mark task nudged today -> tomorrow (1d elapsed < 7d second backoff) daily_review stays silent!
+    mark_tasks_nudged(cfg.task_dir, ["20261120-vendor-contract"], now=t_day4)
+    t_day5 = _pt_ts(2026, 11, 28, 18, 5)
+    runner._last_morning_brief_date = "2026-11-28"
+    enqueued_day5 = runner._run_timers(t_day5)
+    assert enqueued_day5["daily_review"] is None
+
