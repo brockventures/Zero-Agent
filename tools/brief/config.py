@@ -104,6 +104,27 @@ def _merge_unique_domains(*groups: list[str]) -> list[str]:
     return merged
 
 
+def _parse_backoff_days(raw: Any) -> list[int]:
+    if raw is None:
+        return [3, 7, 14]
+    items: list[Any]
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return [3, 7, 14]
+
+    parsed: list[int] = []
+    for item in items:
+        try:
+            val = max(1, int(item))
+        except (TypeError, ValueError):
+            continue
+        parsed.append(val)
+    return parsed or [3, 7, 14]
+
+
 def _load_secrets_owner_emails(secrets_path: Path | None) -> list[str]:
     if secrets_path is None or not secrets_path.exists():
         return []
@@ -168,6 +189,16 @@ class BriefConfig:
     gate_max_proposal_ttl_seconds: int = 604800
     gate_default_calendar_id: str = "primary"
 
+    # [tasks]
+    task_open_stale_days: int = 3
+    task_blocked_stale_days: int = 6
+    task_staleness_backoff_days: list[int] = field(default_factory=lambda: [3, 7, 14])
+    skip_empty_daily_review: bool = True
+
+    # [dismissals]
+    dismissal_mute_strikes: int = 3
+    dismissal_window_days: int = 30
+
     # Runtime filesystem directories
     state_dir: Path = DEFAULT_STATE_DIR
     memory_dir: Path = DEFAULT_MEMORY_DIR
@@ -192,6 +223,12 @@ class BriefConfig:
         self.imminent_event_minutes = max(0, int(self.imminent_event_minutes))
         self.automated_domain_allowlist = _merge_unique_domains(self.automated_domain_allowlist)
         self.blocked_domains = _merge_unique_domains(self.blocked_domains)
+        self.task_open_stale_days = max(1, int(self.task_open_stale_days))
+        self.task_blocked_stale_days = max(1, int(self.task_blocked_stale_days))
+        self.task_staleness_backoff_days = _parse_backoff_days(self.task_staleness_backoff_days)
+        self.skip_empty_daily_review = bool(self.skip_empty_daily_review)
+        self.dismissal_mute_strikes = max(1, int(self.dismissal_mute_strikes))
+        self.dismissal_window_days = max(1, int(self.dismissal_window_days))
 
     @property
     def db_path(self) -> Path:
@@ -301,10 +338,16 @@ class BriefConfig:
         sessions = data.get("sessions", {})
         safety = data.get("safety", {})
         gate = data.get("gate", {})
+        tasks = data.get("tasks", {})
+        dismissals = data.get("dismissals", {})
         if not isinstance(filtering, dict):
             filtering = {}
         if not isinstance(gate, dict):
             gate = {}
+        if not isinstance(tasks, dict):
+            tasks = {}
+        if not isinstance(dismissals, dict):
+            dismissals = {}
 
         toml_emails = _parse_email_list(owner.get("allowlisted_emails", []))
         vip_emails = _parse_email_list(owner.get("vip_senders", []))
@@ -359,6 +402,14 @@ class BriefConfig:
             gate_allow_shared_oauth_fallback=bool(raw_allow_fallback),
             gate_max_proposal_ttl_seconds=int(raw_max_ttl),
             gate_default_calendar_id=str(raw_default_cal_id),
+            task_open_stale_days=int(tasks.get("open_stale_days", 3)),
+            task_blocked_stale_days=int(tasks.get("blocked_stale_days", 6)),
+            task_staleness_backoff_days=_parse_backoff_days(
+                tasks.get("staleness_backoff_days", [3, 7, 14])
+            ),
+            skip_empty_daily_review=bool(tasks.get("skip_empty_daily_review", True)),
+            dismissal_mute_strikes=int(dismissals.get("mute_strikes", 3)),
+            dismissal_window_days=int(dismissals.get("window_days", 30)),
             state_dir=resolved_state,
             memory_dir=resolved_memory,
             prompts_dir=resolved_prompts,

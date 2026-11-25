@@ -48,6 +48,12 @@ def test_brief_toml_example_is_valid_and_pii_free() -> None:
     assert parsed["filtering"]["blocked_domains"] == ["marketing.example.net"]
     assert parsed["sessions"]["email_grain"] == "thread"
     assert parsed["safety"]["dry_run"] is True
+    assert parsed["tasks"]["open_stale_days"] == 3
+    assert parsed["tasks"]["blocked_stale_days"] == 6
+    assert parsed["tasks"]["staleness_backoff_days"] == [3, 7, 14]
+    assert parsed["tasks"]["skip_empty_daily_review"] is True
+    assert parsed["dismissals"]["mute_strikes"] == 3
+    assert parsed["dismissals"]["window_days"] == 30
 
 
 def test_config_wave1_fields_defaults_and_normalization(
@@ -104,6 +110,59 @@ def test_config_wave1_fields_defaults_and_normalization(
     assert wave1_cfg.imminent_event_minutes == 45
     assert wave1_cfg.automated_domain_allowlist == ["konstella.com", "alerts.example.org"]
     assert wave1_cfg.blocked_domains == ["promo.example.net", "ads.example.com"]
+
+
+def test_config_wave2_tasks_and_dismissals_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BRIEF_OWNER_EMAILS", raising=False)
+    defaults_cfg = BriefConfig()
+    assert defaults_cfg.task_open_stale_days == 3
+    assert defaults_cfg.task_blocked_stale_days == 6
+    assert defaults_cfg.task_staleness_backoff_days == [3, 7, 14]
+    assert defaults_cfg.skip_empty_daily_review is True
+    assert defaults_cfg.dismissal_mute_strikes == 3
+    assert defaults_cfg.dismissal_window_days == 30
+
+    wave2_toml = tmp_path / "wave2.toml"
+    wave2_toml.write_text(
+        "[tasks]\n"
+        "open_stale_days = 4\n"
+        "blocked_stale_days = 8\n"
+        "staleness_backoff_days = [4, 10, 21]\n"
+        "skip_empty_daily_review = false\n"
+        "[dismissals]\n"
+        "mute_strikes = 5\n"
+        "window_days = 45\n",
+        encoding="utf-8",
+    )
+    wave2_cfg = BriefConfig.load(
+        config_path=wave2_toml,
+        state_dir=tmp_path / "s_w2",
+        memory_dir=tmp_path / "m_w2",
+        secrets_path=tmp_path / "no-secrets.json",
+    )
+    assert wave2_cfg.task_open_stale_days == 4
+    assert wave2_cfg.task_blocked_stale_days == 8
+    assert wave2_cfg.task_staleness_backoff_days == [4, 10, 21]
+    assert wave2_cfg.skip_empty_daily_review is False
+    assert wave2_cfg.dismissal_mute_strikes == 5
+    assert wave2_cfg.dismissal_window_days == 45
+
+    # Clamping invalid/non-positive values in __post_init__
+    clamped = BriefConfig(
+        task_open_stale_days=0,
+        task_blocked_stale_days=-2,
+        task_staleness_backoff_days=[],
+        dismissal_mute_strikes=0,
+        dismissal_window_days=-10,
+    )
+    assert clamped.task_open_stale_days == 1
+    assert clamped.task_blocked_stale_days == 1
+    assert clamped.task_staleness_backoff_days == [3, 7, 14]
+    assert clamped.dismissal_mute_strikes == 1
+    assert clamped.dismissal_window_days == 1
 
 
 def test_layered_prompts_exist_and_cover_core_contracts() -> None:
