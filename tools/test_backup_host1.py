@@ -543,6 +543,9 @@ def test_backup_docker_appdata_success():
         "--exclude='logs'",
         "--exclude='log'",
         "--exclude='*.log'",
+        "--exclude='processed_books'",
+        "--exclude='thumbnails'",
+        "--exclude='covers'",
     ):
         assert excl in tar_cmd
     assert f"-C '{backup_host1.DOCKER_ROOT}/appdata' dockhand" not in tar_cmd

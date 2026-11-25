@@ -164,6 +164,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
         f"--exclude='backups' --exclude='backup' --exclude='Backups' "
         f"--exclude='cache' --exclude='.cache' --exclude='MediaCover' "
         f"--exclude='Transcode' --exclude='logs' --exclude='log' --exclude='*.log' "
+        f"--exclude='processed_books' --exclude='thumbnails' --exclude='covers' "
         f"-czf '{dest_tar}' -C '{APPDATA_NVME_ROOT}' "
         f"maintainerr seerr tautulli bazarr dockhand calibre-web-automated shelfmark "
         f"sabnzbd/sabnzbd.ini sabnzbd/admin/history1.db glances/conf/glances.conf "
