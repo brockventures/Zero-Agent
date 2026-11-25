@@ -11,16 +11,16 @@ when new reviews (CHANGES_REQUESTED, APPROVED, COMMENTED) or review requests arr
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import fnmatch
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -125,9 +125,40 @@ def is_trusted_pr_actor(author_login: str | None) -> bool:
     clean = str(author_login or "").strip().lower()
     if not clean:
         return False
-    whitelisted_lower = {a.strip().lower() for a in WHITELISTED_AUTHORS if a and a.strip()}
-    trusted_bots_lower = {b.strip().lower() for b in TRUSTED_REVIEW_BOTS if b and b.strip()}
+    whitelisted_lower = {
+        a.strip().lower() for a in WHITELISTED_AUTHORS if a and a.strip()
+    }
+    trusted_bots_lower = {
+        b.strip().lower() for b in TRUSTED_REVIEW_BOTS if b and b.strip()
+    }
     return clean in whitelisted_lower or clean in trusted_bots_lower
+
+
+def _clean_github_text_base(text: str | None) -> str:
+    """Normalize line endings and strip zero-width, control, and prompt-spoof characters."""
+    cleaned = str(text or "")
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = _ZERO_WIDTH_AND_BIDI_RE.sub("", cleaned)
+    cleaned = _CONTROL_CHARS_RE.sub("", cleaned)
+    cleaned = _PROMPT_DELIMITER_SPOOF_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_github_text(
+    text: str | None,
+    max_len: int = 240,
+    collapse_ws: bool = False,
+) -> str:
+    """Sanitize untrusted GitHub text for compact human-facing notifications."""
+    cleaned = _clean_github_text_base(text)
+    if collapse_ws:
+        cleaned = " ".join(cleaned.split())
+    if max_len > 0 and len(cleaned) > max_len:
+        if max_len > 3:
+            cleaned = cleaned[: max_len - 3].rstrip() + "..."
+        else:
+            cleaned = cleaned[:max_len]
+    return cleaned
 
 
 def _wrap_untrusted_github_text(text: str | None, max_len: int = 800) -> str:
@@ -136,12 +167,7 @@ def _wrap_untrusted_github_text(text: str | None, max_len: int = 800) -> str:
     Strips zero-width/bidi/control characters and prompt-delimiter spoofing tags
     before truncating to max_len and wrapping in explicit untrusted tags.
     """
-    cleaned = str(text or "")
-    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = _ZERO_WIDTH_AND_BIDI_RE.sub("", cleaned)
-    cleaned = _CONTROL_CHARS_RE.sub("", cleaned)
-    cleaned = _PROMPT_DELIMITER_SPOOF_RE.sub("", cleaned)
-    cleaned = cleaned.strip()
+    cleaned = _clean_github_text_base(text)
     if max_len > 0 and len(cleaned) > max_len:
         cleaned = cleaned[:max_len].rstrip() + "... *(truncated)*"
     return f"<untrusted_github_content>{cleaned}</untrusted_github_content>"
@@ -194,7 +220,7 @@ def ensure_schedule_registered(
         tmp_file.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
         tmp_file.replace(schedule_file)
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed ensuring gh_pr_watcher in %s: %s", schedule_file, exc)
         return False
 
@@ -206,7 +232,9 @@ def is_ci_passing_or_empty(status_rollup: Any) -> bool:
 
     # Handle single dictionary summary
     if isinstance(status_rollup, dict):
-        state = str(status_rollup.get("state") or status_rollup.get("status") or "").upper()
+        state = str(
+            status_rollup.get("state") or status_rollup.get("status") or ""
+        ).upper()
         if state in ("FAILURE", "ERROR"):
             return False
         if state in ("PENDING", "IN_PROGRESS", "QUEUED"):
@@ -225,7 +253,13 @@ def is_ci_passing_or_empty(status_rollup: Any) -> bool:
             status = str(check.get("status") or "").upper()
 
             # Definite failure states
-            if conclusion in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STARTUP_FAILURE"):
+            if conclusion in (
+                "FAILURE",
+                "TIMED_OUT",
+                "ACTION_REQUIRED",
+                "CANCELLED",
+                "STARTUP_FAILURE",
+            ):
                 return False
             if state in ("FAILURE", "ERROR"):
                 return False
@@ -303,7 +337,7 @@ def try_auto_merge_pr(
             )
             return False
 
-    is_approved = (review_decision == "APPROVED")
+    is_approved = review_decision == "APPROVED"
     if not is_approved:
         # Check if there is a clean peer approval from a whitelisted collaborator / Zero
         # (including when Zero approves a whitelisted collaborator PR on brockventures/* repos)
@@ -359,9 +393,15 @@ def try_auto_merge_pr(
         auto_res.stderr.strip(),
     )
 
-    fallback_res = run_gh(["pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"])
+    fallback_res = run_gh(
+        ["pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"]
+    )
     if fallback_res.returncode == 0:
-        log.info("Successfully merged %s#%s with fallback --squash --delete-branch", repo, num)
+        log.info(
+            "Successfully merged %s#%s with fallback --squash --delete-branch",
+            repo,
+            num,
+        )
         return True
 
     log.error(
@@ -396,7 +436,7 @@ def get_authenticated_user() -> str:
         res = run_gh(["api", "/user", "--jq", ".login"])
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed querying gh api /user: %s", exc)
 
     return os.environ.get("GH_USER", "brockventures")
@@ -428,7 +468,7 @@ def load_state(state_file: Path) -> dict[str, Any]:
                 if k not in data:
                     data[k] = v
             return data
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning(
             "Failed loading state from %s: %s; using default state",
             state_file,
@@ -440,7 +480,7 @@ def load_state(state_file: Path) -> dict[str, Any]:
 def save_state(state: dict[str, Any], state_file: Path) -> None:
     """Persist watcher state to disk atomically."""
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state["last_run"] = datetime.now(timezone.utc).isoformat()
+    state["last_run"] = datetime.now(UTC).isoformat()
 
     for k in (
         "seen_review_ids",
@@ -451,7 +491,7 @@ def save_state(state: dict[str, Any], state_file: Path) -> None:
         "auto_merged_prs",
     ):
         if isinstance(state.get(k), (set, list)):
-            state[k] = sorted(list(set(state[k])))
+            state[k] = sorted(set(state[k]))
 
     tmp_file = state_file.with_suffix(f".tmp.{os.getpid()}")
     try:
@@ -480,8 +520,10 @@ def get_discord_bot_token(token: str | None = None) -> str | None:
                 tok = data.get("DISCORD_BOT_TOKEN")
                 if tok and str(tok).strip():
                     return str(tok).strip()
-        except Exception as exc:
-            log.warning("Failed loading DISCORD_BOT_TOKEN from %s: %s", secrets_file, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed loading DISCORD_BOT_TOKEN from %s: %s", secrets_file, exc
+            )
     return None
 
 
@@ -554,7 +596,7 @@ def cleanup_pr_notifications(
                             if res.status_code in (200, 204, 404):
                                 deleted_count += 1
                                 deleted_message_ids.add(mid_str)
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001
                             log.warning(
                                 "Failed deleting notification message %s in channel %s: %s",
                                 mid,
@@ -587,9 +629,19 @@ def cleanup_pr_notifications(
                             is_pr_card = any(
                                 marker in content
                                 for marker in (
+                                    "**PR Comment**",
+                                    "**PR Approved**",
+                                    "**Changes Requested**",
+                                    "**PR Review",
+                                    "**Review Dismissed**",
+                                    "**Review Requested**",
+                                    "**CI Failed**",
+                                    "**Merge Conflict**",
                                     "**GitHub PR Comment**",
                                     "**GitHub PR Review:",
                                     "**GitHub Review Requested**",
+                                    "**GitHub CI Check Failure**",
+                                    "**GitHub PR Merge Conflict**",
                                 )
                             )
                             if not is_pr_card:
@@ -613,7 +665,7 @@ def cleanup_pr_notifications(
                             else:
                                 deleted_count += 1
                                 deleted_message_ids.add(mid_str)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "Failed sweeping channel %s for PR notification cards: %s",
                     cid,
@@ -623,7 +675,7 @@ def cleanup_pr_notifications(
     if not dry_run:
         try:
             save_state(state, state_file)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             log.warning("Failed saving state after cleanup: %s", exc)
 
     return deleted_count
@@ -667,7 +719,9 @@ def discover_open_prs(
         effective_allowlist = list(default_allowlist)
     else:
         scan_patterns = [p.strip() for p in target_patterns if p and p.strip()]
-        effective_allowlist = scan_patterns if scan_patterns else list(default_allowlist)
+        effective_allowlist = (
+            scan_patterns if scan_patterns else list(default_allowlist)
+        )
 
     if current_user is None:
         current_user = get_authenticated_user()
@@ -686,7 +740,9 @@ def discover_open_prs(
         repo_clean = str(repo or "").strip()
         if not repo_clean or not number:
             return
-        if enforce_pattern and not matches_target_patterns(repo_clean, effective_allowlist):
+        if enforce_pattern and not matches_target_patterns(
+            repo_clean, effective_allowlist
+        ):
             log.debug(
                 "Skipping PR %s#%s: repository not in allowlist",
                 repo_clean,
@@ -711,14 +767,16 @@ def discover_open_prs(
 
     # 1. Search PRs authored by @me (strictly filtered against allowlist)
     try:
-        res = run_gh([
-            "search",
-            "prs",
-            "--state=open",
-            "--author=@me",
-            "--json",
-            "repository,number,title,url,author",
-        ])
+        res = run_gh(
+            [
+                "search",
+                "prs",
+                "--state=open",
+                "--author=@me",
+                "--json",
+                "repository,number,title,url,author",
+            ]
+        )
         if res.returncode == 0:
             for item in json.loads(res.stdout or "[]"):
                 repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
@@ -730,19 +788,21 @@ def discover_open_prs(
                     author=(item.get("author") or {}).get("login", current_user),
                     enforce_pattern=True,
                 )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed querying prs authored by @me: %s", exc)
 
     # 2. Search PRs where review is requested from @me (strictly filtered against allowlist)
     try:
-        res = run_gh([
-            "search",
-            "prs",
-            "--state=open",
-            "--review-requested=@me",
-            "--json",
-            "repository,number,title,url,author",
-        ])
+        res = run_gh(
+            [
+                "search",
+                "prs",
+                "--state=open",
+                "--review-requested=@me",
+                "--json",
+                "repository,number,title,url,author",
+            ]
+        )
         if res.returncode == 0:
             for item in json.loads(res.stdout or "[]"):
                 repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
@@ -754,19 +814,21 @@ def discover_open_prs(
                     author=(item.get("author") or {}).get("login", ""),
                     enforce_pattern=True,
                 )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed querying prs review-requested: %s", exc)
 
     # 3. Search PRs that involve @me (strictly filtered against allowlist)
     try:
-        res = run_gh([
-            "search",
-            "prs",
-            "--state=open",
-            "--involves=@me",
-            "--json",
-            "repository,number,title,url,author",
-        ])
+        res = run_gh(
+            [
+                "search",
+                "prs",
+                "--state=open",
+                "--involves=@me",
+                "--json",
+                "repository,number,title,url,author",
+            ]
+        )
         if res.returncode == 0:
             for item in json.loads(res.stdout or "[]"):
                 repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
@@ -778,7 +840,7 @@ def discover_open_prs(
                     author=(item.get("author") or {}).get("login", ""),
                     enforce_pattern=True,
                 )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed querying prs involves=@me: %s", exc)
 
     # 4. Target repo patterns
@@ -789,17 +851,21 @@ def discover_open_prs(
         if pat.endswith("/*"):
             owner = pat[:-2]
             try:
-                res = run_gh([
-                    "search",
-                    "prs",
-                    "--state=open",
-                    f"--owner={owner}",
-                    "--json",
-                    "repository,number,title,url,author",
-                ])
+                res = run_gh(
+                    [
+                        "search",
+                        "prs",
+                        "--state=open",
+                        f"--owner={owner}",
+                        "--json",
+                        "repository,number,title,url,author",
+                    ]
+                )
                 if res.returncode == 0:
                     for item in json.loads(res.stdout or "[]"):
-                        repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
+                        repo_name = (item.get("repository") or {}).get(
+                            "nameWithOwner", ""
+                        )
                         _add_pr(
                             repo=repo_name,
                             number=item.get("number"),
@@ -808,20 +874,22 @@ def discover_open_prs(
                             author=(item.get("author") or {}).get("login", ""),
                             enforce_pattern=True,
                         )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.warning("Failed querying prs for owner %s: %s", owner, exc)
         else:
             try:
-                res = run_gh([
-                    "pr",
-                    "list",
-                    "--repo",
-                    pat,
-                    "--state",
-                    "open",
-                    "--json",
-                    "number,title,url,author,reviewDecision",
-                ])
+                res = run_gh(
+                    [
+                        "pr",
+                        "list",
+                        "--repo",
+                        pat,
+                        "--state",
+                        "open",
+                        "--json",
+                        "number,title,url,author,reviewDecision",
+                    ]
+                )
                 if res.returncode == 0:
                     for item in json.loads(res.stdout or "[]"):
                         _add_pr(
@@ -833,7 +901,7 @@ def discover_open_prs(
                             review_decision=item.get("reviewDecision"),
                             enforce_pattern=True,
                         )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.warning("Failed querying pr list for repo %s: %s", pat, exc)
 
     # 5. Ingest unread/recent PullRequest notifications
@@ -861,7 +929,9 @@ def discover_open_prs(
                                     "team_mention",
                                     "state_change",
                                 )
-                                if not (valid_reason or r_name.startswith("brockventures/")):
+                                if not (
+                                    valid_reason or r_name.startswith("brockventures/")
+                                ):
                                     continue
                             _add_pr(
                                 repo=r_name,
@@ -871,7 +941,7 @@ def discover_open_prs(
                                 author="",
                                 enforce_pattern=True,
                             )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed querying notifications: %s", exc)
 
     return list(discovered.values())
@@ -880,15 +950,17 @@ def discover_open_prs(
 def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
     """Fetch complete PR reviews, comments, and reviewDecision via gh pr view."""
     try:
-        res = run_gh([
-            "pr",
-            "view",
-            str(number),
-            "--repo",
-            repo,
-            "--json",
-            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,mergedAt,mergeable,mergeStateStatus",
-        ])
+        res = run_gh(
+            [
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,mergedAt,mergeable,mergeStateStatus",
+            ]
+        )
         if res.returncode != 0:
             log.warning(
                 "gh pr view failed for %s#%s: %s",
@@ -900,9 +972,12 @@ def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
 
         data = json.loads(res.stdout or "{}")
         data["repo"] = repo
-        data["merged"] = bool(data.get("mergedAt")) or str(data.get("state") or "").upper() == "MERGED"
+        data["merged"] = (
+            bool(data.get("mergedAt"))
+            or str(data.get("state") or "").upper() == "MERGED"
+        )
         return data
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed fetching PR details for %s#%s: %s", repo, number, exc)
         return None
 
@@ -924,18 +999,13 @@ def format_review_message(
     url: str,
     review: dict[str, Any],
     current_decision: str,
+    for_agent: bool = False,
 ) -> str:
     """Build structured Discord notification card for a PR review."""
     rev_state = review.get("state", "COMMENTED")
     reviewer = (review.get("author") or {}).get("login", "unknown")
     submitted_at = review.get("submittedAt", "")
     raw_body = (review.get("body") or "").strip()
-    body_text = (
-        _wrap_untrusted_github_text(raw_body, max_len=800)
-        if raw_body
-        else "*(No review body provided)*"
-    )
-    safe_title = _wrap_untrusted_github_text(" ".join(str(title or "").split()), max_len=200)
 
     emoji_map = {
         "CHANGES_REQUESTED": "⚠️",
@@ -945,18 +1015,41 @@ def format_review_message(
     }
     emoji = emoji_map.get(rev_state, "🔔")
 
-    lines = [
-        f"{emoji} **GitHub PR Review: {rev_state}**",
-        UNTRUSTED_GITHUB_PREAMBLE,
-        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
-        f"**Reviewer:** @{reviewer} | **Overall Decision:** `{current_decision or 'NONE'}`",
-    ]
-    if submitted_at:
-        lines.append(f"**Submitted At:** `{submitted_at}`")
-    lines.append("")
-    lines.append("**Key Findings & Review Body:**")
-    lines.append(f">>> {body_text}")
-    return "\n".join(lines)
+    if for_agent:
+        body_text = (
+            _wrap_untrusted_github_text(raw_body, max_len=800)
+            if raw_body
+            else "*(No review body provided)*"
+        )
+        safe_title = _wrap_untrusted_github_text(
+            " ".join(str(title or "").split()), max_len=200
+        )
+        lines = [
+            f"{emoji} **GitHub PR Review: {rev_state}**",
+            UNTRUSTED_GITHUB_PREAMBLE,
+            f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
+            f"**Reviewer:** @{reviewer} | **Overall Decision:** `{current_decision or 'NONE'}`",
+        ]
+        if submitted_at:
+            lines.append(f"**Submitted At:** `{submitted_at}`")
+        lines.append("")
+        lines.append("**Key Findings & Review Body:**")
+        lines.append(f">>> {body_text}")
+        return "\n".join(lines)
+
+    label_map = {
+        "CHANGES_REQUESTED": "Changes Requested",
+        "APPROVED": "PR Approved",
+        "COMMENTED": "PR Review",
+        "DISMISSED": "Review Dismissed",
+    }
+    label = label_map.get(rev_state, f"PR Review: {rev_state}")
+    clean_title = _sanitize_github_text(title, max_len=90, collapse_ws=True)
+    clean_body = _sanitize_github_text(raw_body, max_len=240, collapse_ws=True)
+    line = f"{emoji} **{label}** · `{repo}` [#{pr_number} {clean_title}](<{url}>) · **@{reviewer}**"
+    if clean_body:
+        return f"{line}\n> {clean_body}"
+    return line
 
 
 def format_review_request_message(
@@ -966,16 +1059,28 @@ def format_review_request_message(
     url: str,
     reviewer: str,
     author: str,
+    for_agent: bool = False,
 ) -> str:
     """Build structured Discord notification card for a new review request."""
-    safe_title = _wrap_untrusted_github_text(" ".join(str(title or "").split()), max_len=200)
-    return "\n".join([
-        "👀 **GitHub Review Requested**",
-        UNTRUSTED_GITHUB_PREAMBLE,
-        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
-        f"**Requested Reviewer:** @{reviewer}",
-        f"**PR Author:** @{author}",
-    ])
+    if for_agent:
+        safe_title = _wrap_untrusted_github_text(
+            " ".join(str(title or "").split()), max_len=200
+        )
+        return "\n".join(
+            [
+                "👀 **GitHub Review Requested**",
+                UNTRUSTED_GITHUB_PREAMBLE,
+                f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
+                f"**Requested Reviewer:** @{reviewer}",
+                f"**PR Author:** @{author}",
+            ]
+        )
+
+    clean_title = _sanitize_github_text(title, max_len=90, collapse_ws=True)
+    return (
+        f"👀 **Review Requested** · `{repo}` [#{pr_number} {clean_title}](<{url}>) "
+        f"· **@{reviewer}** (by **@{author}**)"
+    )
 
 
 def format_comment_message(
@@ -984,24 +1089,38 @@ def format_comment_message(
     title: str,
     url: str,
     comment: dict[str, Any],
+    for_agent: bool = False,
 ) -> str:
     """Build structured Discord notification card for a top-level PR comment."""
     author = (comment.get("author") or {}).get("login", "unknown")
     raw_body = (comment.get("body") or "").strip()
-    body_text = (
-        _wrap_untrusted_github_text(raw_body, max_len=800)
-        if raw_body
-        else "*(No review body provided)*"
-    )
-    safe_title = _wrap_untrusted_github_text(" ".join(str(title or "").split()), max_len=200)
-    return "\n".join([
-        "💬 **GitHub PR Comment**",
-        UNTRUSTED_GITHUB_PREAMBLE,
-        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
-        f"**Commenter:** @{author}",
-        "",
-        f">>> {body_text}",
-    ])
+
+    if for_agent:
+        body_text = (
+            _wrap_untrusted_github_text(raw_body, max_len=800)
+            if raw_body
+            else "*(No review body provided)*"
+        )
+        safe_title = _wrap_untrusted_github_text(
+            " ".join(str(title or "").split()), max_len=200
+        )
+        return "\n".join(
+            [
+                "💬 **GitHub PR Comment**",
+                UNTRUSTED_GITHUB_PREAMBLE,
+                f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
+                f"**Commenter:** @{author}",
+                "",
+                f">>> {body_text}",
+            ]
+        )
+
+    clean_title = _sanitize_github_text(title, max_len=90, collapse_ws=True)
+    clean_body = _sanitize_github_text(raw_body, max_len=240, collapse_ws=True)
+    line = f"💬 **PR Comment** · `{repo}` [#{pr_number} {clean_title}](<{url}>) · **@{author}**"
+    if clean_body:
+        return f"{line}\n> {clean_body}"
+    return line
 
 
 def format_ci_failure_message(
@@ -1011,20 +1130,38 @@ def format_ci_failure_message(
     url: str,
     check_name: str,
     details_url: str = "",
+    for_agent: bool = False,
 ) -> str:
     """Build structured Discord notification card for a CI check failure."""
-    safe_title = _wrap_untrusted_github_text(" ".join(str(title or "").split()), max_len=200)
-    lines = [
-        "❌ **GitHub CI Check Failure**",
-        UNTRUSTED_GITHUB_PREAMBLE,
-        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
-        f"**Failed Check:** `{check_name}`",
-    ]
+    clean_check_name = (
+        _sanitize_github_text(check_name, max_len=120, collapse_ws=True)
+        .replace("`", "")
+        .strip()
+        or "unnamed_check"
+    )
+    if for_agent:
+        safe_title = _wrap_untrusted_github_text(
+            " ".join(str(title or "").split()), max_len=200
+        )
+        lines = [
+            "❌ **GitHub CI Check Failure**",
+            UNTRUSTED_GITHUB_PREAMBLE,
+            f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
+            f"**Failed Check:** `{clean_check_name}`",
+        ]
+        if details_url:
+            lines.append(f"**Details:** [View Log / Run]({details_url})")
+        lines.append("")
+        lines.append(
+            "> ⚠️ CI workflow failed on head commit. Action required before merge."
+        )
+        return "\n".join(lines)
+
+    clean_title = _sanitize_github_text(title, max_len=90, collapse_ws=True)
+    line = f"❌ **CI Failed** · `{repo}` [#{pr_number} {clean_title}](<{url}>) · `{clean_check_name}`"
     if details_url:
-        lines.append(f"**Details:** [View Log / Run]({details_url})")
-    lines.append("")
-    lines.append("> ⚠️ CI workflow failed on head commit. Action required before merge.")
-    return "\n".join(lines)
+        line += f" ([Logs](<{details_url}>))"
+    return line
 
 
 def format_merge_conflict_message(
@@ -1032,16 +1169,25 @@ def format_merge_conflict_message(
     pr_number: int,
     title: str,
     url: str,
+    for_agent: bool = False,
 ) -> str:
     """Build structured Discord notification card for a PR merge conflict."""
-    safe_title = _wrap_untrusted_github_text(" ".join(str(title or "").split()), max_len=200)
-    return "\n".join([
-        "⚠️ **GitHub PR Merge Conflict**",
-        UNTRUSTED_GITHUB_PREAMBLE,
-        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
-        "",
-        "> 💥 This branch has merge conflicts that must be resolved before merging.",
-    ])
+    if for_agent:
+        safe_title = _wrap_untrusted_github_text(
+            " ".join(str(title or "").split()), max_len=200
+        )
+        return "\n".join(
+            [
+                "⚠️ **GitHub PR Merge Conflict**",
+                UNTRUSTED_GITHUB_PREAMBLE,
+                f"**Repo:** `{repo}` | **PR:** [#{pr_number} {safe_title}]({url})",
+                "",
+                "> 💥 This branch has merge conflicts that must be resolved before merging.",
+            ]
+        )
+
+    clean_title = _sanitize_github_text(title, max_len=90, collapse_ws=True)
+    return f"⚠️ **Merge Conflict** · `{repo}` [#{pr_number} {clean_title}](<{url}>)"
 
 
 def extract_failed_checks(status_rollup: Any) -> list[dict[str, Any]]:
@@ -1059,7 +1205,9 @@ def extract_failed_checks(status_rollup: Any) -> list[dict[str, Any]]:
         if isinstance(contexts, list) and contexts:
             checks = contexts
         else:
-            state = str(status_rollup.get("state") or status_rollup.get("status") or "").upper()
+            state = str(
+                status_rollup.get("state") or status_rollup.get("status") or ""
+            ).upper()
             conclusion = str(status_rollup.get("conclusion") or "").upper()
             if state in ("FAILURE", "ERROR") or conclusion in (
                 "FAILURE",
@@ -1074,14 +1222,16 @@ def extract_failed_checks(status_rollup: Any) -> list[dict[str, Any]]:
                     or status_rollup.get("workflowName")
                     or "status_check"
                 )
-                failed.append({
-                    "name": name,
-                    "url": status_rollup.get("targetUrl")
-                    or status_rollup.get("detailsUrl")
-                    or status_rollup.get("url")
-                    or "",
-                    "conclusion": conclusion or state,
-                })
+                failed.append(
+                    {
+                        "name": name,
+                        "url": status_rollup.get("targetUrl")
+                        or status_rollup.get("detailsUrl")
+                        or status_rollup.get("url")
+                        or "",
+                        "conclusion": conclusion or state,
+                    }
+                )
 
     for check in checks:
         if not isinstance(check, dict):
@@ -1101,14 +1251,16 @@ def extract_failed_checks(status_rollup: Any) -> list[dict[str, Any]]:
                 or check.get("workflowName")
                 or "unnamed_check"
             )
-            failed.append({
-                "name": name,
-                "url": check.get("targetUrl")
-                or check.get("detailsUrl")
-                or check.get("url")
-                or "",
-                "conclusion": conclusion or state,
-            })
+            failed.append(
+                {
+                    "name": name,
+                    "url": check.get("targetUrl")
+                    or check.get("detailsUrl")
+                    or check.get("url")
+                    or "",
+                    "conclusion": conclusion or state,
+                }
+            )
 
     return failed
 
@@ -1127,11 +1279,13 @@ def dispatch_notification(
     if dry_run:
         for ch in channels:
             log.info("[DRY-RUN] Outbox dispatch to %s:\n%s", ch, content)
-            results.append({
-                "channel": ch,
-                "content": content,
-                "status": "dry_run",
-            })
+            results.append(
+                {
+                    "channel": ch,
+                    "content": content,
+                    "status": "dry_run",
+                }
+            )
         return results
 
     for ch in channels:
@@ -1144,7 +1298,7 @@ def dispatch_notification(
                 is_agent_turn=is_agent_turn,
             )
             results.append(res)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             log.warning("Failed queuing outbox message to %s: %s", ch, exc)
 
     return results
@@ -1205,9 +1359,8 @@ def check_pr(
         if author_login and author_login.lower() in zero_users:
             if latest_zero_ts is None or ts > latest_zero_ts:
                 latest_zero_ts = ts
-        elif author_login:
-            if latest_external_ts is None or ts > latest_external_ts:
-                latest_external_ts = ts
+        elif author_login and (latest_external_ts is None or ts > latest_external_ts):
+            latest_external_ts = ts
 
     for com in pr_details.get("comments", []):
         author_login = (com.get("author") or {}).get("login", "")
@@ -1217,9 +1370,8 @@ def check_pr(
         if author_login and author_login.lower() in zero_users:
             if latest_zero_ts is None or ts > latest_zero_ts:
                 latest_zero_ts = ts
-        elif author_login:
-            if latest_external_ts is None or ts > latest_external_ts:
-                latest_external_ts = ts
+        elif author_login and (latest_external_ts is None or ts > latest_external_ts):
+            latest_external_ts = ts
 
     zero_responded = bool(
         latest_external_ts and latest_zero_ts and latest_zero_ts >= latest_external_ts
@@ -1234,24 +1386,34 @@ def check_pr(
             if notif_head and notif_head != current_head:
                 head_changed = True
                 break
-    if current_head and pr_key in pr_head_ref_oids:
-        if pr_head_ref_oids[pr_key] and pr_head_ref_oids[pr_key] != current_head:
-            head_changed = True
+    if (
+        current_head
+        and pr_key in pr_head_ref_oids
+        and pr_head_ref_oids[pr_key]
+        and pr_head_ref_oids[pr_key] != current_head
+    ):
+        head_changed = True
 
     pr_state = str(pr_details.get("state") or "").upper()
-    merged = bool(pr_details.get("mergedAt")) or pr_details.get("state") == "MERGED" or pr_state == "MERGED" or pr_details.get("merged") is True
-    is_closed_or_merged = merged or pr_state in ("MERGED", "CLOSED") or pr_details.get("closed") is True
+    merged = (
+        bool(pr_details.get("mergedAt"))
+        or pr_details.get("state") == "MERGED"
+        or pr_state == "MERGED"
+        or pr_details.get("merged") is True
+    )
+    is_closed_or_merged = (
+        merged or pr_state in ("MERGED", "CLOSED") or pr_details.get("closed") is True
+    )
 
-    if zero_responded or head_changed or is_closed_or_merged:
-        if not seed_only:
-            cleaned = cleanup_pr_notifications(
-                repo=repo,
-                pr_number=pr_number,
-                state_file=state_file,
-                state=state,
-                dry_run=dry_run,
-            )
-            stats["notifications_cleaned"] = cleaned
+    if (zero_responded or head_changed or is_closed_or_merged) and not seed_only:
+        cleaned = cleanup_pr_notifications(
+            repo=repo,
+            pr_number=pr_number,
+            state_file=state_file,
+            state=state,
+            dry_run=dry_run,
+        )
+        stats["notifications_cleaned"] = cleaned
 
     if current_head:
         pr_head_ref_oids[pr_key] = current_head
@@ -1288,6 +1450,10 @@ def check_pr(
             if seed_only:
                 seen_reviews.add(rev_id)
             else:
+                should_wake_agent = (
+                    rev_state == "CHANGES_REQUESTED"
+                    and is_trusted_pr_actor(author_login)
+                )
                 msg = format_review_message(
                     repo=repo,
                     pr_number=pr_number,
@@ -1295,10 +1461,7 @@ def check_pr(
                     url=url,
                     review=rev,
                     current_decision=review_decision,
-                )
-                should_wake_agent = (
-                    rev_state == "CHANGES_REQUESTED"
-                    and is_trusted_pr_actor(author_login)
+                    for_agent=should_wake_agent,
                 )
                 if rev_state == "CHANGES_REQUESTED" and not should_wake_agent:
                     log.warning(
@@ -1319,13 +1482,18 @@ def check_pr(
                     if not dry_run:
                         notif_list = active_notifications.setdefault(pr_key, [])
                         for d_res in dispatch_res:
-                            notif_list.append({
-                                "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                                "message_id": d_res.get("message_id") or 0,
-                                "event_id": rev_id,
-                                "created_at": submitted_at or datetime.now(timezone.utc).isoformat(),
-                                "head_ref_oid": current_head,
-                            })
+                            notif_list.append(
+                                {
+                                    "channel_id": d_res.get("channel_id")
+                                    or d_res.get("channel")
+                                    or 0,
+                                    "message_id": d_res.get("message_id") or 0,
+                                    "event_id": rev_id,
+                                    "created_at": submitted_at
+                                    or datetime.now(UTC).isoformat(),
+                                    "head_ref_oid": current_head,
+                                }
+                            )
         else:
             seen_reviews.add(rev_id)
 
@@ -1349,21 +1517,28 @@ def check_pr(
                 url=url,
                 reviewer=req_login,
                 author=pr_author,
+                for_agent=False,
             )
-            dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+            dispatch_res = dispatch_notification(
+                msg, channels=channels, dry_run=dry_run
+            )
             if dry_run or dispatch_res:
                 seen_reqs.add(req_key)
                 stats["review_requests_notified"] += 1
                 if not dry_run:
                     notif_list = active_notifications.setdefault(pr_key, [])
                     for d_res in dispatch_res:
-                        notif_list.append({
-                            "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                            "message_id": d_res.get("message_id") or 0,
-                            "event_id": req_key,
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                            "head_ref_oid": current_head,
-                        })
+                        notif_list.append(
+                            {
+                                "channel_id": d_res.get("channel_id")
+                                or d_res.get("channel")
+                                or 0,
+                                "message_id": d_res.get("message_id") or 0,
+                                "event_id": req_key,
+                                "created_at": datetime.now(UTC).isoformat(),
+                                "head_ref_oid": current_head,
+                            }
+                        )
 
     # 3. Check comments
     for com in pr_details.get("comments", []):
@@ -1383,19 +1558,20 @@ def check_pr(
         if seed_only:
             seen_comments.add(com_id)
         else:
-            msg = format_comment_message(
-                repo=repo,
-                pr_number=pr_number,
-                title=title,
-                url=url,
-                comment=com,
-            )
             com_body_lower = str(com.get("body") or "").lower()
             is_roborev_fail = (
                 "agent assessment: fail" in com_body_lower
                 or "**agent assessment:** fail" in com_body_lower
             )
             should_wake_agent = is_roborev_fail and is_trusted_pr_actor(author_login)
+            msg = format_comment_message(
+                repo=repo,
+                pr_number=pr_number,
+                title=title,
+                url=url,
+                comment=com,
+                for_agent=should_wake_agent,
+            )
             if is_roborev_fail and not should_wake_agent:
                 log.warning(
                     "Suppressing agent turn for fail-assessment comment on %s#%s from untrusted actor '%s'",
@@ -1415,13 +1591,18 @@ def check_pr(
                 if not dry_run:
                     notif_list = active_notifications.setdefault(pr_key, [])
                     for d_res in dispatch_res:
-                        notif_list.append({
-                            "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                            "message_id": d_res.get("message_id") or 0,
-                            "event_id": com_id,
-                            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
-                            "head_ref_oid": current_head,
-                        })
+                        notif_list.append(
+                            {
+                                "channel_id": d_res.get("channel_id")
+                                or d_res.get("channel")
+                                or 0,
+                                "message_id": d_res.get("message_id") or 0,
+                                "event_id": com_id,
+                                "created_at": created_at
+                                or datetime.now(UTC).isoformat(),
+                                "head_ref_oid": current_head,
+                            }
+                        )
 
     # 4. Check reviewDecision transition
     old_decision = review_decisions.get(pr_key)
@@ -1437,7 +1618,8 @@ def check_pr(
         pr_author = str(author_obj or "").strip().lower()
 
     is_authored = bool(
-        pr_author and (pr_author in zero_users or pr_author == (current_user or "").lower())
+        pr_author
+        and (pr_author in zero_users or pr_author == (current_user or "").lower())
     )
     is_contributed = False
 
@@ -1452,8 +1634,14 @@ def check_pr(
             for rev in pr_details.get("reviews", []):
                 rev_a = rev.get("author")
                 rev_login = (
-                    rev_a.get("login") if isinstance(rev_a, dict) else str(rev_a or "")
-                ).strip().lower()
+                    (
+                        rev_a.get("login")
+                        if isinstance(rev_a, dict)
+                        else str(rev_a or "")
+                    )
+                    .strip()
+                    .lower()
+                )
                 if rev_login and (
                     rev_login in zero_users or rev_login == (current_user or "").lower()
                 ):
@@ -1463,20 +1651,31 @@ def check_pr(
                 for com in pr_details.get("comments", []):
                     com_a = com.get("author")
                     com_login = (
-                        com_a.get("login") if isinstance(com_a, dict) else str(com_a or "")
-                    ).strip().lower()
+                        (
+                            com_a.get("login")
+                            if isinstance(com_a, dict)
+                            else str(com_a or "")
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if com_login and (
-                        com_login in zero_users or com_login == (current_user or "").lower()
+                        com_login in zero_users
+                        or com_login == (current_user or "").lower()
                     ):
                         is_contributed = True
                         break
             if not is_contributed:
                 for assignee in pr_details.get("assignees", []):
                     a_login = (
-                        assignee.get("login")
-                        if isinstance(assignee, dict)
-                        else str(assignee or "")
-                    ).strip().lower()
+                        (
+                            assignee.get("login")
+                            if isinstance(assignee, dict)
+                            else str(assignee or "")
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if a_login and (
                         a_login in zero_users or a_login == (current_user or "").lower()
                     ):
@@ -1500,6 +1699,7 @@ def check_pr(
                         url=url,
                         check_name=check_name,
                         details_url=chk.get("url") or "",
+                        for_agent=True,
                     )
                     dispatch_res = dispatch_notification(
                         msg,
@@ -1513,13 +1713,17 @@ def check_pr(
                         if not dry_run:
                             notif_list = active_notifications.setdefault(pr_key, [])
                             for d_res in dispatch_res:
-                                notif_list.append({
-                                    "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                                    "message_id": d_res.get("message_id") or 0,
-                                    "event_id": fail_key,
-                                    "created_at": datetime.now(timezone.utc).isoformat(),
-                                    "head_ref_oid": current_head,
-                                })
+                                notif_list.append(
+                                    {
+                                        "channel_id": d_res.get("channel_id")
+                                        or d_res.get("channel")
+                                        or 0,
+                                        "message_id": d_res.get("message_id") or 0,
+                                        "event_id": fail_key,
+                                        "created_at": datetime.now(UTC).isoformat(),
+                                        "head_ref_oid": current_head,
+                                    }
+                                )
 
         # B) Check merge conflicts
         mergeable = str(pr_details.get("mergeable") or "").upper()
@@ -1535,6 +1739,7 @@ def check_pr(
                         pr_number=pr_number,
                         title=title,
                         url=url,
+                        for_agent=True,
                     )
                     dispatch_res = dispatch_notification(
                         msg,
@@ -1548,13 +1753,17 @@ def check_pr(
                         if not dry_run:
                             notif_list = active_notifications.setdefault(pr_key, [])
                             for d_res in dispatch_res:
-                                notif_list.append({
-                                    "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                                    "message_id": d_res.get("message_id") or 0,
-                                    "event_id": conflict_key,
-                                    "created_at": datetime.now(timezone.utc).isoformat(),
-                                    "head_ref_oid": current_head,
-                                })
+                                notif_list.append(
+                                    {
+                                        "channel_id": d_res.get("channel_id")
+                                        or d_res.get("channel")
+                                        or 0,
+                                        "message_id": d_res.get("message_id") or 0,
+                                        "event_id": conflict_key,
+                                        "created_at": datetime.now(UTC).isoformat(),
+                                        "head_ref_oid": current_head,
+                                    }
+                                )
 
     # 6. Check and attempt auto-merge for whitelisted authors
     if not seed_only:
@@ -1734,17 +1943,21 @@ def parse_github_email_doorbell(
     ).lower()
 
     if "dkim=pass" not in auth_results:
-        log.warning("Email doorbell rejected: dkim=pass not found in Authentication-Results")
+        log.warning(
+            "Email doorbell rejected: dkim=pass not found in Authentication-Results"
+        )
         return None
 
     # If domain attribution is present in Authentication-Results, ensure it references github.com
-    if any(marker in auth_results for marker in ("header.i", "header.d", "domain=")):
-        if "github.com" not in auth_results:
-            log.warning(
-                "Email doorbell rejected: DKIM pass is not for github.com (%s)",
-                auth_results,
-            )
-            return None
+    if (
+        any(marker in auth_results for marker in ("header.i", "header.d", "domain="))
+        and "github.com" not in auth_results
+    ):
+        log.warning(
+            "Email doorbell rejected: DKIM pass is not for github.com (%s)",
+            auth_results,
+        )
+        return None
 
     # 2. Verify From header
     from_header = _get_val("From").lower()
@@ -1804,9 +2017,11 @@ def parse_github_email_doorbell(
             matched_repo = allowed_repo
             break
 
-    if not matched_repo:
-        if repo_cand.lower().startswith("brockventures/") or repo_cand.lower() == "azylman/mirrormere":
-            matched_repo = repo_cand
+    if not matched_repo and (
+        repo_cand.lower().startswith("brockventures/")
+        or repo_cand.lower() == "azylman/mirrormere"
+    ):
+        matched_repo = repo_cand
 
     if not matched_repo:
         log.warning(
@@ -1908,9 +2123,11 @@ def parse_discord_github_webhook_embed(
             matched_repo = allowed_repo
             break
 
-    if not matched_repo:
-        if repo_cand.lower().startswith("brockventures/") or repo_cand.lower() == "azylman/mirrormere":
-            matched_repo = repo_cand
+    if not matched_repo and (
+        repo_cand.lower().startswith("brockventures/")
+        or repo_cand.lower() == "azylman/mirrormere"
+    ):
+        matched_repo = repo_cand
 
     if not matched_repo:
         log.info(
@@ -2004,7 +2221,7 @@ def ensure_repo_discord_webhook(
         hooks = json.loads(res.stdout or "[]")
         if not isinstance(hooks, list):
             hooks = []
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed parsing hooks response for %s: %s", repo, exc)
         return False
 
@@ -2014,7 +2231,10 @@ def ensure_repo_discord_webhook(
             continue
         config = hook.get("config") or {}
         existing_url = str(config.get("url") or "").rstrip("/")
-        if existing_url in (clean_url.rstrip("/"), discord_webhook_url.strip().rstrip("/")):
+        if existing_url in (
+            clean_url.rstrip("/"),
+            discord_webhook_url.strip().rstrip("/"),
+        ):
             log.info("Webhook already exists for %s: %s", repo, existing_url)
             return True
 
@@ -2043,7 +2263,9 @@ def ensure_repo_discord_webhook(
         log.info("Registered Discord GitHub webhook for %s", repo)
         return True
 
-    log.warning("Failed registering webhook for %s: %s", repo, create_res.stderr.strip())
+    log.warning(
+        "Failed registering webhook for %s: %s", repo, create_res.stderr.strip()
+    )
     return False
 
 
@@ -2166,7 +2388,9 @@ def main() -> int:
         return 0
 
     if args.register_webhooks:
-        res_hooks = ensure_repo_discord_webhooks(discord_webhook_url=args.webhook_url or None)
+        res_hooks = ensure_repo_discord_webhooks(
+            discord_webhook_url=args.webhook_url or None
+        )
         print(f"Webhook registration completed: {res_hooks}")
         return 0 if all(res_hooks.values()) else 1
 
@@ -2226,7 +2450,7 @@ def main() -> int:
                     seed_only=args.seed,
                 )
                 log.info("Poll cycle completed: %s", stats)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.error("Error during poll cycle: %s", exc)
             time.sleep(args.interval)
     except KeyboardInterrupt:
