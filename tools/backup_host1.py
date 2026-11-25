@@ -6,14 +6,12 @@ Backs up:
   - postgres-arr (PostgreSQL pg_dumpall: Sonarr, Radarr, Prowlarr)
   - homeassistant (HA config, .storage, automations, credentials + SQLite DB)
   - docker-appdata (docker-compose.yml + critical lightweight configs)
+  - wordpress (Volume 2 NVMe MariaDB wp01/wp02 dumps + site files & stack configs)
 Enforces a 14-day rolling retention policy.
 """
 
-import os
 import sys
-import subprocess
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
@@ -24,9 +22,11 @@ for _p in ["/workspace", "/workspace/tools"]:
         sys.path.insert(0, _p)
 
 try:
-    from tools.nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+    from tools.nas_config import DOCKER_ROOT, resolve_nas_config
+    from tools.nas_config import run_ssh as _nas_run_ssh
 except ImportError:
-    from nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+    from nas_config import DOCKER_ROOT, resolve_nas_config
+    from nas_config import run_ssh as _nas_run_ssh
 
 HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
@@ -41,12 +41,12 @@ def prune_old_backups(dir_path: str, days: int = RETENTION_DAYS) -> int:
 def backup_postgres_arr(ts: str) -> tuple[bool, str]:
     dest = f"/volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz"
     cmd = f"sudo docker exec postgres-arr pg_dumpall -U postgres | gzip > '{dest}'"
-    code, stdout, stderr = run_ssh(cmd, timeout=180)
+    code, _, stderr = run_ssh(cmd, timeout=180)
     if code != 0:
         run_ssh(f"rm -f '{dest}'")
         return False, f"pg_dumpall failed (code {code}): {stderr.strip()}"
     
-    code, size_out, _ = run_ssh(f"ls -lh '{dest}' | awk '{{print $5}}'")
+    _, size_out, _ = run_ssh(f"ls -lh '{dest}' | awk '{{print $5}}'")
     return True, f"postgres-arr -> {dest} ({size_out.strip()})"
 
 def backup_home_assistant(ts: str) -> tuple[bool, str]:
@@ -71,7 +71,7 @@ def backup_home_assistant(ts: str) -> tuple[bool, str]:
         run_ssh(f"rm -f '{dest_db}'")
         return False, f"ha sqlite db backup failed (code {code_db}): {stderr_db.strip()}"
 
-    code, size_out, _ = run_ssh(f"ls -lh '{dest_config}' '{dest_db}' | awk '{{print $9, $5}}'")
+    _, _, _ = run_ssh(f"ls -lh '{dest_config}' '{dest_db}' | awk '{{print $9, $5}}'")
     return True, f"homeassistant -> {dest_config} & {dest_db}"
 
 def backup_docker_appdata(ts: str) -> tuple[bool, str]:
@@ -111,18 +111,75 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
         run_ssh(f"rm -f '{dest_tar}'")
         return False, f"appdata tar failed (code {code}): {stderr.strip()}"
 
-    code, size_out, _ = run_ssh(f"ls -lh '{dest_compose}' '{dest_tar}' | awk '{{print $9, $5}}'")
+    _, _, _ = run_ssh(f"ls -lh '{dest_compose}' '{dest_tar}' | awk '{{print $9, $5}}'")
     return True, f"docker-appdata -> {dest_compose} & {dest_tar}"
+
+
+def backup_wordpress(ts: str) -> tuple[bool, str]:
+    dest_db = f"/volumeUSB1/usbshare/backups/wordpress/wp_dbs_{ts}.sql.gz"
+    dest_tar = f"/volumeUSB1/usbshare/backups/wordpress/wp_files_{ts}.tar.gz"
+    wp_root = "/volume2/docker/wordpress"
+
+    # 1. Dump wp01 & wp02 from MariaDB with pipefail so container errors aren't masked by gzip
+    cmd_db = (
+        "bash -o pipefail -c "
+        "\"sudo docker exec wordpress-mariadb sh -c "
+        "'MYSQL_PWD=\\\"\\$MARIADB_ROOT_PASSWORD\\\" mariadb-dump "
+        "--single-transaction --quick --routines --triggers --databases wp01 wp02' "
+        f"| gzip > '{dest_db}'\""
+    )
+    code_db, _, stderr_db = run_ssh(cmd_db, timeout=180)
+    if code_db != 0:
+        run_ssh(f"rm -f '{dest_db}'")
+        return False, f"wordpress mariadb-dump failed (code {code_db}): {stderr_db.strip()}"
+
+    # 2. Verify compressed dump archive is non-trivial (>= 1024 bytes)
+    code_stat, size_bytes_out, _ = run_ssh(f"stat -c %s '{dest_db}' 2>/dev/null || echo 0")
+    try:
+        dump_bytes = int(size_bytes_out.strip().splitlines()[-1]) if size_bytes_out.strip() else 0
+    except ValueError:
+        dump_bytes = 0
+    if code_stat != 0 or dump_bytes < 1024:
+        run_ssh(f"rm -f '{dest_db}'")
+        return False, f"wordpress mariadb-dump archive too small ({dump_bytes} bytes)"
+
+    # 3. Archive stack configs & site files, excluding disposable caches and logs
+    cmd_tar = (
+        f"sudo tar --warning=no-file-changed "
+        f"--exclude='sites/*/wp-content/cache/*' "
+        f"--exclude='sites/*/wp-content/upgrade-temp-backup/*' "
+        f"--exclude='@eaDir' --exclude='*.log' "
+        f"-czf '{dest_tar}' -C '{wp_root}' docker-compose.yml .env apache php sites"
+    )
+    code_tar, _, stderr_tar = run_ssh(cmd_tar, timeout=240)
+    if code_tar not in (0, 1):
+        run_ssh(f"rm -f '{dest_tar}'")
+        return False, f"wordpress tar failed (code {code_tar}): {stderr_tar.strip()}"
+
+    _, size_out, _ = run_ssh(f"ls -lh '{dest_db}' '{dest_tar}' | awk '{{print $9, $5}}'")
+    return True, f"wordpress -> {dest_db} & {dest_tar} ({size_out.strip()})"
+
 
 def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
+
+    mount_code, _, mount_err = run_ssh("mountpoint -q /volumeUSB1/usbshare", timeout=15)
+    if mount_code != 0:
+        err_detail = f" ({mount_err.strip()})" if mount_err.strip() else ""
+        print(
+            f"❌ USB backup target /volumeUSB1/usbshare is not mounted (code {mount_code}){err_detail}; "
+            f"aborting to protect rootfs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     now = datetime.now(PT)
     ts = now.strftime("%Y%m%d_%H%M%S")
     date_human = now.strftime("%Y-%m-%d %I:%M %p PT")
     if not quiet:
         print(f"[{date_human}] Starting Host 1 Local Backup to /volumeUSB1/usbshare/...")
 
-    dirs = ["postgres-arr", "homeassistant", "docker-appdata"]
+    dirs = ["postgres-arr", "homeassistant", "docker-appdata", "wordpress"]
     for d in dirs:
         run_ssh(f"sudo mkdir -p /volumeUSB1/usbshare/backups/{d} && sudo chown -R {SSH_USER}:users /volumeUSB1/usbshare/backups/{d}")
 
@@ -149,6 +206,13 @@ def main():
         print("• Backing up Docker Compose & Critical AppData...")
     ok, msg = backup_docker_appdata(ts)
     results["docker_appdata"] = (ok, msg)
+    if not quiet:
+        print(f"  {'✅' if ok else '❌'} {msg}")
+
+    if not quiet:
+        print("• Backing up WordPress (Volume 2 NVMe MariaDB + site files)...")
+    ok, msg = backup_wordpress(ts)
+    results["wordpress"] = (ok, msg)
     if not quiet:
         print(f"  {'✅' if ok else '❌'} {msg}")
 
