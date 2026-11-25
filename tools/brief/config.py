@@ -160,7 +160,7 @@ class BriefConfig:
 
     # [limits]
     max_events_per_hour: int = 30
-    max_proactive_messages_per_day: int = 12
+    max_proactive_messages_per_day: int = 0
     max_overnight_bypasses: int = 3
     imminent_event_minutes: int = 60
     quiet_hours_start: str = "22:00"
@@ -380,7 +380,7 @@ class BriefConfig:
             calendar_interval_seconds=int(polling.get("calendar_interval_seconds", 300)),
             router_interval_seconds=int(polling.get("router_interval_seconds", 15)),
             max_events_per_hour=int(limits.get("max_events_per_hour", 30)),
-            max_proactive_messages_per_day=int(limits.get("max_proactive_messages_per_day", 12)),
+            max_proactive_messages_per_day=int(limits.get("max_proactive_messages_per_day", 0)),
             max_overnight_bypasses=int(limits.get("max_overnight_bypasses", 3)),
             imminent_event_minutes=int(limits.get("imminent_event_minutes", 60)),
             quiet_hours_start=str(limits.get("quiet_hours_start", "22:00")),

@@ -1121,7 +1121,7 @@ class BriefApprovalGate:
             return bool(self._budget_check_fn(now_ts))
         limit = max(0, int(self.config.max_proactive_messages_per_day))
         if limit <= 0:
-            return False
+            return True
         date_key, _ = self._delivery_gate._pt_date_key(now=now_ts)
         with self._delivery_gate._lock:
             used = self._delivery_gate._get_proactive_count_unlocked(date_key)

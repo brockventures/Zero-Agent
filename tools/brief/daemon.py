@@ -607,7 +607,7 @@ class BriefDeliveryGate:
                 bypass_granted = True
 
             is_proactive = not is_owner and not is_urgent and not bypass_granted
-            if is_proactive and used >= limit:
+            if is_proactive and limit > 0 and used >= limit:
                 return {
                     "delivered": False,
                     "status": "suppressed_budget",
@@ -678,7 +678,7 @@ class BriefDeliveryGate:
             used = self._get_proactive_count_unlocked(date_key)
 
             for idx, item in enumerate(items):
-                if used >= limit:
+                if limit > 0 and used >= limit:
                     stopped_reason = "budget_exhausted"
                     remaining.extend(items[idx:])
                     break

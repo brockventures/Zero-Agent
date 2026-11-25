@@ -16,7 +16,7 @@ router_interval_seconds = 15
 
 [limits]
 max_events_per_hour = 30
-max_proactive_messages_per_day = 12
+max_proactive_messages_per_day = 0  # 0 = unlimited
 max_overnight_bypasses = 3
 imminent_event_minutes = 60
 quiet_hours_start = "22:00"

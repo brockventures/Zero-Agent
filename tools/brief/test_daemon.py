@@ -45,7 +45,7 @@ def _make_cfg(
     tmp_path: Path,
     *,
     dry_run: bool = True,
-    max_proactive: int = 12,
+    max_proactive: int = 0,
     quiet_start: str = "22:00",
     quiet_end: str = "07:00",
 ) -> BriefConfig:
@@ -1006,4 +1006,81 @@ def test_quiet_daily_review_skips_when_empty_and_enqueues_on_strikes_or_stale_ta
     runner._last_morning_brief_date = "2026-11-28"
     enqueued_day5 = runner._run_timers(t_day5)
     assert enqueued_day5["daily_review"] is None
+
+
+def test_delivery_gate_unlimited_when_default_or_non_positive_and_flush_caps_when_positive(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    assert BriefConfig().max_proactive_messages_per_day == 0
+    example_cfg = tomllib.loads((REPO_ROOT / "config" / "brief.toml.example").read_text(encoding="utf-8"))
+    assert example_cfg["limits"]["max_proactive_messages_per_day"] == 0
+
+    day_ts = _pt_ts(2026, 11, 24, 10, 0)
+    night_ts = _pt_ts(2026, 11, 23, 23, 15)
+
+    # Default / zero limit allows unlimited (>12) proactive deliveries and deferred flushes.
+    cfg_zero = _make_cfg(tmp_path / "zero", max_proactive=0)
+    sent_zero: list[tuple[int, str]] = []
+    gate_zero = BriefDeliveryGate(
+        cfg_zero,
+        post_fn=lambda ch, msg: sent_zero.append((ch, msg)) or True,
+    )
+    for idx in range(15):
+        res = gate_zero.deliver(f"INFORM: Message {idx}", now=day_ts + idx)
+        assert res["delivered"] is True
+        assert res["budget_limit"] == 0
+        assert res["budget_used"] == idx + 1
+    assert len(sent_zero) == 15
+
+    for idx in range(15):
+        queued = gate_zero.deliver(
+            f"INFORM: Night {idx}",
+            tag=f"intake/gmail/night-{idx}",
+            event={"id": 100 + idx, "source": "gmail"},
+            now=night_ts + idx,
+        )
+        assert queued["status"] == "deferred_quiet_hours"
+
+    flushed_zero = gate_zero.flush_deferred(now=_pt_ts(2026, 11, 24, 11, 0))
+    assert flushed_zero["flushed"] == 15
+    assert flushed_zero["remaining"] == 0
+    assert flushed_zero["skipped"] is None
+    assert len(sent_zero) == 30
+
+    # Negative limit (<= 0) is also treated as unlimited.
+    cfg_neg = _make_cfg(tmp_path / "neg", max_proactive=-1)
+    sent_neg: list[tuple[int, str]] = []
+    gate_neg = BriefDeliveryGate(
+        cfg_neg,
+        post_fn=lambda ch, msg: sent_neg.append((ch, msg)) or True,
+    )
+    for idx in range(15):
+        res = gate_neg.deliver(f"INFORM: Neg {idx}", now=day_ts + idx)
+        assert res["delivered"] is True
+        assert res["budget_limit"] == 0
+    assert len(sent_neg) == 15
+
+    # Explicit positive limit still enforces cap during flush_deferred.
+    cfg_pos = _make_cfg(tmp_path / "pos", max_proactive=2)
+    sent_pos: list[tuple[int, str]] = []
+    gate_pos = BriefDeliveryGate(
+        cfg_pos,
+        post_fn=lambda ch, msg: sent_pos.append((ch, msg)) or True,
+    )
+    for idx in range(3):
+        queued = gate_pos.deliver(
+            f"INFORM: Capped night {idx}",
+            tag=f"intake/gmail/cap-{idx}",
+            event={"id": 200 + idx, "source": "gmail"},
+            now=night_ts + idx,
+        )
+        assert queued["status"] == "deferred_quiet_hours"
+
+    flushed_pos = gate_pos.flush_deferred(now=_pt_ts(2026, 11, 24, 11, 0))
+    assert flushed_pos["flushed"] == 2
+    assert flushed_pos["remaining"] == 1
+    assert flushed_pos["skipped"] == "budget_exhausted"
+    assert len(sent_pos) == 2
 

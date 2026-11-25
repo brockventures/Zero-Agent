@@ -41,7 +41,7 @@ def _make_config(
     tmp_path: Path,
     *,
     dry_run: bool = False,
-    max_proactive: int = 12,
+    max_proactive: int = 0,
     max_ttl: int = 604800,
 ) -> BriefConfig:
     state_dir = tmp_path / "state"
@@ -852,4 +852,64 @@ def test_extract_dismissal_keys_and_three_strike_silent_dismissal_lifecycle(
     assert cat_cands[0]["category_key"] == "calendar.update"
     assert direct_store.mark_strikes_surfaced(cat_cands, now=now_ts + 220) == 3
     assert direct_store.list_three_strike_candidates(now=now_ts + 225) == []
+
+
+def test_gate_default_and_non_positive_proactive_limit_unlimited_while_positive_caps(
+    tmp_path: Path,
+) -> None:
+    day_ts = _ts_pt(2026, 11, 24, 10, 0)
+
+    # Default / 0 and negative limits allow unlimited (>12) proactive proposal staging.
+    for label, limit_val in (("zero", 0), ("negative", -1)):
+        cfg = _make_config(tmp_path / label, dry_run=True, max_proactive=limit_val)
+        staged_calls: list[dict[str, Any]] = []
+        gate = BriefApprovalGate(
+            cfg,
+            stage_card_fn=lambda **kw: staged_calls.append(kw)
+            or {"decision_id": f"dec-{len(staged_calls)}"},
+            now_fn=lambda: day_ts,
+        )
+        assert gate._can_send_proactive(day_ts) is True
+
+        for idx in range(15):
+            write_proposal_atomic(
+                cfg.proposals_pending_dir,
+                _sample_create_proposal(
+                    f"prop-{label}-{idx:02d}",
+                    expires_at="2026-11-26T18:00:00-08:00",
+                    urgent=False,
+                    summary=f"Sync {idx}",
+                ),
+            )
+
+        res = gate.scan_pending_proposals(now=day_ts)
+        assert res["staged"] == 15
+        assert res["deferred_budget"] == 0
+        assert len(staged_calls) == 15
+        assert gate._can_send_proactive(day_ts + 60) is True
+
+    # Explicit positive limit still enforces daily cap for routine proactive proposals.
+    cfg_pos = _make_config(tmp_path / "positive", dry_run=True, max_proactive=2)
+    staged_pos: list[dict[str, Any]] = []
+    gate_pos = BriefApprovalGate(
+        cfg_pos,
+        stage_card_fn=lambda **kw: staged_pos.append(kw)
+        or {"decision_id": f"dec-{len(staged_pos)}"},
+        now_fn=lambda: day_ts,
+    )
+    for idx in range(3):
+        write_proposal_atomic(
+            cfg_pos.proposals_pending_dir,
+            _sample_create_proposal(
+                f"prop-pos-{idx:02d}",
+                expires_at="2026-11-26T18:00:00-08:00",
+                urgent=False,
+                summary=f"Positive Cap {idx}",
+            ),
+        )
+
+    res_pos = gate_pos.scan_pending_proposals(now=day_ts)
+    assert res_pos["staged"] == 2
+    assert res_pos["deferred_budget"] == 1
+    assert gate_pos._can_send_proactive(day_ts + 60) is False
 
