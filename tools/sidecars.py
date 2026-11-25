@@ -1195,7 +1195,11 @@ def run_plex_session_cleanup(dry_run: bool = False) -> tuple[bool, str]:
             return True, ""
 
         # Scan for stale sessions > 60m old
-        cmd = "find /docker/appdata/plex/Temp/Transcode/Sessions -maxdepth 1 -name 'plex-transcode-*' -mmin +60"
+        transcode_sessions_dir = "/volume2/docker/appdata/plex/Temp/Transcode/Sessions"
+        cmd = (
+            f"[ -d {transcode_sessions_dir} ] && "
+            f"find {transcode_sessions_dir} -maxdepth 1 -name 'plex-transcode-*' -mmin +60 || true"
+        )
         res = _ssh_cmd(HOST_1_IP, cmd, timeout=20)
         stale_dirs = [d.strip() for d in res.stdout.splitlines() if d.strip()]
 
@@ -1207,7 +1211,10 @@ def run_plex_session_cleanup(dry_run: bool = False) -> tuple[bool, str]:
             return True, f"🎬 **Plex Cleanup (Dry Run)**: Found {len(stale_dirs)} stale directory(ies) to prune."
 
         # Remove stale directories
-        del_cmd = "find /docker/appdata/plex/Temp/Transcode/Sessions -maxdepth 1 -name 'plex-transcode-*' -mmin +60 -exec rm -rf {} +"
+        del_cmd = (
+            f"[ -d {transcode_sessions_dir} ] && "
+            f"find {transcode_sessions_dir} -maxdepth 1 -name 'plex-transcode-*' -mmin +60 -exec rm -rf {{}} + || true"
+        )
         del_res = _ssh_cmd(HOST_1_IP, del_cmd, timeout=30)
         if del_res.returncode == 0:
             # Successfully pruned without errors — silent

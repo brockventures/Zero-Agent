@@ -7,6 +7,7 @@ Backs up:
   - homeassistant (Volume 2 NVMe HA config, .storage, SQLite/Zigbee DBs, Matter/OTBR/Z-Wave/go2rtc & Homebridge)
   - docker-appdata (docker-compose.yml + critical lightweight configs)
   - wordpress (Volume 2 NVMe MariaDB wp01/wp02 dumps + site files & stack configs)
+  - plex (Volume 2 NVMe Plex SQLite library/blobs DBs, Preferences.xml, Kometa/Posterizarr configs)
 Enforces a 14-day rolling retention policy.
 """
 
@@ -215,6 +216,65 @@ def backup_wordpress(ts: str) -> tuple[bool, str]:
     return True, f"wordpress -> {dest_db} & {dest_tar} ({size_out.strip()})"
 
 
+def backup_plex_artwork(ts: str) -> tuple[bool, str]:
+    plex_backup_dir = "/volumeUSB1/usbshare/backups/plex"
+    dest_lib_db = f"{plex_backup_dir}/plex_library_{ts}.db"
+    dest_blobs_db = f"{plex_backup_dir}/plex_blobs_{ts}.db"
+    dest_tar = f"{plex_backup_dir}/plex_artwork_configs_{ts}.tar.gz"
+
+    # 1. WAL-safe SQLite backup of Plex library database
+    lib_src = f"{APPDATA_NVME_ROOT}/plex/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+    cmd_lib = f"sudo sqlite3 '{lib_src}' \".backup '{dest_lib_db}'\""
+    code_lib, _, stderr_lib = run_ssh(cmd_lib, timeout=300)
+    if code_lib != 0:
+        run_ssh(f"rm -f '{dest_lib_db}'")
+        return False, f"plex library sqlite db backup failed (code {code_lib}): {stderr_lib.strip()}"
+
+    # 2. WAL-safe SQLite backup of Plex blobs database (if present)
+    blobs_src = f"{APPDATA_NVME_ROOT}/plex/Plug-in Support/Databases/com.plexapp.plugins.library.blobs.db"
+    cmd_blobs = (
+        f"if sudo test -f '{blobs_src}'; then "
+        f"sudo sqlite3 '{blobs_src}' \".backup '{dest_blobs_db}'\"; "
+        f"else echo '__MISSING__'; fi"
+    )
+    code_blobs, stdout_blobs, stderr_blobs = run_ssh(cmd_blobs, timeout=300)
+    if code_blobs != 0:
+        run_ssh(f"rm -f '{dest_blobs_db}'")
+        return False, f"plex blobs sqlite db backup failed (code {code_blobs}): {stderr_blobs.strip()}"
+    blobs_backed_up = "__MISSING__" not in (stdout_blobs or "")
+
+    # 3. Tarball of Plex Preferences.xml and Kometa/Posterizarr artwork configs
+    cmd_tar = (
+        f"sudo tar --ignore-failed-read --warning=no-file-changed "
+        f"--exclude='*.log' --exclude='Logs' --exclude='Cache' --exclude='temp' "
+        f"-czf '{dest_tar}' -C '{APPDATA_NVME_ROOT}' "
+        f"plex/Preferences.xml "
+        f"kometa/radarr_arrapi_patch.py "
+        f"kometa/config/config.yml "
+        f"kometa/config/collection_movies.yml "
+        f"kometa/config/overlay_movies.yml "
+        f"kometa/config/overlay_tv.yml "
+        f"posterizarr/config.json "
+        f"posterizarr/scheduler.json "
+        f"posterizarr/config "
+        f"posterizarr/database"
+    )
+    code_tar, _, stderr_tar = run_ssh(cmd_tar, timeout=180)
+    if code_tar not in (0, 1):
+        run_ssh(f"rm -f '{dest_tar}'")
+        return False, f"plex artwork configs tar failed (code {code_tar}): {stderr_tar.strip()}"
+
+    backed_up = [dest_lib_db]
+    if blobs_backed_up:
+        backed_up.append(dest_blobs_db)
+    backed_up.append(dest_tar)
+    ls_targets = " ".join(f"'{p}'" for p in backed_up)
+    _, size_out, _ = run_ssh(f"ls -lh {ls_targets} | awk '{{print $9, $5}}'")
+    summary = " & ".join(backed_up)
+    size_suffix = f" ({size_out.strip()})" if size_out.strip() else ""
+    return True, f"plex -> {summary}{size_suffix}"
+
+
 def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
@@ -234,7 +294,7 @@ def main():
     if not quiet:
         print(f"[{date_human}] Starting Host 1 Local Backup to /volumeUSB1/usbshare/...")
 
-    dirs = ["postgres-arr", "homeassistant", "docker-appdata", "wordpress"]
+    dirs = ["postgres-arr", "homeassistant", "docker-appdata", "wordpress", "plex"]
     for d in dirs:
         run_ssh(f"sudo mkdir -p /volumeUSB1/usbshare/backups/{d} && sudo chown -R {SSH_USER}:users /volumeUSB1/usbshare/backups/{d}")
 
@@ -268,6 +328,13 @@ def main():
         print("• Backing up WordPress (Volume 2 NVMe MariaDB + site files)...")
     ok, msg = backup_wordpress(ts)
     results["wordpress"] = (ok, msg)
+    if not quiet:
+        print(f"  {'✅' if ok else '❌'} {msg}")
+
+    if not quiet:
+        print("• Backing up Plex DBs & Artwork Configs (Volume 2 NVMe)...")
+    ok, msg = backup_plex_artwork(ts)
+    results["plex"] = (ok, msg)
     if not quiet:
         print(f"  {'✅' if ok else '❌'} {msg}")
 

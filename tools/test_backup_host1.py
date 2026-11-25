@@ -169,6 +169,7 @@ def test_main_aborts_when_usb_not_mounted(capsys):
         patch.object(backup_host1, "backup_home_assistant") as m_ha,
         patch.object(backup_host1, "backup_docker_appdata") as m_app,
         patch.object(backup_host1, "backup_wordpress") as m_wp,
+        patch.object(backup_host1, "backup_plex_artwork") as m_plex,
         pytest.raises(SystemExit) as exc_info,
     ):
         backup_host1.main()
@@ -179,12 +180,13 @@ def test_main_aborts_when_usb_not_mounted(capsys):
     m_ha.assert_not_called()
     m_app.assert_not_called()
     m_wp.assert_not_called()
+    m_plex.assert_not_called()
     captured = capsys.readouterr()
     assert "/volumeUSB1/usbshare" in captured.err
 
 
 def test_main_creates_and_prunes_wordpress_dir():
-    """Verify main() creates/prunes wordpress backup dir and runs backup_wordpress."""
+    """Verify main() creates/prunes wordpress and plex backup dirs and runs both backups."""
     ssh_cmds: list[str] = []
 
     def fake_run_ssh(cmd: str, timeout: int = 180):
@@ -200,14 +202,18 @@ def test_main_creates_and_prunes_wordpress_dir():
         patch.object(backup_host1, "backup_home_assistant", return_value=(True, "ok")),
         patch.object(backup_host1, "backup_docker_appdata", return_value=(True, "ok")),
         patch.object(backup_host1, "backup_wordpress", return_value=(True, "ok")) as m_wp,
+        patch.object(backup_host1, "backup_plex_artwork", return_value=(True, "ok")) as m_plex,
         pytest.raises(SystemExit) as exc_info,
     ):
         backup_host1.main()
 
     assert exc_info.value.code == 0
     m_wp.assert_called_once()
+    m_plex.assert_called_once()
     assert any("mkdir -p /volumeUSB1/usbshare/backups/wordpress" in c for c in ssh_cmds)
     assert any("find /volumeUSB1/usbshare/backups/wordpress" in c for c in ssh_cmds)
+    assert any("mkdir -p /volumeUSB1/usbshare/backups/plex" in c for c in ssh_cmds)
+    assert any("find /volumeUSB1/usbshare/backups/plex" in c for c in ssh_cmds)
 
 
 def test_backup_home_assistant_success():
@@ -596,3 +602,177 @@ def test_backup_docker_appdata_compose_copy_failure_cleans_up():
     assert f"rm -f '/volumeUSB1/usbshare/backups/docker-appdata/docker-compose_{ts}.yml'" in cmds
     assert not any("PRAGMA wal_checkpoint" in c for c in cmds)
     assert not any("sudo tar" in c for c in cmds)
+
+
+def test_backup_plex_artwork_success():
+    """Verify NVMe Plex library/blobs SQLite .backup and Kometa/Posterizarr configs tarball."""
+    calls: list[tuple[str, int | None]] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        calls.append((cmd, timeout))
+        if f"plex_library_{ts}.db" in cmd and "sudo sqlite3" in cmd:
+            return 0, "", ""
+        if f"plex_blobs_{ts}.db" in cmd and "sudo sqlite3" in cmd:
+            return 0, "", ""
+        if f"plex_artwork_configs_{ts}.tar.gz" in cmd and "sudo tar" in cmd:
+            return 0, "", ""
+        if cmd.startswith("ls -lh"):
+            return 0, "plex_library 250M plex_blobs 80M plex_artwork_configs 12M\n", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_plex_artwork(ts)
+
+    assert ok is True
+    assert f"/volumeUSB1/usbshare/backups/plex/plex_library_{ts}.db" in msg
+    assert f"/volumeUSB1/usbshare/backups/plex/plex_blobs_{ts}.db" in msg
+    assert f"/volumeUSB1/usbshare/backups/plex/plex_artwork_configs_{ts}.tar.gz" in msg
+    assert "250M" in msg
+
+    lib_cmd, lib_timeout = calls[0]
+    assert (
+        "sudo sqlite3 '/volume2/docker/appdata/plex/Plug-in Support/Databases/com.plexapp.plugins.library.db'"
+        in lib_cmd
+    )
+    assert f".backup '/volumeUSB1/usbshare/backups/plex/plex_library_{ts}.db'" in lib_cmd
+    assert lib_timeout == 300
+
+    blobs_cmd, blobs_timeout = calls[1]
+    assert (
+        "sudo test -f '/volume2/docker/appdata/plex/Plug-in Support/Databases/com.plexapp.plugins.library.blobs.db'"
+        in blobs_cmd
+    )
+    assert f".backup '/volumeUSB1/usbshare/backups/plex/plex_blobs_{ts}.db'" in blobs_cmd
+    assert blobs_timeout == 300
+
+    tar_cmd, tar_timeout = calls[2]
+    assert "--ignore-failed-read" in tar_cmd
+    assert "--warning=no-file-changed" in tar_cmd
+    for excl in ("--exclude='*.log'", "--exclude='Logs'", "--exclude='Cache'", "--exclude='temp'"):
+        assert excl in tar_cmd
+    assert "-C '/volume2/docker/appdata'" in tar_cmd
+    for member in (
+        "plex/Preferences.xml",
+        "kometa/radarr_arrapi_patch.py",
+        "kometa/config/config.yml",
+        "kometa/config/collection_movies.yml",
+        "kometa/config/overlay_movies.yml",
+        "kometa/config/overlay_tv.yml",
+        "posterizarr/config.json",
+        "posterizarr/scheduler.json",
+        "posterizarr/config",
+        "posterizarr/database",
+    ):
+        assert member in tar_cmd
+    assert tar_timeout == 180
+
+    ls_cmd, _ = calls[3]
+    assert f"plex_blobs_{ts}.db" in ls_cmd
+
+
+def test_backup_plex_artwork_skips_missing_blobs_db():
+    """Verify missing com.plexapp.plugins.library.blobs.db is skipped cleanly without ls entry."""
+    calls: list[str] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        calls.append(cmd)
+        if f"plex_library_{ts}.db" in cmd and "sudo sqlite3" in cmd:
+            return 0, "", ""
+        if "library.blobs.db" in cmd:
+            return 0, "__MISSING__\n", ""
+        if f"plex_artwork_configs_{ts}.tar.gz" in cmd and "sudo tar" in cmd:
+            return 0, "", ""
+        if cmd.startswith("ls -lh"):
+            return 0, "plex_library 250M plex_artwork_configs 12M\n", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_plex_artwork(ts)
+
+    assert ok is True
+    assert f"plex_library_{ts}.db" in msg
+    assert f"plex_blobs_{ts}.db" not in msg
+    assert f"plex_artwork_configs_{ts}.tar.gz" in msg
+    ls_cmd = next(c for c in calls if c.startswith("ls -lh"))
+    assert f"plex_blobs_{ts}.db" not in ls_cmd
+
+
+def test_backup_plex_artwork_db_failure_cleans_up():
+    """Verify library DB and blobs DB failures remove partial files and return (False, ...)."""
+    ts = "20261125_034500"
+
+    cmds_lib_fail: list[str] = []
+
+    def fake_lib_fail(cmd: str, timeout: int = 180):
+        cmds_lib_fail.append(cmd)
+        if f"plex_library_{ts}.db" in cmd and "sudo sqlite3" in cmd:
+            return 5, "", "database is locked"
+        if cmd.startswith("rm -f"):
+            return 0, "", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_lib_fail):
+        ok_lib, msg_lib = backup_host1.backup_plex_artwork(ts)
+
+    assert ok_lib is False
+    assert "code 5" in msg_lib
+    assert f"rm -f '/volumeUSB1/usbshare/backups/plex/plex_library_{ts}.db'" in cmds_lib_fail
+    assert not any("library.blobs.db" in c for c in cmds_lib_fail)
+    assert not any("sudo tar" in c for c in cmds_lib_fail)
+
+    cmds_blobs_fail: list[str] = []
+
+    def fake_blobs_fail(cmd: str, timeout: int = 180):
+        cmds_blobs_fail.append(cmd)
+        if f"plex_library_{ts}.db" in cmd and "sudo sqlite3" in cmd:
+            return 0, "", ""
+        if "library.blobs.db" in cmd:
+            return 1, "", "disk I/O error"
+        if cmd.startswith("rm -f"):
+            return 0, "", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_blobs_fail):
+        ok_blobs, msg_blobs = backup_host1.backup_plex_artwork(ts)
+
+    assert ok_blobs is False
+    assert "code 1" in msg_blobs
+    assert f"rm -f '/volumeUSB1/usbshare/backups/plex/plex_blobs_{ts}.db'" in cmds_blobs_fail
+    assert not any("sudo tar" in c for c in cmds_blobs_fail)
+
+
+def test_backup_plex_artwork_allows_tar_rc_1_fails_rc_2():
+    """Verify GNU tar rc=1 succeeds and rc=2 cleans up dest_tar and returns (False, ...)."""
+    ts = "20261125_034500"
+
+    def make_fake_ssh(tar_rc: int, cmds: list[str]):
+        def fake_run_ssh(cmd: str, timeout: int = 180):
+            cmds.append(cmd)
+            if f"plex_library_{ts}.db" in cmd and "sudo sqlite3" in cmd:
+                return 0, "", ""
+            if "library.blobs.db" in cmd:
+                return 0, "", ""
+            if f"plex_artwork_configs_{ts}.tar.gz" in cmd and "sudo tar" in cmd:
+                return tar_rc, "", "file changed" if tar_rc == 1 else "fatal tar error"
+            if cmd.startswith("ls -lh"):
+                return 0, "ok 10M\n", ""
+            if cmd.startswith("rm -f"):
+                return 0, "", ""
+            raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+        return fake_run_ssh
+
+    cmds_rc1: list[str] = []
+    with patch.object(backup_host1, "run_ssh", side_effect=make_fake_ssh(1, cmds_rc1)):
+        ok1, msg1 = backup_host1.backup_plex_artwork(ts)
+    assert ok1 is True
+    assert "plex ->" in msg1
+
+    cmds_rc2: list[str] = []
+    with patch.object(backup_host1, "run_ssh", side_effect=make_fake_ssh(2, cmds_rc2)):
+        ok2, msg2 = backup_host1.backup_plex_artwork(ts)
+    assert ok2 is False
+    assert "code 2" in msg2
+    assert f"rm -f '/volumeUSB1/usbshare/backups/plex/plex_artwork_configs_{ts}.tar.gz'" in cmds_rc2
