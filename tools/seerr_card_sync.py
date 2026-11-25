@@ -25,8 +25,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+HTTP_TIMEOUT = 30
 
 for _path in [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent)]:
     if _path not in sys.path:
@@ -447,7 +451,7 @@ def _fetch_discord_messages(
             f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
             headers=headers,
             params=params,
-            timeout=15,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         batch = resp.json()
@@ -473,7 +477,7 @@ def _fetch_webhook_tokens(
     resp = http_client.get(
         f"{DISCORD_API_BASE}/channels/{channel_id}/webhooks",
         headers={"Authorization": f"Bot {discord_token}"},
-        timeout=15,
+        timeout=HTTP_TIMEOUT,
     )
     resp.raise_for_status()
     webhooks = resp.json()
@@ -499,7 +503,7 @@ def _fetch_seerr_requests(
             f"{seerr_base_url}/api/v1/request",
             headers=headers,
             params={"take": 100, "skip": skip, "sort": "added"},
-            timeout=15,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         payload = resp.json()
@@ -532,7 +536,7 @@ def _fetch_seerr_detail_memoized(
         resp = http_client.get(
             f"{seerr_base_url}/api/v1/{media_type}/{tmdb_id}",
             headers={"X-Api-Key": seerr_api_key},
-            timeout=15,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         detail = resp.json()
@@ -554,6 +558,17 @@ def sync_seerr_cards(
     own_session = http_client is None
     if own_session:
         http_client = requests.Session()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=1.5,
+            status_forcelist=(429, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        http_client.mount("https://", adapter)
+        http_client.mount("http://", adapter)
         if os.environ.get("SEERR_VERIFY_SSL", "").strip().lower() in ("0", "false", "no"):
             http_client.verify = False
 
@@ -673,7 +688,7 @@ def sync_seerr_cards(
                         f"{DISCORD_API_BASE}/webhooks/{wh_id}/{wh_token}/messages/{msg['id']}",
                         headers={"Content-Type": "application/json"},
                         json={"embeds": payload_embeds},
-                        timeout=15,
+                        timeout=HTTP_TIMEOUT,
                     )
                     patch_resp.raise_for_status()
                     time.sleep(0.4)

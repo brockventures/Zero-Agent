@@ -1960,12 +1960,18 @@ def run_arr_queue_watchdog(auto_fix: bool = True, force: bool = False) -> tuple[
     except Exception as e:
         return False, f"⚠️ Arr queue watchdog failed: {e}"
 
+_SEERR_SYNC_TRANSIENT_STREAK = 0
+_SEERR_SYNC_ALERT_THRESHOLD = 3
+
+
 def run_seerr_card_sync(limit: int = 100) -> tuple[bool, str]:
     """Sync Seerr webhook cards in #media-requests with live Seerr request statuses."""
+    global _SEERR_SYNC_TRANSIENT_STREAK
     try:
         from tools.seerr_card_sync import sync_seerr_cards
         res = sync_seerr_cards(dry_run=False, limit=limit)
         if not res["errors"]:
+            _SEERR_SYNC_TRANSIENT_STREAK = 0
             return True, f"(nominal - {res['updated']} Seerr card(s) updated)"
         return (
             False,
@@ -1973,6 +1979,21 @@ def run_seerr_card_sync(limit: int = 100) -> tuple[bool, str]:
             f"(updated={res.get('updated', 0)}, scanned={res.get('scanned', 0)})",
         )
     except Exception as e:
+        err_text = str(e)
+        is_transient = (
+            isinstance(e, TimeoutError)
+            or "timed out" in err_text.lower()
+            or "connection reset" in err_text.lower()
+            or "temporarily unavailable" in err_text.lower()
+        )
+        if is_transient:
+            _SEERR_SYNC_TRANSIENT_STREAK += 1
+            if _SEERR_SYNC_TRANSIENT_STREAK < _SEERR_SYNC_ALERT_THRESHOLD:
+                return (
+                    True,
+                    f"(transient seerr sync timeout {_SEERR_SYNC_TRANSIENT_STREAK}/"
+                    f"{_SEERR_SYNC_ALERT_THRESHOLD} suppressed: {err_text})",
+                )
         return False, f"⚠️ Seerr card sync failed: {e}"
 
 def run_ha_reauth_watchdog(force: bool = False) -> tuple[bool, str]:

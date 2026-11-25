@@ -572,3 +572,28 @@ def test_sync_seerr_cards_dry_run_and_live_patch(monkeypatch):
     patched_embed_2 = patch_body_2["embeds"][0]
     assert patched_embed_2["color"] == 15965202
     assert "Status synced via Seerr • Partially Available on Plex" in patched_embed_2["footer"]["text"]
+
+
+def test_seerr_card_sync_transient_timeout_suppression(monkeypatch):
+    """Single transient Discord read timeouts are suppressed until 3 consecutive failures."""
+    import requests
+
+    import tools.sidecars as sc
+
+    monkeypatch.setattr(sc, "_SEERR_SYNC_TRANSIENT_STREAK", 0)
+    err = requests.exceptions.ReadTimeout("HTTPSConnectionPool(host='discord.com', port=443): Read timed out. (read timeout=30)")
+    monkeypatch.setattr("tools.seerr_card_sync.sync_seerr_cards", lambda **_kw: (_ for _ in ()).throw(err))
+
+    ok1, msg1 = sc.run_seerr_card_sync()
+    ok2, msg2 = sc.run_seerr_card_sync()
+    ok3, msg3 = sc.run_seerr_card_sync()
+
+    assert ok1 is True and "suppressed" in msg1
+    assert ok2 is True and "suppressed" in msg2
+    assert ok3 is False and "Seerr card sync failed" in msg3
+
+    # Clean run resets the streak
+    monkeypatch.setattr("tools.seerr_card_sync.sync_seerr_cards", lambda **_kw: {"updated": 0, "errors": 0, "scanned": 5})
+    ok_reset, _ = sc.run_seerr_card_sync()
+    assert ok_reset is True
+    assert sc._SEERR_SYNC_TRANSIENT_STREAK == 0
