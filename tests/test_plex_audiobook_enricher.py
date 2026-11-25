@@ -5,6 +5,9 @@ from __future__ import annotations
 import io
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
@@ -14,6 +17,8 @@ from PIL import Image
 
 from tools.plex_audiobook_enricher import (
     COLLECTION_BADGE_LABELS,
+    PLEX_NVME_PREFERENCES_PATH,
+    _resolve_plex_token,
     compute_book_collections,
     render_collection_poster,
 )
@@ -213,3 +218,48 @@ def test_collection_badge_labels_completeness():
         label, color = COLLECTION_BADGE_LABELS[col_name]
         assert isinstance(label, str) and len(label) > 0
         assert len(color) == 3
+
+
+def test_resolve_plex_token_ssh_prefers_nvme():
+    """Verify _resolve_plex_token checks Volume 2 NVMe Preferences.xml first."""
+    state: dict[str, str] = {}
+    mock_out = 'PlexOnlineToken="nvme_token_123"'
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("tools.plex_audiobook_enricher.os.path.exists", return_value=False),
+        patch("tools.plex_audiobook_enricher._save_state") as mock_save,
+        patch("tools.plex_audiobook_enricher.nas_config.run_ssh", return_value=(0, mock_out, "")) as mock_ssh,
+    ):
+        tok = _resolve_plex_token(state)
+        assert tok == "nvme_token_123"
+        assert state.get("plex_token") == "nvme_token_123"
+        mock_save.assert_called_once_with(state)
+        mock_ssh.assert_called_once()
+        cmd = mock_ssh.call_args[0][1]
+        assert PLEX_NVME_PREFERENCES_PATH in cmd
+        assert cmd.index(PLEX_NVME_PREFERENCES_PATH) < cmd.index("Application Support/Plex Media Server/Preferences.xml")
+
+
+def test_resolve_plex_token_ssh_fallback_and_failure():
+    """Verify fallback when NVMe returns nothing and error when token cannot be resolved."""
+    state: dict[str, str] = {}
+    mock_out = 'PlexOnlineToken="fallback_legacy_token"'
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("tools.plex_audiobook_enricher.os.path.exists", return_value=False),
+        patch("tools.plex_audiobook_enricher._save_state"),
+        patch("tools.plex_audiobook_enricher.nas_config.run_ssh", return_value=(0, mock_out, "")),
+    ):
+        tok = _resolve_plex_token(state)
+        assert tok == "fallback_legacy_token"
+
+    # When SSH returns no token
+    state_empty: dict[str, str] = {}
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("tools.plex_audiobook_enricher.os.path.exists", return_value=False),
+        patch("tools.plex_audiobook_enricher.nas_config.run_ssh", return_value=(0, "", "")),
+        pytest.raises(RuntimeError, match="Unable to resolve PLEX_TOKEN"),
+    ):
+        _resolve_plex_token(state_empty)
+

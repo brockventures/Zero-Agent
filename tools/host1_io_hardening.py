@@ -52,6 +52,7 @@ HEAVY_CONTAINERS: tuple[str, ...] = (
 
 WATCHDOG_BEGIN_MARKER = "# === BEGIN HOST1_IO_SSHD_HARDENING ==="
 WATCHDOG_END_MARKER = "# === END HOST1_IO_SSHD_HARDENING ==="
+HA_NVME_CONFIG_DIR = "/volume2/docker/homeassistant/config"
 
 
 def _resolve_ha_credentials(host: str | None = None) -> tuple[str, str]:
@@ -333,20 +334,29 @@ def apply_recorder_and_btrfs_tuning(
     auto_purge: bool = True,
 ) -> dict[str, Any]:
     """
-    1. On Host 1 (`$DOCKER_ROOT/homeassistant/config`), ensure `chattr +C` (`nodatacow`) is
-       applied to the config directory and SQLite DB directory/files.
+    1. On Host 1 (preferring NVMe `/volume2/docker/homeassistant/config`, falling back to
+       `$DOCKER_ROOT/homeassistant/config` when absent or when explicit `docker_root` is provided),
+       ensure `chattr +C` (`nodatacow`) is applied to the config directory and SQLite DB directory/files.
     2. Configure `recorder:` in `configuration.yaml` with `commit_interval: 30` and
        `auto_purge: true` (preserving all existing configuration.yaml keys and formatting).
     3. Validate Home Assistant config via the HA REST API (`/api/config/core/check_config`).
     """
     target_host = host or nas_config.HOST_1_IP
-    target_root = docker_root or nas_config.DOCKER_ROOT
-    config_dir = f"{target_root.rstrip('/')}/homeassistant/config"
+    if docker_root:
+        explicit_dir = f"{docker_root.rstrip('/')}/homeassistant/config"
+        config_dir_code = f"config_dir = {json.dumps(explicit_dir)}"
+    else:
+        fallback_dir = f"{nas_config.DOCKER_ROOT.rstrip('/')}/homeassistant/config"
+        config_dir_code = (
+            f"nvme_dir = {json.dumps(HA_NVME_CONFIG_DIR)}\n"
+            f"fallback_dir = {json.dumps(fallback_dir)}\n"
+            f"config_dir = nvme_dir if os.path.isdir(nvme_dir) else fallback_dir"
+        )
 
     remote_script = f"""
 import json, os, re, shutil, subprocess
 
-config_dir = {json.dumps(config_dir)}
+{config_dir_code}
 cfg_file = os.path.join(config_dir, "configuration.yaml")
 commit_interval = {int(commit_interval)}
 auto_purge = {bool(auto_purge)}

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 Plex Audiobook Enricher & Cover Badge Engine (`/workspace/tools/plex_audiobook_enricher.py`).
 
@@ -48,6 +49,7 @@ except ImportError:
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 STATE_FILE = DATA_DIR / "audiobook_enricher_state.json"
 COVER_CACHE_DIR = DATA_DIR / "audiobook_covers_clean"
+PLEX_NVME_PREFERENCES_PATH = "/volume2/docker/appdata/plex/Preferences.xml"
 
 # Baseline curated catalog for instant, deterministic enrichment of core library titles
 BOOK_CATALOG: dict[str, dict[str, Any]] = {
@@ -507,9 +509,10 @@ def _resolve_plex_token(state: dict[str, Any]) -> str:
             pass
     if state.get("plex_token"):
         return str(state["plex_token"])
-    # Dynamically query Plex Preferences.xml on Host 1 via SSH
+    # Dynamically query Plex Preferences.xml on Host 1 via SSH (prefer Volume 2 NVMe appdata, fallback to legacy Volume 1 DOCKER_ROOT)
     rc, out, _ = nas_config.run_ssh(
         nas_config.HOST_1_IP,
+        f"sudo grep -o 'PlexOnlineToken=\"[^\"]*\"' '{PLEX_NVME_PREFERENCES_PATH}' 2>/dev/null || "
         f"sudo grep -o 'PlexOnlineToken=\"[^\"]*\"' '{nas_config.DOCKER_ROOT.rsplit('/', 1)[0]}/Plex/Library/Application Support/Plex Media Server/Preferences.xml' 2>/dev/null || "
         f"sudo find {nas_config.DOCKER_ROOT.rsplit('/', 1)[0]} -maxdepth 4 -name 'Preferences.xml' -exec grep -o 'PlexOnlineToken=\"[^\"]*\"' {{}} + 2>/dev/null | head -n 1",
         timeout=20,

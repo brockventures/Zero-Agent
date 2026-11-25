@@ -7,7 +7,9 @@ exclusively per .agents/rules/no_hardcoded_topology.md.
 
 from __future__ import annotations
 
+import base64
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -203,3 +205,60 @@ def test_verify_host1_hardening_raises_when_guardrail_missing():
         pytest.raises(RuntimeError, match="Host 1 hardening verification failed"),
     ):
         h1.verify_host1_hardening(host=TEST_HOST_1, docker_root=TEST_DOCKER_ROOT)
+
+
+def test_apply_recorder_and_btrfs_tuning_prefers_nvme_when_docker_root_none():
+    """Verify remote script evaluates HA_NVME_CONFIG_DIR when docker_root is None."""
+    mock_ssh_out = json.dumps({
+        "config_dir": h1.HA_NVME_CONFIG_DIR,
+        "lsattr": f"---------------C-- {h1.HA_NVME_CONFIG_DIR}",
+        "nodatacow_ok": True,
+        "yaml_changed": False,
+    })
+    with (
+        patch.object(h1.nas_config, "run_ssh", return_value=(0, mock_ssh_out, "")) as mock_ssh,
+        patch.object(h1, "validate_ha_config_via_api", return_value={"ok": True, "result": "valid"}),
+    ):
+        res = h1.apply_recorder_and_btrfs_tuning(
+            host=TEST_HOST_1,
+            docker_root=None,
+            commit_interval=30,
+            auto_purge=True,
+        )
+        assert res["ok"] is True
+        assert res["config_dir"] == h1.HA_NVME_CONFIG_DIR
+        mock_ssh.assert_called_once()
+        raw_cmd = mock_ssh.call_args[0][1]
+        b64_match = re.search(r"base64\.b64decode\('([^']+)'\)", raw_cmd)
+        assert b64_match is not None
+        remote_code = base64.b64decode(b64_match.group(1)).decode("utf-8")
+        assert h1.HA_NVME_CONFIG_DIR in remote_code
+        assert "os.path.isdir(nvme_dir)" in remote_code
+        assert f"{h1.nas_config.DOCKER_ROOT.rstrip('/')}/homeassistant/config" in remote_code
+
+
+def test_apply_recorder_and_btrfs_tuning_honors_explicit_docker_root():
+    """Verify remote script uses explicit docker_root verbatim without fallback."""
+    custom_root = "/mnt/custom_storage/docker"
+    mock_ssh_out = json.dumps({
+        "config_dir": f"{custom_root}/homeassistant/config",
+        "lsattr": f"---------------C-- {custom_root}/homeassistant/config",
+        "nodatacow_ok": True,
+        "yaml_changed": False,
+    })
+    with (
+        patch.object(h1.nas_config, "run_ssh", return_value=(0, mock_ssh_out, "")) as mock_ssh,
+        patch.object(h1, "validate_ha_config_via_api", return_value={"ok": True, "result": "valid"}),
+    ):
+        res = h1.apply_recorder_and_btrfs_tuning(
+            host=TEST_HOST_1,
+            docker_root=custom_root,
+        )
+        assert res["ok"] is True
+        raw_cmd = mock_ssh.call_args[0][1]
+        b64_match = re.search(r"base64\.b64decode\('([^']+)'\)", raw_cmd)
+        assert b64_match is not None
+        remote_code = base64.b64decode(b64_match.group(1)).decode("utf-8")
+        assert f"{custom_root}/homeassistant/config" in remote_code
+        assert "nvme_dir" not in remote_code
+
