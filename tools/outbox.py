@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, FURB122, I001, S110, S112, UP017
 """
 outbox.py - Decoupled Cross-Channel Asynchronous Message Dispatch
 Implements Marvin's atomic JSONL queue pattern (data/outbox/pending.jsonl)
@@ -499,19 +500,33 @@ def _pending_lock_path() -> Path:
     return PENDING_FILE.parent / f".{PENDING_FILE.name}.lock"
 
 
-def flush_pending_messages(channel_filter: int | None = None) -> list[dict]:
+def flush_pending_messages(
+    channel_filter: int | None = None,
+    exclude_channels: set[int] | list[int] | tuple[int, ...] | None = None,
+) -> list[dict]:
     """
     Atomically acquire and drain pending messages for delivery using an exclusive flock.
 
     When `channel_filter` is provided, only lines matching `channel_id == int(channel_filter)`
-    are drained and returned. Unmatched raw JSONL lines are written back verbatim to
-    `pending.jsonl` via temp-file + `os.replace()` without passing through `queue_outbox_message()`,
-    preserving original message IDs, flags, and formatting while preventing cross-container races.
+    are candidates for draining. When `exclude_channels` is provided, any line whose integer
+    `channel_id` is in `exclude_channels` is excluded and preserved verbatim. Unmatched raw
+    JSONL lines are written back verbatim to `pending.jsonl` via temp-file + `os.replace()`
+    without passing through `queue_outbox_message()`, preserving original message IDs, flags,
+    and formatting while preventing cross-container races.
     """
     if not PENDING_FILE.parent.exists():
         return []
 
     filter_cid = int(channel_filter) if channel_filter is not None else None
+    excluded_cids: set[int] = set()
+    if exclude_channels is not None:
+        for cid in exclude_channels:
+            if cid is None or isinstance(cid, bool):
+                continue
+            try:
+                excluded_cids.add(int(cid))
+            except (ValueError, TypeError):
+                continue
     lock_path = _pending_lock_path()
 
     try:
@@ -534,12 +549,21 @@ def flush_pending_messages(channel_filter: int | None = None) -> list[dict]:
                         except Exception:
                             continue
 
-                        if filter_cid is not None:
+                        if filter_cid is not None or excluded_cids:
                             msg_cid = parsed.get("channel_id")
-                            try:
-                                is_match = (msg_cid is not None and int(msg_cid) == filter_cid)
-                            except (ValueError, TypeError):
-                                is_match = False
+                            msg_cid_int: int | None = None
+                            if msg_cid is not None and not isinstance(msg_cid, bool):
+                                try:
+                                    msg_cid_int = int(msg_cid)
+                                except (ValueError, TypeError):
+                                    msg_cid_int = None
+                            passes_filter = (filter_cid is None) or (
+                                msg_cid_int is not None and msg_cid_int == filter_cid
+                            )
+                            passes_exclude = (msg_cid_int is None) or (
+                                msg_cid_int not in excluded_cids
+                            )
+                            is_match = passes_filter and passes_exclude
                             if is_match:
                                 matched_messages.append(parsed)
                             else:
@@ -549,7 +573,7 @@ def flush_pending_messages(channel_filter: int | None = None) -> list[dict]:
                         else:
                             matched_messages.append(parsed)
 
-                if filter_cid is not None and not matched_messages:
+                if (filter_cid is not None or excluded_cids) and not matched_messages:
                     return []
 
                 if unmatched_raw_lines:

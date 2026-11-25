@@ -2151,7 +2151,11 @@ class BridgeScheduler:
         for t in list(self._active_job_tasks):
             t.cancel()
 
-    async def flush_outbox_queue(self, channel_filter: int | None = None):
+    async def flush_outbox_queue(
+        self,
+        channel_filter: int | None = None,
+        exclude_channels: set[int] | list[int] | tuple[int, ...] | None = None,
+    ):
         """Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
         
         Safely drains pending outbox messages with:
@@ -2165,7 +2169,10 @@ class BridgeScheduler:
             return
         try:
             from tools.outbox import flush_pending_messages
-            pending_outbox = flush_pending_messages(channel_filter=channel_filter)
+            pending_outbox = flush_pending_messages(
+                channel_filter=channel_filter,
+                exclude_channels=exclude_channels,
+            )
             if not pending_outbox:
                 return
 
@@ -2465,7 +2472,10 @@ class BridgeScheduler:
                         pass
 
                 # Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
-                await self.flush_outbox_queue()
+                from tools.bridge_state import FORGE_CHANNEL_ID, is_vulcan_delegated
+                await self.flush_outbox_queue(
+                    exclude_channels={FORGE_CHANNEL_ID} if is_vulcan_delegated() else None
+                )
 
                 # Zero-downtime bridge reload trigger
                 reload_flag = DATA_DIR / "reload_bridge.flag"

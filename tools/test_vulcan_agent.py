@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001, I001
 """
 Unit tests for Vulcan standalone agent mode, channel scoping, ForgeSupervisor delegation,
 scheduler lean loop, and Host 2 container provisioner.
@@ -335,6 +336,129 @@ class TestVulcanSchedulerLeanMode(unittest.IsolatedAsyncioTestCase):
         mock_init_db.assert_called_once()
         mock_spawn.assert_called_once()
         mock_flush.assert_awaited_once_with(channel_filter=bs.FORGE_CHANNEL_ID)
+
+    async def test_zero_scheduler_loop_forge_outbox_exclusion(self):
+        zero_chat_id = "1542081375287640084"
+        for delegated_val, expected_exclude in (("1", {bs.FORGE_CHANNEL_ID}), ("0", None)):
+            scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+            scheduler._running = True
+
+            def stop_after_one_sleep(_, sched=scheduler):
+                sched._running = False
+                raise asyncio.CancelledError()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_ROLE": "zero",
+                    "DISCORD_CHANNEL_ID": zero_chat_id,
+                    "VULCAN_DELEGATED": delegated_val,
+                },
+                clear=False,
+            ), \
+                 patch("tools.bridge_state.get_runtime_rules", return_value={}), \
+                 patch.object(scheduler, "_evaluate_and_dispatch_jobs", new_callable=AsyncMock), \
+                 patch.object(scheduler, "_sync_housekeeping"), \
+                 patch.object(scheduler, "flush_outbox_queue", new_callable=AsyncMock) as mock_flush, \
+                 patch("tools.forge.forge_supervisor.tick_sync"), \
+                 patch("asyncio.sleep", side_effect=stop_after_one_sleep):
+                try:
+                    await scheduler._loop()
+                except asyncio.CancelledError:
+                    pass
+
+            mock_flush.assert_awaited_once_with(exclude_channels=expected_exclude)
+
+    async def test_handle_message_forge_reply_isolation_for_zero(self):
+        from unittest.mock import MagicMock
+
+        import tools.bridge_handlers as bh
+
+        bot = AsyncMock()
+        bot.user = MagicMock()
+        bot.user.id = 1542285964213358633
+
+        def make_owner_reply(channel, content: str):
+            msg = MagicMock()
+            msg.id = 999111222
+            msg.type = None
+            msg.content = content
+            msg.created_at = MagicMock()
+            msg.created_at.timestamp.return_value = 9999999999.0
+            msg.author = MagicMock()
+            msg.author.id = bh.OWNER_USER_ID
+            msg.author.bot = False
+            msg.author.display_name = "Ryan"
+            msg.author.name = "ryan"
+            msg.channel = channel
+            resolved = MagicMock()
+            resolved.author = MagicMock()
+            resolved.author.id = bot.user.id
+            resolved.author.bot = True
+            resolved.author.display_name = "Zero"
+            resolved.author.name = "zero"
+            msg.reference = MagicMock()
+            msg.reference.message_id = 1563755730161631280
+            msg.reference.resolved = resolved
+            return msg
+
+        forge_ch = DummyChannel(bs.FORGE_CHANNEL_ID)
+        forge_thread = DummyChannel(777888999, parent_id=bs.FORGE_CHANNEL_ID)
+        baseball_ch = DummyChannel(1548196929308065893)
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_ROLE": "zero",
+                "DISCORD_CHANNEL_ID": "1542081375287640084",
+                "VULCAN_DELEGATED": "1",
+            },
+            clear=False,
+        ), \
+             patch("tools.bridge_state.get_runtime_rules", return_value={}), \
+             patch("tools.bridge_handlers.get_runtime_rules", return_value={}), \
+             patch("tools.channel_history.record_message"), \
+             patch("tools.channel_history.get_recent_messages", return_value=[{}, {}]), \
+             patch("tools.last_word_protocol.unpause_bot"):
+            # 1. Owner inline reply to Zero in #forge without explicit @Zero tag -> dropped
+            with patch("tools.bridge_handlers.route_external_message", new_callable=AsyncMock, return_value=True) as mock_route:
+                await bh.handle_message(
+                    msg=make_owner_reply(forge_ch, "Did that build pass?"),
+                    bot=bot,
+                    home_turn_queue=asyncio.Queue(),
+                    ext_turn_queue=asyncio.Queue(),
+                )
+                mock_route.assert_not_awaited()
+
+            # 2. Owner inline reply to Zero in a #forge thread without explicit @Zero tag -> dropped
+            with patch("tools.bridge_handlers.route_external_message", new_callable=AsyncMock, return_value=True) as mock_route:
+                await bh.handle_message(
+                    msg=make_owner_reply(forge_thread, "Checking thread status"),
+                    bot=bot,
+                    home_turn_queue=asyncio.Queue(),
+                    ext_turn_queue=asyncio.Queue(),
+                )
+                mock_route.assert_not_awaited()
+
+            # 3. Owner explicit @Zero tag in #forge -> preserved
+            with patch("tools.bridge_handlers.route_external_message", new_callable=AsyncMock, return_value=True) as mock_route:
+                await bh.handle_message(
+                    msg=make_owner_reply(forge_ch, "@Zero check this please"),
+                    bot=bot,
+                    home_turn_queue=asyncio.Queue(),
+                    ext_turn_queue=asyncio.Queue(),
+                )
+                mock_route.assert_awaited_once()
+
+            # 4. Owner inline reply to Zero in #baseball without explicit @Zero tag -> preserved
+            with patch("tools.bridge_handlers.route_external_message", new_callable=AsyncMock, return_value=True) as mock_route:
+                await bh.handle_message(
+                    msg=make_owner_reply(baseball_ch, "How about the Cubs?"),
+                    bot=bot,
+                    home_turn_queue=asyncio.Queue(),
+                    ext_turn_queue=asyncio.Queue(),
+                )
+                mock_route.assert_awaited_once()
 
 
 class TestForgeSupervisorResilience(unittest.TestCase):

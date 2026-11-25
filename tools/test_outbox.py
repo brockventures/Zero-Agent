@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, I001, PLR0402
 import os
 import sys
 import json
@@ -454,6 +455,73 @@ class TestOutboxAtomicPartitioning(unittest.TestCase):
         drained_rest = outbox.flush_pending_messages()
         self.assertEqual([m["id"] for m in drained_rest], ["outbox-orig-zero-1", "outbox-orig-lounge-1"])
         self.assertEqual(drained_rest[0]["custom_meta"], "keep-me")
+        self.assertFalse(outbox.PENDING_FILE.exists())
+
+    def test_flush_pending_messages_exclude_channels_preserves_excluded_raw_jsonl(self):
+        """Verify exclude_channels drains non-excluded items, preserves excluded raw JSONL, and avoids rewrite when empty."""
+        forge_cid = 1562899941595160657
+        zero_cid = 1542081375287640084
+        lounge_cid = 1534452820995080192
+
+        raw_zero = json.dumps({
+            "id": "outbox-excl-zero-1",
+            "channel": "zero-chat",
+            "channel_id": zero_cid,
+            "content": "Zero message",
+        })
+        raw_forge = json.dumps({
+            "id": "outbox-excl-forge-1",
+            "channel": "forge",
+            "channel_id": forge_cid,
+            "content": "Vulcan-owned #forge message",
+            "custom_meta": "keep-verbatim",
+        })
+        raw_lounge = json.dumps({
+            "id": "outbox-excl-lounge-1",
+            "channel": "lounge",
+            "channel_id": lounge_cid,
+            "content": "Lounge message",
+        })
+        raw_no_cid = json.dumps({
+            "id": "outbox-excl-nocid-1",
+            "channel": "legacy",
+            "content": "Missing channel_id payload",
+        })
+        outbox.PENDING_FILE.write_text(
+            f"{raw_zero}\n{raw_forge}\n{raw_lounge}\n{raw_no_cid}\n",
+            encoding="utf-8",
+        )
+
+        drained = outbox.flush_pending_messages(
+            exclude_channels=[forge_cid, None, True, "not-an-int"]  # type: ignore[list-item]
+        )
+        self.assertEqual(
+            [m["id"] for m in drained],
+            ["outbox-excl-zero-1", "outbox-excl-lounge-1", "outbox-excl-nocid-1"],
+        )
+        self.assertEqual(outbox.PENDING_FILE.read_text(encoding="utf-8"), f"{raw_forge}\n")
+
+        # Flushing again when only excluded items exist returns [] without rewriting pending.jsonl
+        stat_before = outbox.PENDING_FILE.stat()
+        with patch("os.replace") as mock_replace:
+            drained_again = outbox.flush_pending_messages(exclude_channels={forge_cid})
+        self.assertEqual(drained_again, [])
+        mock_replace.assert_not_called()
+        self.assertEqual(outbox.PENDING_FILE.read_text(encoding="utf-8"), f"{raw_forge}\n")
+        self.assertEqual(outbox.PENDING_FILE.stat().st_ino, stat_before.st_ino)
+
+        # Combining channel_filter and exclude_channels requires both predicates to pass
+        with patch("os.replace") as mock_replace:
+            drained_conflict = outbox.flush_pending_messages(
+                channel_filter=forge_cid,
+                exclude_channels={forge_cid},
+            )
+        self.assertEqual(drained_conflict, [])
+        mock_replace.assert_not_called()
+
+        # Vulcan's channel_filter=forge_cid drains the remaining #forge item
+        drained_forge = outbox.flush_pending_messages(channel_filter=forge_cid)
+        self.assertEqual([m["id"] for m in drained_forge], ["outbox-excl-forge-1"])
         self.assertFalse(outbox.PENDING_FILE.exists())
 
     def test_flush_pending_messages_concurrent_partitioned_flushes_no_message_loss(self):

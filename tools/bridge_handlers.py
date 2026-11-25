@@ -44,6 +44,7 @@ from tools.bridge_state import (
     RESTART_INTENT_FILE,
     SESSIONS_FILE,
     TARGET_CHANNEL_ID,
+    FORGE_CHANNEL_ID,
     OWNER_USER_ID,
     get_runtime_rules,
     update_beacon,
@@ -52,6 +53,7 @@ from tools.bridge_state import (
     is_excluded_channel,
     is_reply_to_zero,
     is_vulcan_agent,
+    is_vulcan_delegated,
     IVY_USER_ID,
 )
 from tools.bridge_formatting import (
@@ -1199,7 +1201,14 @@ async def handle_message(
             except Exception as ue:
                 print(f"[Bridge] Warning unpausing Ivy on owner message: {ue}")
 
-            if not has_explicit_tag and not reply_to_zero:
+            is_forge_ch = (
+                getattr(msg.channel, "id", None) == FORGE_CHANNEL_ID
+                or getattr(msg.channel, "parent_id", None) == FORGE_CHANNEL_ID
+            )
+            if not is_vulcan_agent() and is_vulcan_delegated() and is_forge_ch:
+                if not has_explicit_tag:
+                    return
+            elif not has_explicit_tag and not reply_to_zero:
                 return
 
         elif author_id == IVY_USER_ID:
