@@ -18,6 +18,7 @@ PT = ZoneInfo("America/Los_Angeles")
 RETENTION_DAYS = 14
 HA_NVME_ROOT = "/volume2/docker/homeassistant"
 HOMEBRIDGE_NVME_ROOT = "/volume2/docker/homebridge"
+APPDATA_NVME_ROOT = "/volume2/docker/appdata"
 
 for _p in ["/workspace", "/workspace/tools"]:
     if _p not in sys.path:
@@ -42,12 +43,21 @@ def prune_old_backups(dir_path: str, days: int = RETENTION_DAYS) -> int:
 
 def backup_postgres_arr(ts: str) -> tuple[bool, str]:
     dest = f"/volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz"
-    cmd = f"sudo docker exec postgres-arr pg_dumpall -U postgres | gzip > '{dest}'"
+    cmd = f"bash -o pipefail -c \"sudo docker exec postgres-arr pg_dumpall -U postgres | gzip > '{dest}'\""
     code, _, stderr = run_ssh(cmd, timeout=180)
     if code != 0:
         run_ssh(f"rm -f '{dest}'")
         return False, f"pg_dumpall failed (code {code}): {stderr.strip()}"
-    
+
+    code_stat, size_bytes_out, _ = run_ssh(f"stat -c %s '{dest}' 2>/dev/null || echo 0")
+    try:
+        dump_bytes = int(size_bytes_out.strip().splitlines()[-1]) if size_bytes_out.strip() else 0
+    except ValueError:
+        dump_bytes = 0
+    if code_stat != 0 or dump_bytes < 1024:
+        run_ssh(f"rm -f '{dest}'")
+        return False, f"pg_dumpall archive too small ({dump_bytes} bytes)"
+
     _, size_out, _ = run_ssh(f"ls -lh '{dest}' | awk '{{print $5}}'")
     return True, f"postgres-arr -> {dest} ({size_out.strip()})"
 
@@ -126,26 +136,30 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
         run_ssh(f"rm -f '{dest_compose}'")
         return False, f"docker-compose copy failed (code {code_cp}): {stderr_cp.strip()}"
 
-    # 2. Checkpoint SQLite WAL databases before archiving (Dockhand, Seerr, Tautulli, Maintainerr)
+    # 2. Checkpoint SQLite WAL databases before archiving (Dockhand on Vol 1, Wave 2 NVMe DBs on Vol 2)
     cmd_ckpt = (
         f"for db in "
         f"'{DOCKER_ROOT}/appdata/dockhand/db/dockhand.db' "
-        f"'{DOCKER_ROOT}/appdata/seerr/db/db.sqlite3' "
-        f"'{DOCKER_ROOT}/appdata/tautulli/tautulli.db' "
-        f"'{DOCKER_ROOT}/appdata/maintainerr/maintainerr.sqlite'; do "
+        f"'{APPDATA_NVME_ROOT}/seerr/db/db.sqlite3' "
+        f"'{APPDATA_NVME_ROOT}/tautulli/tautulli.db' "
+        f"'{APPDATA_NVME_ROOT}/maintainerr/maintainerr.sqlite' "
+        f"'{APPDATA_NVME_ROOT}/bazarr/db/bazarr.db'; do "
         f"[ -f \"$db\" ] && sudo sqlite3 \"$db\" 'PRAGMA wal_checkpoint(PASSIVE);' >/dev/null 2>&1 || true; "
         f"done"
     )
     run_ssh(cmd_ckpt, timeout=30)
 
-    # 3. Tar critical lightweight appdata configs (maintainerr, seerr, tautulli, dockhand)
-    # Exclude internal backups, cache, transcode, and logs to avoid disk stall;
+    # 3. Tar critical lightweight appdata configs (Wave 2 NVMe services + Vol 1 dockhand)
+    # Exclude internal backups, cache, MediaCover, transcode, and logs to avoid disk stall;
     # use --warning=no-file-changed and allow GNU tar exit code 1 (live WAL/file mutation during read)
     cmd_tar = (
-        f"sudo tar --warning=no-file-changed --exclude='backups' --exclude='cache' --exclude='Transcode' "
-        f"--exclude='logs' --exclude='*.log' "
-        f"-czf '{dest_tar}' -C '{DOCKER_ROOT}/appdata' "
-        f"maintainerr seerr tautulli dockhand"
+        f"sudo tar --warning=no-file-changed "
+        f"--exclude='backups' --exclude='backup' --exclude='Backups' "
+        f"--exclude='cache' --exclude='.cache' --exclude='MediaCover' "
+        f"--exclude='Transcode' --exclude='logs' --exclude='log' --exclude='*.log' "
+        f"-czf '{dest_tar}' -C '{APPDATA_NVME_ROOT}' "
+        f"maintainerr seerr tautulli bazarr sonarr/config.xml radarr/config.xml prowlarr/config.xml "
+        f"-C '{DOCKER_ROOT}/appdata' dockhand"
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=180)
     if code not in (0, 1):

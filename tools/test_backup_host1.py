@@ -398,3 +398,201 @@ def test_backup_home_assistant_db_failure_cleans_up():
     assert "code 1" in msg_zb
     assert f"rm -f '/volumeUSB1/usbshare/backups/homeassistant/zigbee_db_{ts}.db'" in cmds_zb_fail
     assert not any("smarthome_radios" in c for c in cmds_zb_fail)
+
+
+def test_backup_postgres_arr_success():
+    """Verify pipefail pg_dumpall, >= 1024B size verification, and return message."""
+    calls: list[tuple[str, int | None]] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        calls.append((cmd, timeout))
+        if "pg_dumpall" in cmd:
+            return 0, "", ""
+        if cmd.startswith("stat -c %s"):
+            return 0, "4096\n", ""
+        if cmd.startswith("ls -lh"):
+            return 0, "4.0K\n", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_postgres_arr(ts)
+
+    assert ok is True
+    assert msg == f"postgres-arr -> /volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz (4.0K)"
+
+    dump_cmd, dump_timeout = calls[0]
+    assert "bash -o pipefail -c" in dump_cmd
+    assert "sudo docker exec postgres-arr pg_dumpall -U postgres | gzip >" in dump_cmd
+    assert f"/volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz" in dump_cmd
+    assert dump_timeout == 180
+
+    stat_cmd, _ = calls[1]
+    assert f"stat -c %s '/volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz'" in stat_cmd
+
+
+def test_backup_postgres_arr_dump_failure_cleans_up():
+    """Verify non-zero pipefail pg_dumpall removes dest and returns (False, ...)."""
+    cmds: list[str] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        cmds.append(cmd)
+        if "pg_dumpall" in cmd:
+            return 2, "", "pg_dumpall: error: connection failed"
+        if cmd.startswith("rm -f"):
+            return 0, "", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_postgres_arr(ts)
+
+    assert ok is False
+    assert "code 2" in msg
+    assert f"rm -f '/volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz'" in cmds
+    assert not any(c.startswith("stat -c %s") for c in cmds)
+
+
+def test_backup_postgres_arr_small_dump_fails_and_cleans_up():
+    """Verify dump < 1024 bytes triggers rm -f cleanup and returns (False, ...)."""
+    cmds: list[str] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        cmds.append(cmd)
+        if "pg_dumpall" in cmd:
+            return 0, "", ""
+        if cmd.startswith("stat -c %s"):
+            return 0, "512\n", ""
+        if cmd.startswith("rm -f"):
+            return 0, "", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_postgres_arr(ts)
+
+    assert ok is False
+    assert "512" in msg
+    assert f"rm -f '/volumeUSB1/usbshare/backups/postgres-arr/arr_{ts}.sql.gz'" in cmds
+
+
+def test_backup_docker_appdata_success():
+    """Verify compose copy, NVMe + Vol1 SQLite checkpoints, and multi--C tar archive."""
+    calls: list[tuple[str, int | None]] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        calls.append((cmd, timeout))
+        if cmd.startswith("cp "):
+            return 0, "", ""
+        if "PRAGMA wal_checkpoint" in cmd:
+            return 0, "", ""
+        if "sudo tar" in cmd:
+            return 0, "", ""
+        if cmd.startswith("ls -lh"):
+            return 0, "docker-compose 4K appdata_critical 18M\n", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_docker_appdata(ts)
+
+    assert ok is True
+    dest_compose = f"/volumeUSB1/usbshare/backups/docker-appdata/docker-compose_{ts}.yml"
+    dest_tar = f"/volumeUSB1/usbshare/backups/docker-appdata/appdata_critical_{ts}.tar.gz"
+    assert msg == f"docker-appdata -> {dest_compose} & {dest_tar}"
+
+    cp_cmd, cp_timeout = calls[0]
+    assert cp_cmd == f"cp '{backup_host1.DOCKER_ROOT}/appdata/docker-compose.yml' '{dest_compose}'"
+    assert cp_timeout == 30
+
+    ckpt_cmd, ckpt_timeout = calls[1]
+    assert ckpt_timeout == 30
+    for db_path in (
+        f"'{backup_host1.DOCKER_ROOT}/appdata/dockhand/db/dockhand.db'",
+        "'/volume2/docker/appdata/seerr/db/db.sqlite3'",
+        "'/volume2/docker/appdata/tautulli/tautulli.db'",
+        "'/volume2/docker/appdata/maintainerr/maintainerr.sqlite'",
+        "'/volume2/docker/appdata/bazarr/db/bazarr.db'",
+    ):
+        assert db_path in ckpt_cmd
+
+    tar_cmd, tar_timeout = calls[2]
+    assert tar_timeout == 180
+    assert "--warning=no-file-changed" in tar_cmd
+    for excl in (
+        "--exclude='backups'",
+        "--exclude='backup'",
+        "--exclude='Backups'",
+        "--exclude='cache'",
+        "--exclude='.cache'",
+        "--exclude='MediaCover'",
+        "--exclude='Transcode'",
+        "--exclude='logs'",
+        "--exclude='log'",
+        "--exclude='*.log'",
+    ):
+        assert excl in tar_cmd
+    expected_members = (
+        f"-C '/volume2/docker/appdata' "
+        f"maintainerr seerr tautulli bazarr sonarr/config.xml radarr/config.xml prowlarr/config.xml "
+        f"-C '{backup_host1.DOCKER_ROOT}/appdata' dockhand"
+    )
+    assert expected_members in tar_cmd
+
+
+def test_backup_docker_appdata_allows_tar_rc_1_fails_rc_2():
+    """Verify GNU tar rc=1 succeeds and rc=2 removes dest_tar and returns (False, ...)."""
+    ts = "20261125_034500"
+
+    def make_fake_ssh(tar_rc: int, cmds: list[str]):
+        def fake_run_ssh(cmd: str, timeout: int = 180):
+            cmds.append(cmd)
+            if cmd.startswith("cp "):
+                return 0, "", ""
+            if "PRAGMA wal_checkpoint" in cmd:
+                return 0, "", ""
+            if "sudo tar" in cmd:
+                return tar_rc, "", "file changed" if tar_rc == 1 else "fatal tar error"
+            if cmd.startswith("ls -lh"):
+                return 0, "ok 10M\n", ""
+            if cmd.startswith("rm -f"):
+                return 0, "", ""
+            raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+        return fake_run_ssh
+
+    cmds_rc1: list[str] = []
+    with patch.object(backup_host1, "run_ssh", side_effect=make_fake_ssh(1, cmds_rc1)):
+        ok1, msg1 = backup_host1.backup_docker_appdata(ts)
+    assert ok1 is True
+    assert "docker-appdata ->" in msg1
+
+    cmds_rc2: list[str] = []
+    with patch.object(backup_host1, "run_ssh", side_effect=make_fake_ssh(2, cmds_rc2)):
+        ok2, msg2 = backup_host1.backup_docker_appdata(ts)
+    assert ok2 is False
+    assert "code 2" in msg2
+    assert f"rm -f '/volumeUSB1/usbshare/backups/docker-appdata/appdata_critical_{ts}.tar.gz'" in cmds_rc2
+
+
+def test_backup_docker_appdata_compose_copy_failure_cleans_up():
+    """Verify failed docker-compose.yml copy removes dest_compose and aborts before checkpoint/tar."""
+    cmds: list[str] = []
+    ts = "20261125_034500"
+
+    def fake_run_ssh(cmd: str, timeout: int = 180):
+        cmds.append(cmd)
+        if cmd.startswith("cp "):
+            return 1, "", "cp: cannot stat"
+        if cmd.startswith("rm -f"):
+            return 0, "", ""
+        raise AssertionError(f"Unexpected SSH command: {cmd}")
+
+    with patch.object(backup_host1, "run_ssh", side_effect=fake_run_ssh):
+        ok, msg = backup_host1.backup_docker_appdata(ts)
+
+    assert ok is False
+    assert "code 1" in msg
+    assert f"rm -f '/volumeUSB1/usbshare/backups/docker-appdata/docker-compose_{ts}.yml'" in cmds
+    assert not any("PRAGMA wal_checkpoint" in c for c in cmds)
+    assert not any("sudo tar" in c for c in cmds)
