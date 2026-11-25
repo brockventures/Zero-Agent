@@ -125,6 +125,13 @@ CORE_INFRA_PREFLIGHT_PATHS = (
     "tools/batch_guard.py",
     "tools/nas_config.py",
 )
+AUTO_DEPLOY_REPO_HOOKS: dict[str, dict[str, Any]] = {
+    "mirrormere": {
+        "name": "Auto-Deploy Hearth to Host 2",
+        "command": "python3 /workspace/tools/deploy_hearth.py",
+        "timeout": 600,
+    },
+}
 DEFAULT_LEASE_TTL_SECONDS = 300.0
 
 WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
@@ -7269,7 +7276,11 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
     return warnings
 
 
-def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> str:
+def format_origin_completion_envelope(
+    build_id: str,
+    db_path: Path | str = FORGE_DB_PATH,
+    autodeploy_result: dict | None = None,
+) -> str:
     """Format the structured FORGE Completion Envelope sent to the originating channel Orchestrator."""
     with get_db_connection(db_path) as conn:
         build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
@@ -7333,6 +7344,25 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
         if build["touches_core_bridge"]
         else ""
     )
+    autodeploy_note = ""
+    if isinstance(autodeploy_result, dict):
+        ad_status = autodeploy_result.get("status")
+        if ad_status == "triggered":
+            task_id = autodeploy_result.get("task_id")
+            task_tag = f" (task `{task_id}`)" if task_id else ""
+            autodeploy_note = (
+                f"\nAuto-deploy triggered for this repository{task_tag}; "
+                "a completion wakeup will follow once Host 2 deploy and health checks finish."
+            )
+        elif ad_status == "deferred":
+            autodeploy_note = (
+                "\nAuto-deploy was deferred because another build for this repository is currently "
+                "queued, running, or awaiting approval; it will deploy once the final queued build finishes."
+            )
+        elif ad_status == "error":
+            err_msg = autodeploy_result.get("error") or "unknown error"
+            autodeploy_note = f"\nAuto-deploy hook failed to launch ({err_msg})."
+
     lines.append(
         "\nEvaluate the completed build ledger above against the original user request. "
         "Deliver a brief, single-message completion summary (1 short paragraph or 2–3 bullets, under 120 words) "
@@ -7340,6 +7370,7 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
         "Do NOT mention Python file names, function/method names, database table/column names, CSS/DOM selectors, "
         "internal variable names, FORGE build IDs, commit SHAs, or unit test pass counts unless Ryan explicitly asked where something lives in the code."
         + reload_note
+        + autodeploy_note
     )
     return "\n".join(lines)
 
@@ -7445,6 +7476,71 @@ def post_pending_decision_cards(
     return posted
 
 
+def _normalize_repo_basename(repo: str | Path | None) -> str:
+    """Return normalized lowercase basename for a repository path or URL."""
+    raw = str(repo or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    name = Path(raw).name.lower()
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+
+def _maybe_trigger_post_merge_autodeploy(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
+    """Trigger configured post-merge auto-deploy job unless opted out or a sibling build is active."""
+    with get_db_connection(db_path) as conn:
+        build = conn.execute(
+            "SELECT id, repo, plan_json, origin_channel_id, origin_thread_id FROM forge_builds WHERE id = ?",
+            (build_id,),
+        ).fetchone()
+        if not build:
+            return {"status": "none"}
+
+        repo_key = _normalize_repo_basename(build["repo"])
+        hook = AUTO_DEPLOY_REPO_HOOKS.get(repo_key)
+        if not hook:
+            return {"status": "none"}
+
+        try:
+            plan_data = json.loads(build["plan_json"] or "{}")
+        except Exception:
+            plan_data = {}
+        if isinstance(plan_data, dict):
+            opt_val = plan_data.get("auto_deploy")
+            if opt_val is False or (isinstance(opt_val, str) and opt_val.strip().lower() == "false"):
+                return {"status": "none"}
+
+        active_siblings = conn.execute(
+            """
+            SELECT id, repo FROM forge_builds
+            WHERE id != ? AND status IN ('queued', 'running', 'awaiting_approval')
+            """,
+            (build_id,),
+        ).fetchall()
+        for sib in active_siblings:
+            if _normalize_repo_basename(sib["repo"]) == repo_key:
+                return {"status": "deferred", "reason": "sibling_build_active"}
+
+        target_ch = build["origin_thread_id"] or build["origin_channel_id"] or get_default_origin_channel()
+
+    try:
+        meta = start_job(
+            command=hook["command"],
+            channel=str(target_ch),
+            name=hook["name"],
+            timeout=hook["timeout"],
+            cwd=str(WORKSPACE_DIR),
+            notify_on_success=True,
+            synthesize=True,
+            db_path=db_path,
+        )
+        return {"status": "triggered", "task_id": meta.get("task_id") if isinstance(meta, dict) else None}
+    except Exception as e:
+        print(f"[FORGE] Warning launching auto-deploy hook for {build_id}: {e}")
+        return {"status": "error", "error": str(e)}
+
+
 def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> bool:
     """Wake the Argon Orchestrator in the originating channel/thread when all chunks complete."""
     with get_db_connection(db_path) as conn:
@@ -7452,7 +7548,12 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
         if not build:
             return False
 
-    envelope = format_origin_completion_envelope(build_id, db_path=db_path)
+    autodeploy_result = _maybe_trigger_post_merge_autodeploy(build_id, db_path=db_path)
+    envelope = format_origin_completion_envelope(
+        build_id,
+        db_path=db_path,
+        autodeploy_result=autodeploy_result,
+    )
     target_ch = build["origin_thread_id"] or build["origin_channel_id"]
     if build["touches_core_bridge"]:
         try:
