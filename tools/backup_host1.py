@@ -4,7 +4,7 @@ backup_host1.py — Automated local backup runner for Host 1 stateful services.
 Targets the ext4 USB volume at /volumeUSB1/usbshare/backups/.
 Backs up:
   - postgres-arr (PostgreSQL pg_dumpall: Sonarr, Radarr, Prowlarr)
-  - homeassistant (HA config, .storage, automations, credentials + SQLite DB)
+  - homeassistant (Volume 2 NVMe HA config, .storage, SQLite/Zigbee DBs, Matter/OTBR/Z-Wave/go2rtc & Homebridge)
   - docker-appdata (docker-compose.yml + critical lightweight configs)
   - wordpress (Volume 2 NVMe MariaDB wp01/wp02 dumps + site files & stack configs)
 Enforces a 14-day rolling retention policy.
@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
 RETENTION_DAYS = 14
+HA_NVME_ROOT = "/volume2/docker/homeassistant"
+HOMEBRIDGE_NVME_ROOT = "/volume2/docker/homebridge"
 
 for _p in ["/workspace", "/workspace/tools"]:
     if _p not in sys.path:
@@ -50,14 +52,17 @@ def backup_postgres_arr(ts: str) -> tuple[bool, str]:
     return True, f"postgres-arr -> {dest} ({size_out.strip()})"
 
 def backup_home_assistant(ts: str) -> tuple[bool, str]:
-    dest_config = f"/volumeUSB1/usbshare/backups/homeassistant/ha_config_{ts}.tar.gz"
-    dest_db = f"/volumeUSB1/usbshare/backups/homeassistant/ha_db_{ts}.db"
+    ha_backup_dir = "/volumeUSB1/usbshare/backups/homeassistant"
+    dest_config = f"{ha_backup_dir}/ha_config_{ts}.tar.gz"
+    dest_db = f"{ha_backup_dir}/ha_db_{ts}.db"
+    dest_zigbee = f"{ha_backup_dir}/zigbee_db_{ts}.db"
+    dest_radios = f"{ha_backup_dir}/smarthome_radios_{ts}.tar.gz"
 
-    # 1. Config tarball (.storage, automations, cloud, yaml)
+    # 1. Config tarball (.storage, automations, cloud, yaml) from Volume 2 NVMe
     cmd_tar = (
         f"sudo tar --warning=no-file-changed --exclude='.git' --exclude='.cache' --exclude='backups' "
         f"--exclude='*.db*' --exclude='*.log' "
-        f"-czf '{dest_config}' -C '{DOCKER_ROOT}/homeassistant/config' ."
+        f"-czf '{dest_config}' -C '{HA_NVME_ROOT}/config' ."
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=120)
     if code not in (0, 1):
@@ -65,14 +70,50 @@ def backup_home_assistant(ts: str) -> tuple[bool, str]:
         return False, f"ha config tar failed (code {code}): {stderr.strip()}"
 
     # 2. SQLite WAL-safe backup of history database
-    cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/homeassistant/config/home-assistant_v2.db' \".backup '{dest_db}'\""
+    cmd_db = f"sudo sqlite3 '{HA_NVME_ROOT}/config/home-assistant_v2.db' \".backup '{dest_db}'\""
     code_db, _, stderr_db = run_ssh(cmd_db, timeout=240)
     if code_db != 0:
         run_ssh(f"rm -f '{dest_db}'")
         return False, f"ha sqlite db backup failed (code {code_db}): {stderr_db.strip()}"
 
-    _, _, _ = run_ssh(f"ls -lh '{dest_config}' '{dest_db}' | awk '{{print $9, $5}}'")
-    return True, f"homeassistant -> {dest_config} & {dest_db}"
+    # 3. SQLite WAL-safe backup of Zigbee coordinator database (if present)
+    zigbee_src = f"{HA_NVME_ROOT}/config/zigbee.db"
+    cmd_zigbee = (
+        f"if sudo test -f '{zigbee_src}'; then "
+        f"sudo sqlite3 '{zigbee_src}' \".backup '{dest_zigbee}'\"; "
+        f"else echo '__MISSING__'; fi"
+    )
+    code_zb, stdout_zb, stderr_zb = run_ssh(cmd_zigbee, timeout=120)
+    if code_zb != 0:
+        run_ssh(f"rm -f '{dest_zigbee}'")
+        return False, f"zigbee sqlite db backup failed (code {code_zb}): {stderr_zb.strip()}"
+    zigbee_backed_up = "__MISSING__" not in (stdout_zb or "")
+
+    # 4. Smart-home companion & radio configs tarball (Matter, OTBR, Z-Wave, go2rtc, Homebridge)
+    nvme_docker_parent = HA_NVME_ROOT.rsplit("/", 1)[0]
+    ha_dir_name = HA_NVME_ROOT.rsplit("/", 1)[-1]
+    hb_dir_name = HOMEBRIDGE_NVME_ROOT.rsplit("/", 1)[-1]
+    cmd_radios = (
+        f"sudo tar --warning=no-file-changed --exclude='*.lock' "
+        f"--exclude='{hb_dir_name}/node_modules' --exclude='{hb_dir_name}/homebridge.log' --exclude='*.log' "
+        f"-czf '{dest_radios}' -C '{nvme_docker_parent}' "
+        f"{ha_dir_name}/matter-server {ha_dir_name}/otbr-data {ha_dir_name}/otbr-start.sh "
+        f"{ha_dir_name}/zwave-js-ui {ha_dir_name}/go2rtc.yaml {hb_dir_name}"
+    )
+    code_radios, _, stderr_radios = run_ssh(cmd_radios, timeout=180)
+    if code_radios not in (0, 1):
+        run_ssh(f"rm -f '{dest_radios}'")
+        return False, f"smarthome radios tar failed (code {code_radios}): {stderr_radios.strip()}"
+
+    backed_up = [dest_config, dest_db]
+    if zigbee_backed_up:
+        backed_up.append(dest_zigbee)
+    backed_up.append(dest_radios)
+    ls_targets = " ".join(f"'{p}'" for p in backed_up)
+    _, size_out, _ = run_ssh(f"ls -lh {ls_targets} | awk '{{print $9, $5}}'")
+    summary = " & ".join(backed_up)
+    size_suffix = f" ({size_out.strip()})" if size_out.strip() else ""
+    return True, f"homeassistant -> {summary}{size_suffix}"
 
 def backup_docker_appdata(ts: str) -> tuple[bool, str]:
     dest_compose = f"/volumeUSB1/usbshare/backups/docker-appdata/docker-compose_{ts}.yml"
@@ -196,7 +237,7 @@ def main():
         print(f"  {'✅' if ok else '❌'} {msg}")
 
     if not quiet:
-        print("• Backing up Home Assistant (config + credentials)...")
+        print("• Backing up Home Assistant & Smart Home stack (Volume 2 NVMe)...")
     ok, msg = backup_home_assistant(ts)
     results["home_assistant"] = (ok, msg)
     if not quiet:

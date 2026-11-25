@@ -18,13 +18,22 @@ except ImportError:
 
 HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
+HA_NVME_ROOT = "/volume2/docker/homeassistant"
 
 
 def run_ssh(cmd_str: str, timeout: int = 180) -> str:
-    code, stdout, stderr = _nas_run_ssh(
+    _code, stdout, _stderr = _nas_run_ssh(
         HOST_1_IP, cmd_str, timeout=timeout, user=SSH_USER, port=SSH_PORT, key=SSH_KEY
     )
     return stdout.strip()
+
+
+def resolve_ha_data_root() -> str:
+    """Prefer Wave 1 NVMe Smart Home path when present on Host 1, falling back to DOCKER_ROOT."""
+    probe = run_ssh(
+        f"[ -d '{HA_NVME_ROOT}/config' ] && echo '{HA_NVME_ROOT}' || echo '{DOCKER_ROOT}/homeassistant'"
+    )
+    return probe or f"{DOCKER_ROOT}/homeassistant"
 
 
 def get_installed_ha_version() -> str:
@@ -42,7 +51,7 @@ def get_latest_ha_stable() -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
             return data.get("homeassistant", {}).get("default", "unknown").lstrip("v")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "unknown"
 
 
@@ -65,16 +74,20 @@ def check_updates(quiet: bool = False):
     updates_available = []
 
     # 1. Home Assistant Core Check
-    if ha_curr != "unknown" and ha_latest != "unknown" and ha_curr != ha_latest:
-        if is_patch_stable(ha_latest):
-            updates_available.append(
-                {
-                    "service": "Home Assistant Core",
-                    "installed": ha_curr,
-                    "latest": ha_latest,
-                    "notes": "https://www.home-assistant.io/blog/",
-                }
-            )
+    if (
+        ha_curr != "unknown"
+        and ha_latest != "unknown"
+        and ha_curr != ha_latest
+        and is_patch_stable(ha_latest)
+    ):
+        updates_available.append(
+            {
+                "service": "Home Assistant Core",
+                "installed": ha_curr,
+                "latest": ha_latest,
+                "notes": "https://www.home-assistant.io/blog/",
+            }
+        )
 
     # Output results
     if updates_available:
@@ -101,7 +114,7 @@ def check_updates(quiet: bool = False):
                 post_to_discord=True,
             )
             decision_staged = True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             msg += f"\n\n[CHOICES: Backup & Upgrade Smart Home Stack | Snooze 1 Week | Skip] ({e})"
 
         if not (quiet and decision_staged):
@@ -122,19 +135,20 @@ def perform_upgrade(target_service: str = "all"):
 
     # 1. Snapshot stateful directories & DB
     print("1. Creating snapshot backups of HA config, Matter fabric, and Thread credentials...")
+    ha_data_root = resolve_ha_data_root()
     backup_tar = f"{backup_dir}/smart_home_pre_upgrade_{ts}.tar.gz"
     backup_cmd = (
         f"tar --exclude='home-assistant_v2.db*' --exclude='*.log*' --exclude='.cloud' "
         f"--exclude='backups' --exclude='.git' --exclude='.cache' "
         f"-czf '{backup_tar}' "
-        f"-C '{DOCKER_ROOT}/homeassistant' config matter-server otbr-data zwave-js-ui 2>/dev/null || true"
+        f"-C '{ha_data_root}' config matter-server otbr-data zwave-js-ui 2>/dev/null || true"
     )
     run_ssh(backup_cmd, timeout=180)
 
     # SQLite WAL-safe backup of HA DB
     backup_db = f"{backup_dir}/ha_db_pre_upgrade_{ts}.db"
     run_ssh(
-        f"sqlite3 '{DOCKER_ROOT}/homeassistant/config/home-assistant_v2.db' \".backup '{backup_db}'\" 2>/dev/null || true",
+        f"sqlite3 '{ha_data_root}/config/home-assistant_v2.db' \".backup '{backup_db}'\" 2>/dev/null || true",
         timeout=240,
     )
 

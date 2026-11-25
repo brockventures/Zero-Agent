@@ -2738,8 +2738,10 @@ def check_slzb_stable_release(force: bool = False) -> dict:
     )
 
     outer_py = (
-        f"import base64, json, subprocess, sys\n"
-        f"cfg_path = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
+        f"import base64, json, os, subprocess, sys\n"
+        f"nvme_cfg = '/volume2/docker/homeassistant/config/.storage/core.config_entries'\n"
+        f"fallback_cfg = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
+        f"cfg_path = nvme_cfg if os.path.exists(nvme_cfg) else fallback_cfg\n"
         f"try:\n"
         f"    with open(cfg_path, 'r', encoding='utf-8') as f:\n"
         f"        data = json.load(f)\n"
@@ -2880,8 +2882,10 @@ def flash_slzb_stable() -> tuple[bool, str]:
     )
 
     outer_flash_py = (
-        f"import base64, json, subprocess, sys\n"
-        f"cfg_path = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
+        f"import base64, json, os, subprocess, sys\n"
+        f"nvme_cfg = '/volume2/docker/homeassistant/config/.storage/core.config_entries'\n"
+        f"fallback_cfg = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
+        f"cfg_path = nvme_cfg if os.path.exists(nvme_cfg) else fallback_cfg\n"
         f"try:\n"
         f"    with open(cfg_path, 'r', encoding='utf-8') as f:\n"
         f"        data = json.load(f)\n"
