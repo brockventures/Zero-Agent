@@ -553,7 +553,7 @@ def prepare_turn_prompt(
 
     anti_leak_guidance = (
         "[Bridge Execution Invariant - Strictly Zero Internal Chatter Leaks]:\n"
-        "• Never choose SDK Option B or emit intermediate wait/status chatter; stop calling tools silently while waiting for background tasks, and reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).\n"
+        "• Reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).\n"
         "• Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals into visible response text; output ONLY the final user-facing message."
         f"{early_ack_bullet}"
     )

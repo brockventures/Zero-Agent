@@ -139,6 +139,21 @@ class TestBridgePipelinePrompt(unittest.TestCase):
         self.assertIn("Pacific Time (PT)", prompt)
         self.assertIn("Hello Zero", prompt)
 
+    def test_prepare_turn_prompt_omits_option_b_silence_trigger_and_preserves_no_reply(self):
+        prompt = prepare_turn_prompt(
+            prompt="Run background task check",
+            mode="home",
+            channel_id=1542081375287640084,
+            sess_key="home",
+        )
+        self.assertNotIn("Never choose SDK Option B", prompt)
+        self.assertNotIn("stop calling tools silently", prompt)
+        self.assertIn("• Reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).", prompt)
+        self.assertIn(
+            "• Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals into visible response text; output ONLY the final user-facing message.",
+            prompt,
+        )
+
     def test_prepare_turn_prompt_external(self):
         with patch("tools.channel_history.format_channel_context", return_value="[Amos]: Hi"):
             prompt = prepare_turn_prompt(

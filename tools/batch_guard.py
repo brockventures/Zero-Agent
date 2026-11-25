@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 Tool Batching Safety Guard (Antigravity PreToolUse Hook)
 Enforces the Tool Roundtrip Minimization & Batch Execution Invariant using strictly
@@ -3330,7 +3331,7 @@ def check_tool_use(
             return False, (
                 "Ouroboros Polling Guard Triggered: Manual shell process-polling loops ('while ... pgrep/ps ... sleep') "
                 "are prohibited because 'pgrep -f' matches its own bash -c wrapper and deadlocks the turn. "
-                "For SDK background tasks, stop calling tools silently and let the task completion event wake you; "
+                "For SDK background tasks, end the turn naturally and let the task completion event wake you; "
                 "for jobs >90 seconds, use 'python3 /workspace/tools/forge.py job start ...' (or detached_runner.py)."
             )
 
