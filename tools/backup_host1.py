@@ -20,6 +20,7 @@ RETENTION_DAYS = 14
 HA_NVME_ROOT = "/volume2/docker/homeassistant"
 HOMEBRIDGE_NVME_ROOT = "/volume2/docker/homebridge"
 APPDATA_NVME_ROOT = "/volume2/docker/appdata"
+HOMEPAGE_NVME_ROOT = "/volume2/docker/homepage"
 
 for _p in ["/workspace", "/workspace/tools"]:
     if _p not in sys.path:
@@ -137,20 +138,25 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
         run_ssh(f"rm -f '{dest_compose}'")
         return False, f"docker-compose copy failed (code {code_cp}): {stderr_cp.strip()}"
 
-    # 2. Checkpoint SQLite WAL databases before archiving (Dockhand on Vol 1, Wave 2 NVMe DBs on Vol 2)
+    # 2. Checkpoint SQLite WAL databases before archiving (Wave 2 + Wave 4 NVMe DBs on Vol 2)
     cmd_ckpt = (
         f"for db in "
-        f"'{DOCKER_ROOT}/appdata/dockhand/db/dockhand.db' "
+        f"'{APPDATA_NVME_ROOT}/dockhand/db/dockhand.db' "
         f"'{APPDATA_NVME_ROOT}/seerr/db/db.sqlite3' "
         f"'{APPDATA_NVME_ROOT}/tautulli/tautulli.db' "
         f"'{APPDATA_NVME_ROOT}/maintainerr/maintainerr.sqlite' "
-        f"'{APPDATA_NVME_ROOT}/bazarr/db/bazarr.db'; do "
+        f"'{APPDATA_NVME_ROOT}/bazarr/db/bazarr.db' "
+        f"'{APPDATA_NVME_ROOT}/sabnzbd/admin/history1.db' "
+        f"'{APPDATA_NVME_ROOT}/calibre-web-automated/app.db' "
+        f"'{APPDATA_NVME_ROOT}/calibre-web-automated/cwa.db' "
+        f"'{APPDATA_NVME_ROOT}/calibre-web-automated/gdrive.db' "
+        f"'{APPDATA_NVME_ROOT}/shelfmark/users.db'; do "
         f"[ -f \"$db\" ] && sudo sqlite3 \"$db\" 'PRAGMA wal_checkpoint(PASSIVE);' >/dev/null 2>&1 || true; "
         f"done"
     )
     run_ssh(cmd_ckpt, timeout=30)
 
-    # 3. Tar critical lightweight appdata configs (Wave 2 NVMe services + Vol 1 dockhand)
+    # 3. Tar critical lightweight appdata configs (Wave 2 + Wave 4 NVMe services + Homepage)
     # Exclude internal backups, cache, MediaCover, transcode, and logs to avoid disk stall;
     # use --warning=no-file-changed and allow GNU tar exit code 1 (live WAL/file mutation during read)
     cmd_tar = (
@@ -159,8 +165,10 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
         f"--exclude='cache' --exclude='.cache' --exclude='MediaCover' "
         f"--exclude='Transcode' --exclude='logs' --exclude='log' --exclude='*.log' "
         f"-czf '{dest_tar}' -C '{APPDATA_NVME_ROOT}' "
-        f"maintainerr seerr tautulli bazarr sonarr/config.xml radarr/config.xml prowlarr/config.xml "
-        f"-C '{DOCKER_ROOT}/appdata' dockhand"
+        f"maintainerr seerr tautulli bazarr dockhand calibre-web-automated shelfmark "
+        f"sabnzbd/sabnzbd.ini sabnzbd/admin/history1.db glances/conf/glances.conf "
+        f"sonarr/config.xml radarr/config.xml prowlarr/config.xml "
+        f"-C '{HOMEPAGE_NVME_ROOT}' config"
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=180)
     if code not in (0, 1):
