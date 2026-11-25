@@ -57,7 +57,7 @@ SERVERBROCK_STOPPED_ALLOWLIST = {
 
 # The remote Python code executed locally on each NAS host via ssh 'python3 -'
 REMOTE_BATCH_SCANNER = r'''
-import subprocess, json, time, re, calendar
+import subprocess, json, time, re, calendar, os
 from concurrent.futures import ThreadPoolExecutor
 
 now_utc = time.time()
@@ -68,7 +68,6 @@ noise_re = re.compile(
     r'('
     r'\[debug\]|'
     r'libusb_init failed|'
-    r'init_VideoIn failed|'
     r'TaskCanceledException|'
     r'--- End of inner exception stack trace ---|'
     r'at System\.Net\.Http\.HttpClient\.HandleFailure|'
@@ -98,7 +97,6 @@ noise_re = re.compile(
     r'credentialedProxyHandler|'
     r'connect EHOSTUNREACH|'
     r'Error calling http:\/\/|'
-    r'octoprint.*|'
     r'android_ip_webcam.*|'
     r'failed to sufficiently increase receive buffer size|'
     r'Frame rx failed, error:Duplicated|'
@@ -208,33 +206,63 @@ def inspect_container(target):
     try:
         logs_res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3)
         raw_lines = logs_res.stdout.splitlines()
+        tail_bytes = len(logs_res.stdout.encode('utf-8', errors='replace'))
     except subprocess.TimeoutExpired:
         raw_lines = []
+        tail_bytes = 0
 
     valid_errs = []
+    suppressed_errors = 0
+    suppressed_active = 0
+    suppressed_samples = []
+    first_ts = None
+    last_ts = None
+    last_sample = ''
+
     for rl in raw_lines:
         clean = ansi_escape.sub('', rl).strip()
-        if not clean or not err_re.search(clean) or noise_re.search(clean):
+        if not clean:
             continue
         m = iso_re.match(clean)
+        age = 0.0
+        ts_str = ''
+        msg = clean
         if m:
             ts_str, msg = m.group(1), m.group(2)
             try:
                 dt_str = ts_str[:19]
-                epoch = calendar.timegm(time.strptime(dt_str, '%Y-%m-%dT%H:%M:%S'))
-                age = now_utc - epoch
+                epoch = float(calendar.timegm(time.strptime(dt_str, '%Y-%m-%dT%H:%M:%S')))
+                if len(ts_str) > 20 and ts_str[19] == '.':
+                    frac = ts_str[20:].rstrip('Z')[:6]
+                    if frac.isdigit():
+                        epoch += float('0.' + frac)
+                age = max(0.0, now_utc - epoch)
+                if first_ts is None or epoch < first_ts:
+                    first_ts = epoch
+                if last_ts is None or epoch > last_ts:
+                    last_ts = epoch
             except Exception:
-                age = 0
-            valid_errs.append({'age': age, 'ts': ts_str, 'msg': msg})
-        else:
-            valid_errs.append({'age': 0, 'ts': '', 'msg': clean})
+                age = 0.0
+        last_sample = msg[:200]
+        if not err_re.search(clean):
+            continue
+        if noise_re.search(clean):
+            suppressed_errors += 1
+            if age < 3600:
+                suppressed_active += 1
+            suppressed_samples.append(msg[:200])
+            continue
+        valid_errs.append({'age': age, 'ts': ts_str, 'msg': msg})
 
+    tail_span_sec = round(max(0.0, last_ts - first_ts), 3) if (first_ts is not None and last_ts is not None and last_ts > first_ts) else 0.0
+
+    flagged_item = None
     if valid_errs:
         active_cnt = sum(1 for e in valid_errs if e['age'] < 3600)
         recent_cnt = sum(1 for e in valid_errs if 3600 <= e['age'] < 21600)
         hist_cnt = sum(1 for e in valid_errs if e['age'] >= 21600)
         is_transient = (active_cnt == 0 and recent_cnt == 0 and hist_cnt > 0)
-        return {
+        flagged_item = {
             'container': cname,
             'status': status,
             'total_errors': len(valid_errs),
@@ -244,14 +272,46 @@ def inspect_container(target):
             'is_transient': is_transient,
             'sample_errors': [e['msg'][:200] for e in valid_errs[-5:]]
         }
-    return None
+
+    muted_storm = None
+    if suppressed_errors >= 50:
+        muted_storm = {
+            'container': cname,
+            'status': status,
+            'suppressed_errors': suppressed_errors,
+            'suppressed_active': suppressed_active,
+            'sample_suppressed': suppressed_samples[-2:]
+        }
+
+    tail_stat = {
+        'container': cname,
+        'tail_lines': len(raw_lines),
+        'tail_bytes': tail_bytes,
+        'tail_span_sec': tail_span_sec,
+        'sample_line': last_sample
+    }
+
+    return {
+        'flagged': flagged_item,
+        'muted_storm': muted_storm,
+        'tail_stat': tail_stat
+    }
 
 flagged = []
+muted_storms = []
+tail_stats = {}
 with ThreadPoolExecutor(max_workers=10) as executor:
     results = executor.map(inspect_container, targets)
     for r in results:
-        if r:
-            flagged.append(r)
+        if not r:
+            continue
+        if r.get('flagged'):
+            flagged.append(r['flagged'])
+        if r.get('muted_storm'):
+            muted_storms.append(r['muted_storm'])
+        tstat = r.get('tail_stat')
+        if tstat and tstat.get('container'):
+            tail_stats[tstat['container']] = tstat
 
 versions = {}
 try:
@@ -261,6 +321,27 @@ try:
             versions['synology-dsm'] = kv['productversion']
 except Exception:
     pass
+
+db_log_containers = []
+log_metrics = {}
+for nm, tstat in tail_stats.items():
+    t_lines = int(tstat.get('tail_lines', 0) or 0)
+    t_bytes = int(tstat.get('tail_bytes', 0) or 0)
+    t_span = float(tstat.get('tail_span_sec', 0.0) or 0.0)
+    s_line = str(tstat.get('sample_line', '') or '')
+    est_mb_day = round((t_bytes / t_span) * 86400.0 / (1024.0 * 1024.0), 2) if (t_lines >= 200 and t_span > 0 and t_bytes > 0) else 0.0
+    log_metrics[nm] = {
+        'container': nm,
+        'log_driver': '',
+        'log_path': '',
+        'log_size_bytes': 0,
+        'log_size_mb': 0.0,
+        'tail_lines': t_lines,
+        'tail_bytes': t_bytes,
+        'tail_span_sec': t_span,
+        'est_mb_per_day': est_mb_day,
+        'sample_line': s_line,
+    }
 
 try:
     cnames = [t[0] for t in targets]
@@ -278,11 +359,57 @@ try:
                 )
                 if ver:
                     versions[nm] = ver
+                host_cfg = item.get('HostConfig') or {}
+                log_cfg = host_cfg.get('LogConfig') or {}
+                log_type = str(log_cfg.get('Type') or '').strip()
+                if log_type == 'db':
+                    db_log_containers.append({'container': nm, 'log_driver': 'db'})
+                log_path = str(item.get('LogPath') or '').strip()
+                log_size_bytes = 0
+                if log_path:
+                    try:
+                        log_size_bytes = int(os.path.getsize(log_path))
+                    except Exception:
+                        log_size_bytes = 0
+                entry = log_metrics.setdefault(nm, {
+                    'container': nm,
+                    'tail_lines': 0,
+                    'tail_bytes': 0,
+                    'tail_span_sec': 0.0,
+                    'est_mb_per_day': 0.0,
+                    'sample_line': '',
+                })
+                entry['log_driver'] = log_type
+                entry['log_path'] = log_path
+                entry['log_size_bytes'] = log_size_bytes
+                entry['log_size_mb'] = round(log_size_bytes / (1024.0 * 1024.0), 2)
 except Exception:
     pass
 
-print(json.dumps({'scanned': len(targets), 'flagged': flagged, 'versions': versions}))
+velocity_alerts = [
+    {
+        'container': m['container'],
+        'est_mb_per_day': m['est_mb_per_day'],
+        'log_size_mb': m['log_size_mb'],
+        'sample_line': m['sample_line'],
+    }
+    for m in log_metrics.values()
+    if m.get('est_mb_per_day', 0.0) > 5.0
+]
+
+print(json.dumps({
+    'scanned': len(targets),
+    'flagged': flagged,
+    'versions': versions,
+    'muted_storms': muted_storms,
+    'db_log_containers': db_log_containers,
+    'log_metrics': log_metrics,
+    'velocity_alerts': velocity_alerts,
+}))
 '''
+
+DEFAULT_LOG_VELOCITY_MB_PER_DAY = 5.0
+VELOCITY_STATE_FILE = DATA_DIR / "nas_log_velocity_state.json"
 
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 KEV_CACHE_FILE = DATA_DIR / "cisa_kev_cache.json"
@@ -460,6 +587,128 @@ def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20, port: st
         return {"scanned": 0, "flagged": [], "error": str(e)}
 
 
+def evaluate_log_velocity(
+    metrics_by_host: dict | list,
+    threshold_mb_per_day: float = DEFAULT_LOG_VELOCITY_MB_PER_DAY,
+    state_file: Path | None = None,
+    now_ts: float | None = None,
+) -> list[dict]:
+    """
+    Evaluate per-container log write velocity using tail timestamp span projection
+    (when >=200 lines fill the 250-line tail) and/or persisted LogPath byte deltas across runs.
+    Flags any container exceeding threshold_mb_per_day (default 5.0 MB/day).
+    """
+    if not metrics_by_host:
+        return []
+
+    curr_ts = float(now_ts if now_ts is not None else time.time())
+    target_state_file = state_file or VELOCITY_STATE_FILE
+    prev_state: dict[str, dict] = {}
+    try:
+        if target_state_file and target_state_file.exists():
+            loaded = json.loads(target_state_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                prev_state = loaded
+    except Exception:  # noqa: BLE001
+        prev_state = {}
+
+    normalized_items: list[tuple[str, str, dict]] = []
+    if isinstance(metrics_by_host, list):
+        for item in metrics_by_host:
+            if isinstance(item, dict):
+                cname = str(item.get("container") or item.get("name") or "").strip()
+                host = str(item.get("host") or "unknown").strip()
+                if cname:
+                    normalized_items.append((host, cname, item))
+    elif isinstance(metrics_by_host, dict):
+        # Support either {host: {cname: metrics}} or {host: [metrics]} or single metric dict
+        if "container" in metrics_by_host and ("tail_bytes" in metrics_by_host or "tail_lines" in metrics_by_host):
+            cname = str(metrics_by_host.get("container") or "").strip()
+            host = str(metrics_by_host.get("host") or "unknown").strip()
+            if cname:
+                normalized_items.append((host, cname, metrics_by_host))
+        else:
+            for host_key, host_val in metrics_by_host.items():
+                if isinstance(host_val, dict):
+                    if "tail_bytes" in host_val or "tail_lines" in host_val or "log_size_bytes" in host_val:
+                        cname = str(host_val.get("container") or host_key).strip()
+                        host = str(host_val.get("host") or "unknown").strip()
+                        normalized_items.append((host, cname, host_val))
+                    else:
+                        for cname, m_dict in host_val.items():
+                            if isinstance(m_dict, dict):
+                                normalized_items.append((str(host_key), str(m_dict.get("container") or cname), m_dict))
+                elif isinstance(host_val, list):
+                    for m_dict in host_val:
+                        if isinstance(m_dict, dict):
+                            cname = str(m_dict.get("container") or m_dict.get("name") or "").strip()
+                            if cname:
+                                normalized_items.append((str(host_key), cname, m_dict))
+
+    new_state = dict(prev_state)
+    alerts: list[dict] = []
+
+    for host, cname, item in normalized_items:
+        tail_lines = int(item.get("tail_lines", 250 if "tail_bytes" in item and "tail_lines" not in item else 0) or 0)
+        tail_bytes = int(item.get("tail_bytes", 0) or 0)
+        tail_span_sec = float(item.get("tail_span_sec", 0.0) or 0.0)
+        log_size_bytes = int(item.get("log_size_bytes", 0) or 0)
+        raw_size_mb = item.get("log_size_mb")
+        if isinstance(raw_size_mb, (int, float)) and raw_size_mb > 0:
+            log_size_mb = round(float(raw_size_mb), 2)
+        else:
+            log_size_mb = round(log_size_bytes / (1024.0 * 1024.0), 2) if log_size_bytes > 0 else 0.0
+        sample_line = str(item.get("sample_line") or "")[:200]
+
+        tail_rate_mb_day = 0.0
+        if tail_lines >= 200 and tail_span_sec > 0 and tail_bytes > 0:
+            tail_rate_mb_day = (tail_bytes / tail_span_sec) * 86400.0 / (1024.0 * 1024.0)
+        elif item.get("est_mb_per_day") is not None and tail_lines == 0 and tail_bytes == 0:
+            tail_rate_mb_day = float(item.get("est_mb_per_day") or 0.0)
+
+        delta_rate_mb_day = 0.0
+        state_key = f"{host}:{cname}"
+        if log_size_bytes > 0:
+            prev_entry = prev_state.get(state_key)
+            if isinstance(prev_entry, dict):
+                prev_bytes = int(prev_entry.get("log_size_bytes", 0) or 0)
+                prev_ts = float(prev_entry.get("ts", 0.0) or 0.0)
+                dt = curr_ts - prev_ts
+                dbytes = log_size_bytes - prev_bytes
+                if dt >= 60.0 and dbytes > 0:
+                    delta_rate_mb_day = (dbytes / dt) * 86400.0 / (1024.0 * 1024.0)
+            new_state[state_key] = {
+                "log_size_bytes": log_size_bytes,
+                "ts": curr_ts,
+            }
+
+        est_mb_per_day = round(max(tail_rate_mb_day, delta_rate_mb_day), 2)
+        if est_mb_per_day > threshold_mb_per_day:
+            alerts.append({
+                "container": cname,
+                "host": host,
+                "est_mb_per_day": est_mb_per_day,
+                "log_size_mb": log_size_mb,
+                "sample_line": sample_line,
+            })
+
+    is_test_runner = (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or "pytest" in sys.modules
+        or ("unittest" in sys.modules and any(k.startswith("test_") or ".test_" in k for k in list(sys.modules)))
+    )
+    if target_state_file and (state_file is not None or not is_test_runner):
+        try:
+            target_state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_state = target_state_file.with_suffix(".tmp")
+            tmp_state.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
+            tmp_state.replace(target_state_file)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    return alerts
+
+
 def scan_all_nas_containers(since: str = "24h") -> dict:
     """
     Perform high-speed batch log scanning across Host 1 and Host 2 in parallel.
@@ -470,6 +719,9 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
             "stale_transients": list[dict],
             "host_errors": dict[str, str],
             "versions_by_host": dict[str, dict],
+            "velocity_alerts": list[dict],
+            "muted_storms": list[dict],
+            "db_log_containers": list[dict],
             "duration_sec": float
         }
     """
@@ -481,6 +733,10 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
     total_scanned = 0
     host_errors = {}
     versions_by_host = {}
+    muted_storms = []
+    db_log_containers = []
+    log_metrics_by_host = {}
+    pre_velocity_alerts = []
 
     h1, h2, _ = _resolve_nas_config()
     hosts = [h1 or HOST_1_IP, h2 or HOST_2_IP]
@@ -495,14 +751,42 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
                     host_errors[host] = res["error"]
                 if res.get("versions"):
                     versions_by_host[host] = res["versions"]
+                if res.get("log_metrics"):
+                    log_metrics_by_host[host] = res["log_metrics"]
                 for item in res.get("flagged", []):
                     item["host"] = host
                     if item.get("is_transient"):
                         stale.append(item)
                     else:
                         actionable.append(item)
+                for storm in res.get("muted_storms", []):
+                    if isinstance(storm, dict):
+                        s_item = dict(storm)
+                        s_item["host"] = host
+                        muted_storms.append(s_item)
+                for db_item in res.get("db_log_containers", []):
+                    if isinstance(db_item, dict):
+                        d_entry = dict(db_item)
+                        d_entry.setdefault("host", host)
+                        d_entry.setdefault("log_driver", "db")
+                        db_log_containers.append(d_entry)
+                    elif isinstance(db_item, str):
+                        db_log_containers.append({"container": db_item, "host": host, "log_driver": "db"})
+                for valert in res.get("velocity_alerts", []):
+                    if isinstance(valert, dict):
+                        v_item = dict(valert)
+                        v_item.setdefault("host", host)
+                        pre_velocity_alerts.append(v_item)
             except Exception as e:  # noqa: BLE001
                 host_errors[host] = str(e)
+
+    velocity_alerts = evaluate_log_velocity(log_metrics_by_host) if log_metrics_by_host else []
+    seen_vel = {(v.get("host"), v.get("container")) for v in velocity_alerts}
+    for v_item in pre_velocity_alerts:
+        v_key = (v_item.get("host"), v_item.get("container"))
+        if v_key not in seen_vel and float(v_item.get("est_mb_per_day", 0.0) or 0.0) > DEFAULT_LOG_VELOCITY_MB_PER_DAY:
+            seen_vel.add(v_key)
+            velocity_alerts.append(v_item)
 
     duration = time.time() - t0
     return {
@@ -511,6 +795,9 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
         "stale_transients": stale,
         "host_errors": host_errors,
         "versions_by_host": versions_by_host,
+        "velocity_alerts": velocity_alerts,
+        "muted_storms": muted_storms,
+        "db_log_containers": db_log_containers,
         "duration_sec": round(duration, 2)
     }
 
@@ -524,6 +811,63 @@ def _format_kev_report_block(kev_risks: list[dict]) -> str:
             f"- **{r['service']}** ({r['host']}): running `{r['running_version']}` < `{r['fixed_version']}` "
             f"(`{r['cve_id']}` — {r['summary']})"
         )
+    return "\n".join(lines)
+
+
+def _format_velocity_report_block(velocity_alerts: list[dict]) -> str:
+    if not velocity_alerts:
+        return ""
+    lines = [f"📈 **Log Velocity / Flood Alert ({len(velocity_alerts)}):**"]
+    for v in velocity_alerts:
+        cname = v.get("container", "unknown")
+        host = v.get("host")
+        host_part = f" ({host})" if host else ""
+        rate = float(v.get("est_mb_per_day", 0.0) or 0.0)
+        size_mb = v.get("log_size_mb")
+        size_part = f", current log `{float(size_mb):.2f} MB`" if isinstance(size_mb, (int, float)) and size_mb > 0 else ""
+        sample = str(v.get("sample_line") or "").strip()
+        sample_part = f" — sample: `{sample[:140]}`" if sample else ""
+        lines.append(
+            f"- **{cname}**{host_part}: `{rate:.2f} MB/day` (> `{DEFAULT_LOG_VELOCITY_MB_PER_DAY:.1f} MB/day` threshold{size_part}){sample_part}"
+        )
+    return "\n".join(lines)
+
+
+def _format_muted_storms_report_block(muted_storms: list[dict]) -> str:
+    if not muted_storms:
+        return ""
+    lines = [f"🔇 **Muted Error Storm Circuit Breaker ({len(muted_storms)}):**"]
+    for s in muted_storms:
+        cname = s.get("container", "unknown")
+        host = s.get("host")
+        host_part = f" ({host})" if host else ""
+        supp = int(s.get("suppressed_errors", 0) or 0)
+        act = int(s.get("suppressed_active", 0) or 0)
+        samples = s.get("sample_suppressed") or []
+        sample_part = f" — sample: `{str(samples[0])[:140]}`" if samples else ""
+        lines.append(
+            f"- **{cname}**{host_part}: `{supp}` muted error lines in 250-line tail (`{act}` active <1h){sample_part}"
+        )
+    return "\n".join(lines)
+
+
+def _format_db_driver_drift_block(db_log_containers: list) -> str:
+    if not db_log_containers:
+        return ""
+    lines = [f"🗃️ **SQLite `db` Log-Driver Drift Flagged ({len(db_log_containers)}):**"]
+    for item in db_log_containers:
+        if isinstance(item, dict):
+            cname = item.get("container") or item.get("name") or "unknown"
+            host = item.get("host")
+            driver = item.get("log_driver") or "db"
+            host_part = f" ({host})" if host else ""
+            lines.append(
+                f"- **{cname}**{host_part}: using Synology `{driver}` log driver (migrate to `json-file` with `max-size=10m`, `max-file=3`)"
+            )
+        else:
+            lines.append(
+                f"- **{item}**: using Synology `db` log driver (migrate to `json-file` with `max-size=10m`, `max-file=3`)"
+            )
     return "\n".join(lines)
 
 
@@ -737,6 +1081,9 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     actionable = res["actionable_issues"]
     stale = res["stale_transients"]
     versions_by_host = res.get("versions_by_host", {})
+    velocity_alerts = res.get("velocity_alerts", []) or []
+    muted_storms = res.get("muted_storms", []) or []
+    db_log_containers = res.get("db_log_containers", []) or []
 
     # Silent high-threshold CISA KEV + critical version floor check
     kev_risks = []
@@ -745,6 +1092,9 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     except Exception:  # noqa: BLE001
         kev_risks = []
     kev_report = _format_kev_report_block(kev_risks)
+    velocity_report = _format_velocity_report_block(velocity_alerts)
+    muted_storms_report = _format_muted_storms_report_block(muted_storms)
+    db_drift_report = _format_db_driver_drift_block(db_log_containers)
 
     # Run Home Assistant + VictoriaMetrics statistical telemetry & self-healing check
     ha_telemetry = {}
@@ -768,12 +1118,22 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     ids_report = _format_unifi_ids_report_block(ids_alerts)
 
     extra = {
-        "total_issues": len(actionable) + len(kev_risks) + max(0, ids_count),
+        "total_issues": (
+            len(actionable)
+            + len(kev_risks)
+            + max(0, ids_count)
+            + len(velocity_alerts)
+            + len(muted_storms)
+            + len(db_log_containers)
+        ),
         "tier1_count": sum(1 for a in actionable if any("fatal" in s.lower() or "panic" in s.lower() or re.search(r"\boom\b", s, re.IGNORECASE) for s in a.get("sample_errors", []))) + len(kev_risks),
-        "tier2_count": len(actionable),
+        "tier2_count": len(actionable) + len(velocity_alerts) + len(muted_storms) + len(db_log_containers),
         "dossier": actionable,
         "kev_risks": kev_risks,
         "unifi_ids_alerts": unifi_ids,
+        "velocity_alerts": velocity_alerts,
+        "muted_storms": muted_storms,
+        "db_log_containers": db_log_containers,
         "stale_transients": stale,
         "duration_sec": res["duration_sec"],
         "scanned": total_scanned,
@@ -781,15 +1141,14 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     }
 
     host_errors = res.get("host_errors", {})
+    extra_blocks = [b for b in (ha_report, kev_report, ids_report, velocity_report, muted_storms_report, db_drift_report) if b]
 
     # Failure guard: 0 containers scanned means connection/timeout failure, not nominal health
     if total_scanned == 0:
         err_details = "; ".join(f"{h}: {e}" for h, e in host_errors.items()) if host_errors else "SSH timeout / unreachable"
         rep = f"⚠️ **NAS Log Review** [{now_pt}]: Failed to scan containers across NAS clusters ({err_details})."
-        if ha_report:
-            rep = f"{rep}\n\n{ha_report}"
-        if ids_report:
-            rep = f"{rep}\n\n{ids_report}"
+        for blk in extra_blocks:
+            rep = f"{rep}\n\n{blk}"
         return False, rep, extra
 
     # Nominal container logs: All scanned containers healthy or only harmless historical transients
@@ -797,24 +1156,16 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
         if host_errors:
             err_hosts = ", ".join(host_errors.keys())
             rep = f"⚠️ **NAS Log Review** [{now_pt}]: {total_scanned} containers healthy, but scan failed on {err_hosts}."
-            if ha_report:
-                rep = f"{rep}\n\n{ha_report}"
-            if kev_report:
-                rep = f"{rep}\n\n{kev_report}"
-            if ids_report:
-                rep = f"{rep}\n\n{ids_report}"
+            for blk in extra_blocks:
+                rep = f"{rep}\n\n{blk}"
             return False, rep, extra
         monitored_ha = ha_telemetry.get("monitored_count", 0)
         unifi_cnt = ha_telemetry.get("unifi_clients_count", 0)
         unifi_part = f", {unifi_cnt} UniFi clients" if unifi_cnt else ""
         ha_suffix = f" ({monitored_ha} HA sensors{unifi_part} nominal)" if monitored_ha and not ha_report else ""
         rep = f"🗄️ **NAS Log Review** [{now_pt}]: All {total_scanned} containers healthy across .82 and .84{ha_suffix}. ✅"
-        if ha_report:
-            rep = f"{rep}\n\n{ha_report}"
-        if kev_report:
-            rep = f"{rep}\n\n{kev_report}"
-        if ids_report:
-            rep = f"{rep}\n\n{ids_report}"
+        for blk in extra_blocks:
+            rep = f"{rep}\n\n{blk}"
         return True, rep, extra
 
     # Candidate issues detected
@@ -837,14 +1188,8 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     if stale:
         lines.append(f"\n🟢 **Historical Transients Cleared (>6h ago, 0 recent):** {', '.join(s['container'] for s in stale)}")
 
-    if ha_report:
-        lines.append(f"\n{ha_report}")
-
-    if kev_report:
-        lines.append(f"\n{kev_report}")
-
-    if ids_report:
-        lines.append(f"\n{ids_report}")
+    for blk in extra_blocks:
+        lines.append(f"\n{blk}")
 
     return True, "\n".join(lines).strip(), extra
 
@@ -856,6 +1201,9 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
     kev_risks = extra.get("kev_risks", [])
     stale = extra.get("stale_transients", [])
     ha_telemetry = extra.get("ha_telemetry", {})
+    velocity_alerts = extra.get("velocity_alerts", []) or []
+    muted_storms = extra.get("muted_storms", []) or []
+    db_log_containers = extra.get("db_log_containers", []) or []
     raw_ids = extra.get("unifi_ids_alerts", {})
     if isinstance(raw_ids, dict):
         ids_alerts = raw_ids.get("alerts", [])
@@ -878,15 +1226,29 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
     }
     if ids_alerts:
         dossier_payload["unifi_ids_alerts"] = ids_alerts
+    if velocity_alerts:
+        dossier_payload["velocity_alerts"] = velocity_alerts
+    if muted_storms:
+        dossier_payload["muted_storms"] = muted_storms
+    if db_log_containers:
+        dossier_payload["db_log_containers"] = db_log_containers
 
     dossier_json = json.dumps(dossier_payload, indent=2)
-    ids_section = f"\n\n### UniFi IDS Alerts:\n{_format_unifi_ids_report_block(ids_alerts)}" if ids_alerts else ""
+    extra_sections = ""
+    if ids_alerts:
+        extra_sections += f"\n\n### UniFi IDS Alerts:\n{_format_unifi_ids_report_block(ids_alerts)}"
+    if velocity_alerts:
+        extra_sections += f"\n\n### Log Velocity Alerts:\n{_format_velocity_report_block(velocity_alerts)}"
+    if muted_storms:
+        extra_sections += f"\n\n### Muted Error Storms:\n{_format_muted_storms_report_block(muted_storms)}"
+    if db_log_containers:
+        extra_sections += f"\n\n### SQLite Log-Driver Drift:\n{_format_db_driver_drift_block(db_log_containers)}"
 
     return (
         f"Nightly Autonomous NAS Log & Telemetry Triage [{now_pt}]:\n"
         f"The log harvester scanned {extra.get('scanned', 39)} running containers across Host1 (.82) and Host2 (.84) "
         f"and flagged candidate issues in {total} container(s).\n\n"
-        f"### Incident Dossier:\n```json\n{dossier_json}\n```{ids_section}\n\n"
+        f"### Incident Dossier:\n```json\n{dossier_json}\n```{extra_sections}\n\n"
         f"### Autonomous Directives:\n"
         f"1. **Forensic Liveness & Root-Cause Analysis:** Silently investigate each flagged container and any HA telemetry anomalies. Determine if errors are actively recurring or transient hiccups.\n"
         f"2. **Autonomous Safe Remediation:** For actionable code, config, schema, or mapping issues within homelab policy "

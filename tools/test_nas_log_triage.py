@@ -12,6 +12,7 @@ if _REPO_ROOT not in sys.path:
 
 from tools.nas_log_triage import (
     REMOTE_BATCH_SCANNER,
+    evaluate_log_velocity,
     fetch_unifi_ids_alerts,
     format_autonomous_triage_prompt,
     run_nas_log_review,
@@ -82,8 +83,13 @@ class TestNasLogTriage(unittest.TestCase):
         ns = {}
         exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
-        sample = "i: init_VideoIn failed"
-        self.assertIsNotNone(rx.search(sample))
+        self.assertIsNone(rx.search("i: init_VideoIn failed"))
+        self.assertIsNone(rx.search("2026-11-25T05:00:00Z octoprint.plugins.webcam ERROR Webcam stream failed"))
+        self.assertIsNotNone(
+            rx.search(
+                "2026-11-25 04:12:00 WARNING (MainThread) [homeassistant.components.octoprint] Config entry 'OctoPrint' not ready yet"
+            )
+        )
 
     def test_noise_re_debug_level_ignored(self):
         ns = {}
@@ -428,6 +434,96 @@ class TestNasLogTriage(unittest.TestCase):
         self.assertFalse(extra["unifi_ids_alerts"]["ok"])
         self.assertNotIn("UniFi IDS", rep)
         self.assertIn("All 39 containers healthy", rep)
+
+    def test_evaluate_log_velocity_flags_flood_and_ignores_normal(self):
+        metrics = {
+            "198.51.100.10": {
+                "otbr": {
+                    "container": "otbr",
+                    "tail_lines": 250,
+                    "tail_bytes": 40960,
+                    "tail_span_sec": 120.0,
+                    "log_size_bytes": 38 * 1024 * 1024,
+                    "sample_line": "otbr-agent[49]: [D] SubMac--------: Frame rx failed",
+                },
+                "plex": {
+                    "container": "plex",
+                    "tail_lines": 250,
+                    "tail_bytes": 25000,
+                    "tail_span_sec": 43200.0,
+                    "log_size_bytes": 512 * 1024,
+                    "sample_line": "GET /identity 200 OK",
+                },
+            }
+        }
+        alerts = evaluate_log_velocity(metrics)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["container"], "otbr")
+        self.assertEqual(alerts[0]["host"], "198.51.100.10")
+        self.assertGreater(alerts[0]["est_mb_per_day"], 25.0)
+        self.assertEqual(alerts[0]["log_size_mb"], 38.0)
+
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts", return_value={"ok": True, "alerts": [], "count": 0})
+    @patch("tools.nas_log_triage.scan_all_nas_containers")
+    @patch("tools.nas_log_triage.evaluate_kev_risks", return_value=[])
+    def test_run_nas_log_review_surfaces_muted_storms_velocity_and_db_driver_drift(
+        self, _mock_kev, mock_scan, _mock_ids
+    ):
+        mock_scan.return_value = {
+            "total_scanned": 39,
+            "actionable_issues": [],
+            "stale_transients": [],
+            "host_errors": {},
+            "versions_by_host": {},
+            "velocity_alerts": [
+                {
+                    "container": "otbr",
+                    "host": "198.51.100.10",
+                    "est_mb_per_day": 28.13,
+                    "log_size_mb": 38.0,
+                    "sample_line": "otbr-agent: [D] SubMac Frame tx attempt failed",
+                }
+            ],
+            "muted_storms": [
+                {
+                    "container": "octoprint",
+                    "host": "198.51.100.10",
+                    "status": "Up 3 days",
+                    "suppressed_errors": 180,
+                    "suppressed_active": 180,
+                    "sample_suppressed": ["otbr-agent: Failed to handle ICMPv6 message"],
+                }
+            ],
+            "db_log_containers": [
+                {
+                    "container": "legacy-service",
+                    "host": "198.51.100.20",
+                    "log_driver": "db",
+                }
+            ],
+            "duration_sec": 1.8,
+        }
+
+        ok, rep, extra = run_nas_log_review()
+        self.assertTrue(ok)
+        self.assertEqual(extra["total_issues"], 3)
+        self.assertEqual(len(extra["velocity_alerts"]), 1)
+        self.assertEqual(len(extra["muted_storms"]), 1)
+        self.assertEqual(len(extra["db_log_containers"]), 1)
+        self.assertIn("Log Velocity / Flood Alert (1)", rep)
+        self.assertIn("otbr", rep)
+        self.assertIn("28.13 MB/day", rep)
+        self.assertIn("Muted Error Storm Circuit Breaker (1)", rep)
+        self.assertIn("180", rep)
+        self.assertIn("SQLite `db` Log-Driver Drift Flagged (1)", rep)
+        self.assertIn("legacy-service", rep)
+
+        prompt = format_autonomous_triage_prompt(extra)
+        self.assertIn('"velocity_alerts"', prompt)
+        self.assertIn('"muted_storms"', prompt)
+        self.assertIn('"db_log_containers"', prompt)
+        self.assertIn("legacy-service", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
