@@ -155,7 +155,7 @@ def test_backup_wordpress_allows_tar_rc_1_fails_rc_2():
 
 
 def test_main_aborts_when_usb_not_mounted(capsys):
-    """Verify mountpoint -q returning 1 causes SystemExit(1) before any backup runs."""
+    """Verify /proc/mounts check returning 1 causes SystemExit(1) before any backup runs."""
     ssh_calls: list[tuple[str, int | None]] = []
 
     def fake_run_ssh(cmd: str, timeout: int = 180):
@@ -174,7 +174,7 @@ def test_main_aborts_when_usb_not_mounted(capsys):
         backup_host1.main()
 
     assert exc_info.value.code == 1
-    assert ssh_calls == [("mountpoint -q /volumeUSB1/usbshare", 15)]
+    assert ssh_calls == [("grep -q ' /volumeUSB1/usbshare ' /proc/mounts", 15)]
     m_arr.assert_not_called()
     m_ha.assert_not_called()
     m_app.assert_not_called()
@@ -189,7 +189,7 @@ def test_main_creates_and_prunes_wordpress_dir():
 
     def fake_run_ssh(cmd: str, timeout: int = 180):
         ssh_cmds.append(cmd)
-        if cmd == "mountpoint -q /volumeUSB1/usbshare":
+        if cmd == "grep -q ' /volumeUSB1/usbshare ' /proc/mounts":
             return 0, "", ""
         return 0, "100G 20G 80G 20% /volumeUSB1/usbshare\n", ""
 

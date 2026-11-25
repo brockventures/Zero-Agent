@@ -163,7 +163,7 @@ def backup_wordpress(ts: str) -> tuple[bool, str]:
 def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
-    mount_code, _, mount_err = run_ssh("mountpoint -q /volumeUSB1/usbshare", timeout=15)
+    mount_code, _, mount_err = run_ssh("grep -q ' /volumeUSB1/usbshare ' /proc/mounts", timeout=15)
     if mount_code != 0:
         err_detail = f" ({mount_err.strip()})" if mount_err.strip() else ""
         print(
