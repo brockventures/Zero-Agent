@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import math
 import os
@@ -343,6 +344,38 @@ def select_best_frame(
     return str(best_sharp["path"]), meta
 
 
+def render_notification_jpeg(
+    frame_path: str,
+    meta: dict[str, Any],
+    quality: int = 90,
+) -> bytes:
+    """Smart-crop the winning frame to 16:9 anchored on the face for Android BigPictureStyle."""
+    raw_bytes = Path(frame_path).read_bytes()
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as loaded:
+            img = loaded.convert("RGB")
+    except Exception:  # noqa: BLE001
+        return raw_bytes
+
+    w, h = img.size
+    target_h = round(w * 9 / 16)
+    if target_h >= h or target_h < 16:
+        return raw_bytes
+
+    box = meta.get("box")
+    if meta.get("face_detected") and isinstance(box, Sequence) and len(box) >= 4:
+        face_cy = ((float(box[1]) + float(box[3])) / 2.0) * h
+        top = round(face_cy - target_h * 0.42)
+    else:
+        top = round((h - target_h) * 0.35)
+    top = max(0, min(top, h - target_h))
+
+    cropped = img.crop((0, top, w, top + target_h))
+    buf = io.BytesIO()
+    cropped.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 async def resolve_doorbell_device_id(
     session: aiohttp.ClientSession,
     ha_url: str,
@@ -475,10 +508,13 @@ def upload_best_frame_to_ha(
 
 def build_notification_payload(
     image_url: str,
-    title: str = "Doorbell",
-    message: str = "Someone is at the front door",
+    title: str = "\U0001F514 Doorbell Ringing",
+    message: str | None = None,
 ) -> dict[str, Any]:
     """Build the silent in-place Home Assistant mobile_app notification payload."""
+    if message is None:
+        ring_time = datetime.now().strftime("%-I:%M %p")
+        message = f"Someone is at the front door ({ring_time})."
     return {
         "title": title,
         "message": message,
@@ -500,8 +536,8 @@ async def send_doorbell_notifications(
     ha_token: str,
     image_url: str,
     targets: Sequence[str] = DEFAULT_NOTIFY_TARGETS,
-    title: str = "Doorbell",
-    message: str = "Someone is at the front door",
+    title: str = "\U0001F514 Doorbell Ringing",
+    message: str | None = None,
 ) -> list[str]:
     """Send silent in-place doorbell notification updates to the configured mobile_app targets."""
     headers = {
@@ -562,7 +598,7 @@ async def process_doorbell_event(
         with tempfile.TemporaryDirectory(prefix="doorbell_face_") as tmpdir:
             frame_paths = extract_frames_from_mp4(mp4_bytes, tmpdir)
             best_path, meta = select_best_frame(frame_paths, detector)
-            jpeg_bytes = Path(best_path).read_bytes()
+            jpeg_bytes = render_notification_jpeg(best_path, meta)
 
         upload_best_frame_to_ha(jpeg_bytes)
         epoch = int(epoch_fn())
