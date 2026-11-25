@@ -274,18 +274,25 @@ def test_validate_remote_ssh_command_blocks_unbounded_du_direct_and_base64(monke
 
 
 def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
-    """Verify Host 1 defaults to Volume 1 docker root while Host 2 defaults to Volume 2 docker root with POSIX slashes."""
+    """Verify Host 1 compose root defaults to Volume 1 while NVMe appdata, HA config, and Host 2 default to Volume 2 with POSIX slashes."""
     monkeypatch.delenv("NAS_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_1_DOCKER_ROOT", raising=False)
+    monkeypatch.delenv("NAS_HOST_1_NVME_DOCKER_ROOT", raising=False)
+    monkeypatch.delenv("NAS_HA_CONFIG_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_2_DOCKER_ROOT", raising=False)
     monkeypatch.setattr(nas_config.os.path, "exists", lambda p: p != "/secrets/env.json")
     reloaded = _load_local_module("nas_config")
     expected_h1 = posixpath.join(VOL1_ROOT, "docker")
     expected_h2 = posixpath.join(VOL2_ROOT, "docker")
+    expected_ha = posixpath.join(expected_h2, "homeassistant", "config")
     assert reloaded.HOST_1_DOCKER_ROOT == expected_h1
     assert reloaded.DOCKER_ROOT == expected_h1
+    assert reloaded.HOST_1_NVME_DOCKER_ROOT == expected_h2
+    assert reloaded.HA_CONFIG_ROOT == expected_ha
     assert reloaded.HOST_2_DOCKER_ROOT == expected_h2
     assert "\\" not in reloaded.HOST_1_DOCKER_ROOT
+    assert "\\" not in reloaded.HOST_1_NVME_DOCKER_ROOT
+    assert "\\" not in reloaded.HA_CONFIG_ROOT
     assert "\\" not in reloaded.HOST_2_DOCKER_ROOT
     blocked, reason = reloaded.validate_remote_ssh_command(f"rm -rf {expected_h2}")
     assert blocked is False
@@ -293,7 +300,7 @@ def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
 
 
 def test_resolve_nas_config_env_and_secrets_precedence_with_empty_fallback(monkeypatch, tmp_path):
-    """Verify resolve_nas_config preserves 5-tuple, reads env.json, lets env override, and ignores empty strings."""
+    """Verify resolve_nas_config preserves 5-tuple, reads env.json, lets env override, ignores empty strings, and cascades NVMe root to HA config."""
     import json
 
     secrets_file = tmp_path / "env.json"
@@ -303,6 +310,8 @@ def test_resolve_nas_config_env_and_secrets_precedence_with_empty_fallback(monke
                 "NAS_HOST_1_IP": "198.51.100.82",
                 "NAS_HOST_2_IP": "198.51.100.84",
                 "NAS_DOCKER_ROOT": posixpath.join(VOL1_ROOT, "custom-h1"),
+                "NAS_HOST_1_NVME_DOCKER_ROOT": posixpath.join(VOL2_ROOT, "secrets-nvme"),
+                "NAS_HA_CONFIG_ROOT": posixpath.join(VOL2_ROOT, "secrets-ha", "config"),
                 "NAS_HOST_2_DOCKER_ROOT": posixpath.join(VOL2_ROOT, "custom-h2"),
                 "NAS_HOST_2_NAME": "AppHost02",
             }
@@ -329,6 +338,8 @@ def test_resolve_nas_config_env_and_secrets_precedence_with_empty_fallback(monke
     monkeypatch.setattr("builtins.open", _fake_open)
     monkeypatch.setenv("NAS_HOST_1_DOCKER_ROOT", "")
     monkeypatch.setenv("NAS_DOCKER_ROOT", "")
+    monkeypatch.setenv("NAS_HOST_1_NVME_DOCKER_ROOT", "   ")
+    monkeypatch.setenv("NAS_HA_CONFIG_ROOT", "")
     monkeypatch.setenv("NAS_HOST_2_DOCKER_ROOT", posixpath.join(VOL2_ROOT, "override-h2"))
 
     res = nas_config.resolve_nas_config()
@@ -337,8 +348,28 @@ def test_resolve_nas_config_env_and_secrets_precedence_with_empty_fallback(monke
     assert res[1] == "198.51.100.84"
     assert nas_config.os.environ["NAS_DOCKER_ROOT"] == posixpath.join(VOL1_ROOT, "custom-h1")
     assert nas_config.os.environ["NAS_HOST_1_DOCKER_ROOT"] == posixpath.join(VOL1_ROOT, "custom-h1")
+    assert nas_config.os.environ["NAS_HOST_1_NVME_DOCKER_ROOT"] == posixpath.join(VOL2_ROOT, "secrets-nvme")
+    assert nas_config.os.environ["NAS_HA_CONFIG_ROOT"] == posixpath.join(VOL2_ROOT, "secrets-ha", "config")
     assert nas_config.os.environ["NAS_HOST_2_DOCKER_ROOT"] == posixpath.join(VOL2_ROOT, "override-h2")
     assert nas_config.os.environ["NAS_HOST_2_NAME"] == "AppHost02"
+
+
+def test_resolve_nas_config_nvme_override_cascades_to_ha_config_root(monkeypatch):
+    """Verify overriding NAS_HOST_1_NVME_DOCKER_ROOT cascades to NAS_HA_CONFIG_ROOT when NAS_HA_CONFIG_ROOT is unset."""
+    monkeypatch.delenv("NAS_HOST_1_NVME_DOCKER_ROOT", raising=False)
+    monkeypatch.delenv("NAS_HA_CONFIG_ROOT", raising=False)
+    monkeypatch.setattr(nas_config.os.path, "exists", lambda p: p not in ("/secrets/env.json", "/secrets/ha.json"))
+
+    nvme_override = posixpath.join(VOL2_ROOT, "nvme-appdata")
+    monkeypatch.setenv("NAS_HOST_1_NVME_DOCKER_ROOT", f"\\{VOL2_ROOT.lstrip('/')}\\nvme-appdata")
+    nas_config.resolve_nas_config()
+    assert nas_config.os.environ["NAS_HOST_1_NVME_DOCKER_ROOT"] == nvme_override
+    assert nas_config.os.environ["NAS_HA_CONFIG_ROOT"] == posixpath.join(nvme_override, "homeassistant", "config")
+
+    explicit_ha = posixpath.join(VOL2_ROOT, "custom-ha-cfg")
+    monkeypatch.setenv("NAS_HA_CONFIG_ROOT", explicit_ha)
+    nas_config.resolve_nas_config()
+    assert nas_config.os.environ["NAS_HA_CONFIG_ROOT"] == explicit_ha
 
 
 def test_get_docker_root_host_routing(monkeypatch):
@@ -367,16 +398,55 @@ def test_get_docker_root_host_routing(monkeypatch):
     assert nas_config.get_docker_root("apphost02") == h2_root
 
 
+def test_get_appdata_root_host_routing(monkeypatch):
+    """Verify get_appdata_root routes Host 1/default to HOST_1_NVME_DOCKER_ROOT and Host 2 to HOST_2_DOCKER_ROOT."""
+    h1_compose = posixpath.join(VOL1_ROOT, "docker")
+    h1_nvme = posixpath.join(VOL2_ROOT, "nvme-apps")
+    h2_root = posixpath.join(VOL2_ROOT, "host2-apps")
+    monkeypatch.setattr(nas_config, "DOCKER_ROOT", h1_compose)
+    monkeypatch.setattr(nas_config, "HOST_1_DOCKER_ROOT", h1_compose)
+    monkeypatch.setattr(nas_config, "HOST_1_NVME_DOCKER_ROOT", h1_nvme)
+    monkeypatch.setattr(nas_config, "HOST_2_DOCKER_ROOT", h2_root)
+    monkeypatch.setattr(nas_config, "HOST_1_IP", "198.51.100.82")
+    monkeypatch.setattr(nas_config, "HOST_2_IP", "203.0.113.50")
+    monkeypatch.setenv("NAS_HOST_2_IP", "203.0.113.50")
+    monkeypatch.setenv("NAS_HOST_2_NAME", "AppHost02")
+
+    assert nas_config.get_appdata_root(None) == h1_nvme
+    assert nas_config.get_appdata_root("") == h1_nvme
+    assert nas_config.get_appdata_root("   ") == h1_nvme
+    assert nas_config.get_appdata_root("127.0.0.1") == h1_nvme
+    assert nas_config.get_appdata_root("198.51.100.82") == h1_nvme
+    assert nas_config.get_appdata_root("host1") == h1_nvme
+
+    assert nas_config.get_appdata_root("203.0.113.50") == h2_root
+    assert nas_config.get_appdata_root("198.51.100.84") == h2_root
+    assert nas_config.get_appdata_root("host2") == h2_root
+    assert nas_config.get_appdata_root("HOST2") == h2_root
+    assert nas_config.get_appdata_root("host_2") == h2_root
+    assert nas_config.get_appdata_root("host-2") == h2_root
+    assert nas_config.get_appdata_root("apphost02") == h2_root
+
+
 def test_volume2_recursive_delete_and_du_guards(monkeypatch):
-    """Verify Volume 2 paths and Host 1/2 Docker root env vars are guarded symmetrically against rm -rf and du."""
+    """Verify Volume 2 paths and Host 1/2 Docker & NVMe root env vars are guarded symmetrically against rm -rf and du."""
     monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    custom_h1_nvme = "/mnt/nvme-appdata"
     custom_h2 = posixpath.join(VOL2_ROOT, "nvme-docker")
+    monkeypatch.setenv("NAS_HOST_1_NVME_DOCKER_ROOT", custom_h1_nvme)
     monkeypatch.setenv("NAS_HOST_2_DOCKER_ROOT", custom_h2)
 
     blocked_rm = [
         f"rm -rf {posixpath.join(VOL2_ROOT, 'docker')}",
         f"rm -rf {posixpath.join(VOL2_ROOT, 'docker')}/*",
+        f"rm -rf {custom_h1_nvme}",
+        f"rm -rf {custom_h1_nvme}/*",
         f"rm -rf {custom_h2}",
+        "rm -rf $NAS_HOST_1_NVME_DOCKER_ROOT",
+        "rm -rf ${NAS_HOST_1_NVME_DOCKER_ROOT}/",
+        "rm -rf $NAS_HOST_1_NVME_DOCKER_ROOT/*",
+        "rm -rf $HOST_1_NVME_DOCKER_ROOT",
+        "rm -rf ${HOST_1_NVME_DOCKER_ROOT}/..",
         "rm -rf $NAS_HOST_2_DOCKER_ROOT",
         "rm -rf ${NAS_HOST_2_DOCKER_ROOT}/",
         "rm -rf $NAS_HOST_2_DOCKER_ROOT/*",
@@ -392,6 +462,9 @@ def test_volume2_recursive_delete_and_du_guards(monkeypatch):
 
     allowed_rm = [
         f"rm -rf {posixpath.join(VOL2_ROOT, 'docker', 'hearth', 'tmp')}",
+        f"rm -rf {custom_h1_nvme}/homeassistant/tmp",
+        "rm -rf $NAS_HOST_1_NVME_DOCKER_ROOT/homeassistant",
+        "rm -rf ${HOST_1_NVME_DOCKER_ROOT}/plex/cache",
         "rm -rf $NAS_HOST_2_DOCKER_ROOT/hearth",
         "rm -rf ${HOST_2_DOCKER_ROOT}/discord-ivy-agent/cache",
     ]
@@ -401,6 +474,9 @@ def test_volume2_recursive_delete_and_du_guards(monkeypatch):
 
     blocked_du = [
         f"du -sh {posixpath.join(VOL2_ROOT, 'docker')}",
+        "du -sh $NAS_HOST_1_NVME_DOCKER_ROOT",
+        "du -sh ${NAS_HOST_1_NVME_DOCKER_ROOT}/homeassistant",
+        "du -sh $HOST_1_NVME_DOCKER_ROOT",
         "du -sh $NAS_HOST_2_DOCKER_ROOT",
         "du -sh ${NAS_HOST_2_DOCKER_ROOT}/discord-ivy-agent",
         "du -sh $HOST_2_DOCKER_ROOT",

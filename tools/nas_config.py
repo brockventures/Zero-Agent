@@ -44,10 +44,14 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
     env_h1_docker = (os.environ.get("NAS_HOST_1_DOCKER_ROOT") or "").strip()
     env_docker = (os.environ.get("NAS_DOCKER_ROOT") or "").strip()
+    env_h1_nvme_docker = (os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or "").strip()
+    env_ha_config = (os.environ.get("NAS_HA_CONFIG_ROOT") or "").strip()
     env_h2_docker = (os.environ.get("NAS_HOST_2_DOCKER_ROOT") or "").strip()
     env_h2_name = (os.environ.get("NAS_HOST_2_NAME") or "").strip()
     json_h1_docker = ""
     json_docker = ""
+    json_h1_nvme_docker = ""
+    json_ha_config = ""
     json_h2_docker = ""
     json_h2_name = ""
     
@@ -91,6 +95,10 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
                     json_h1_docker = str(d["NAS_HOST_1_DOCKER_ROOT"]).strip()
                 if d.get("NAS_DOCKER_ROOT"):
                     json_docker = str(d["NAS_DOCKER_ROOT"]).strip()
+                if d.get("NAS_HOST_1_NVME_DOCKER_ROOT"):
+                    json_h1_nvme_docker = str(d["NAS_HOST_1_NVME_DOCKER_ROOT"]).strip()
+                if d.get("NAS_HA_CONFIG_ROOT"):
+                    json_ha_config = str(d["NAS_HA_CONFIG_ROOT"]).strip()
                 if d.get("NAS_HOST_2_DOCKER_ROOT"):
                     json_h2_docker = str(d["NAS_HOST_2_DOCKER_ROOT"]).strip()
                 if d.get("NAS_HOST_2_NAME"):
@@ -141,6 +149,17 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
         or json_docker
         or default_h1_docker
     ).replace("\\", "/")
+    host_1_nvme_docker_root = (
+        env_h1_nvme_docker
+        or json_h1_nvme_docker
+        or default_h2_docker
+    ).replace("\\", "/")
+    default_ha_config = posixpath.join(host_1_nvme_docker_root, "homeassistant", "config")
+    ha_config_root = (
+        env_ha_config
+        or json_ha_config
+        or default_ha_config
+    ).replace("\\", "/")
     host_2_docker_root = (
         env_h2_docker
         or json_h2_docker
@@ -157,6 +176,8 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     os.environ["NAS_SSH_KEY"] = ssh_key
     os.environ["NAS_DOCKER_ROOT"] = docker_root
     os.environ["NAS_HOST_1_DOCKER_ROOT"] = host_1_docker_root
+    os.environ["NAS_HOST_1_NVME_DOCKER_ROOT"] = host_1_nvme_docker_root
+    os.environ["NAS_HA_CONFIG_ROOT"] = ha_config_root
     os.environ["NAS_HOST_2_DOCKER_ROOT"] = host_2_docker_root
     if host_2_name:
         os.environ["NAS_HOST_2_NAME"] = host_2_name
@@ -174,18 +195,25 @@ DOCKER_ROOT = (
     os.environ.get("NAS_DOCKER_ROOT") or posixpath.join("/volume1", "docker")
 ).replace("\\", "/")
 HOST_1_DOCKER_ROOT = DOCKER_ROOT
+HOST_1_NVME_DOCKER_ROOT = (
+    os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or posixpath.join("/volume2", "docker")
+).replace("\\", "/")
+HA_CONFIG_ROOT = (
+    os.environ.get("NAS_HA_CONFIG_ROOT")
+    or posixpath.join(HOST_1_NVME_DOCKER_ROOT, "homeassistant", "config")
+).replace("\\", "/")
 HOST_2_DOCKER_ROOT = (
     os.environ.get("NAS_HOST_2_DOCKER_ROOT") or posixpath.join("/volume2", "docker")
 ).replace("\\", "/")
 
 
-def get_docker_root(host: str | None = None) -> str:
-    """Return the canonical Docker root for a NAS host (Host 2 defaults to Volume 2; all others to Volume 1)."""
+def _is_host_2(host: str | None) -> bool:
+    """Return True if host resolves to Host 2 via IP, .84 suffix, alias, or NAS_HOST_2_NAME."""
     if not host or not isinstance(host, str):
-        return DOCKER_ROOT
+        return False
     target = host.strip()
     if not target:
-        return DOCKER_ROOT
+        return False
     target_lower = target.lower()
     h2_ips = {
         ip.strip()
@@ -197,14 +225,26 @@ def get_docker_root(host: str | None = None) -> str:
         for n in (os.environ.get("NAS_HOST_2_NAME") or "").split(",")
         if n.strip()
     }
-    if (
+    return (
         target in h2_ips
         or target.endswith(".84")
         or target_lower in ("host2", "host_2", "host-2")
         or target_lower in h2_names
-    ):
+    )
+
+
+def get_docker_root(host: str | None = None) -> str:
+    """Return the canonical Docker Compose root for a NAS host (Host 2 defaults to Volume 2; all others to Volume 1)."""
+    if _is_host_2(host):
         return HOST_2_DOCKER_ROOT
     return DOCKER_ROOT
+
+
+def get_appdata_root(host: str | None = None) -> str:
+    """Return the canonical container appdata/config root for a NAS host (Host 2 -> HOST_2_DOCKER_ROOT; Host 1/default -> HOST_1_NVME_DOCKER_ROOT)."""
+    if _is_host_2(host):
+        return HOST_2_DOCKER_ROOT
+    return HOST_1_NVME_DOCKER_ROOT
 
 def build_ssh_cmd(
     host: str,
@@ -449,6 +489,9 @@ def _has_unsafe_first_subpath_segment(subpath: str) -> bool:
     return False
 
 
+_DOCKER_ROOT_VAR_PATTERN = r"(?:NAS_(?:HOST_1_NVME_|HOST_[12]_)?)?DOCKER_ROOT|HOST_(?:1_NVME_|[12]_)DOCKER_ROOT"
+
+
 def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str | None = None) -> Tuple[bool, str]:
     """Return (True, description) if raw_target points to '/', a NAS volume root, or top-level $NAS_DOCKER_ROOT without a safe sub-path."""
     clean = _strip_outer_quotes(raw_target).strip()
@@ -458,9 +501,8 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
     if active_cwd and not clean.startswith(("/", "$")):
         clean = active_cwd.rstrip("/") + "/" + clean
 
-    _docker_root_vars = r"(?:NAS_(?:HOST_[12]_)?)?DOCKER_ROOT|HOST_[12]_DOCKER_ROOT"
     m_var = re.match(
-        rf"^\$(?:{_docker_root_vars}|\{{(?:{_docker_root_vars})\}})(?=/|$)(?P<subpath>.*)$",
+        rf"^\$(?:{_DOCKER_ROOT_VAR_PATTERN}|\{{(?:{_DOCKER_ROOT_VAR_PATTERN})\}})(?=/|$)(?P<subpath>.*)$",
         clean,
     )
     if m_var:
@@ -492,6 +534,9 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
         os.environ.get("NAS_HOST_1_DOCKER_ROOT") or HOST_1_DOCKER_ROOT or default_vol_docker
     ).strip()
     configured_docker_root = (os.environ.get("NAS_DOCKER_ROOT") or DOCKER_ROOT or default_vol_docker).strip()
+    configured_h1_nvme_docker_root = (
+        os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or HOST_1_NVME_DOCKER_ROOT or default_vol2_docker
+    ).strip()
     configured_h2_docker_root = (
         os.environ.get("NAS_HOST_2_DOCKER_ROOT") or HOST_2_DOCKER_ROOT or default_vol2_docker
     ).strip()
@@ -505,6 +550,8 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
         protected_top_dirs.add(posixpath.normpath(configured_h1_docker_root))
     if configured_docker_root.startswith("/"):
         protected_top_dirs.add(posixpath.normpath(configured_docker_root))
+    if configured_h1_nvme_docker_root.startswith("/"):
+        protected_top_dirs.add(posixpath.normpath(configured_h1_nvme_docker_root))
     if configured_h2_docker_root.startswith("/"):
         protected_top_dirs.add(posixpath.normpath(configured_h2_docker_root))
 
@@ -809,9 +856,8 @@ def _is_protected_nas_du_target(raw_target: str, active_cwd: str | None = None) 
     if re.search(r"/volume(?:USB)?[0-9]*", clean, re.IGNORECASE):
         return True, raw_target
 
-    _du_docker_root_vars = r"(?:NAS_(?:HOST_[12]_)?)?DOCKER_ROOT|HOST_[12]_DOCKER_ROOT"
     if re.search(
-        rf"\$(?:\{{(?:{_du_docker_root_vars})\}}|(?:{_du_docker_root_vars})(?![A-Za-z0-9_]))",
+        rf"\$(?:\{{(?:{_DOCKER_ROOT_VAR_PATTERN})\}}|(?:{_DOCKER_ROOT_VAR_PATTERN})(?![A-Za-z0-9_]))",
         clean,
     ):
         return True, raw_target
