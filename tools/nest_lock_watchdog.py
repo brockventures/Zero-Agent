@@ -69,6 +69,7 @@ LOCK_ENTITY_ID = "lock.entryway_lock"
 
 COOLDOWN_SECONDS = 180  # 3 minutes minimum between restart attempts
 TRANSITION_TIMEOUT_SECONDS = 25.0  # Physical bolt throws in ~2.5s; >25s means stuck
+STARTUP_GRACE_SECONDS = 120.0  # Allow HA/HomeKit 2m after boot before bouncing Homebridge
 MAX_CONSECUTIVE_FAILURES = 3
 VERIFY_TIMEOUT_SECONDS = 65.0  # Homebridge + homebridge-nest startup takes ~42-60s
 VERIFY_POLL_INTERVAL_SECONDS = 5.0
@@ -101,6 +102,21 @@ def save_state(state: dict):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
     tmp.replace(STATE_FILE)
+
+
+def get_ha_core_state(base_url: str, token: str) -> str | None:
+    """Query Home Assistant /api/config for core lifecycle state (RUNNING, STARTING, NOT_RUNNING, STOPPING)."""
+    url = f"{base_url}/api/config"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("state")
+    except Exception:
+        return None
 
 
 def get_ha_entity_state(base_url: str, token: str, entity_id: str = LOCK_ENTITY_ID) -> dict | None:
@@ -206,13 +222,28 @@ def audit_lock_health(
     # 1. Inspect HA Lock State
     entity_data = get_ha_entity_state(base_url, token, LOCK_ENTITY_ID)
     if not entity_data:
-        return False, "Failed to query Home Assistant lock entity", details
+        ha_state = get_ha_core_state(base_url, token)
+        details["ha_core_state"] = ha_state
+        return True, f"Deferred: Home Assistant unreachable or restarting ({ha_state or 'no response'})", details
 
     state_val = entity_data.get("state")
     details["state"] = state_val
     last_changed_str = entity_data.get("last_changed")
 
     if state_val in ("unavailable", "unknown"):
+        ha_state = get_ha_core_state(base_url, token)
+        details["ha_core_state"] = ha_state
+        if ha_state and ha_state != "RUNNING":
+            return True, f"Deferred: Home Assistant core state is {ha_state} (startup/restart in progress)", details
+        if last_changed_str:
+            try:
+                dt_changed = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00"))
+                age_s = (datetime.now(timezone.utc) - dt_changed).total_seconds()
+                details["state_age_seconds"] = age_s
+                if age_s < STARTUP_GRACE_SECONDS:
+                    return True, f"Deferred: {LOCK_ENTITY_ID} in {state_val} for only {age_s:.0f}s (grace: {STARTUP_GRACE_SECONDS:.0f}s)", details
+            except Exception as e:
+                print(f"[NestWatchdog] Timestamp parse warning: {e}")
         return False, f"Lock entity is currently {state_val}", details
 
     if state_val in ("unlocking", "locking") and last_changed_str:

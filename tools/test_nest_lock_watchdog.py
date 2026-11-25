@@ -256,3 +256,37 @@ def test_execute_self_heal_delayed_readiness_polling(
     # Initial reload + periodic retry on 3rd poll
     assert mock_reload.call_count == 2
 
+
+@patch("nest_lock_watchdog.get_ha_core_state", return_value="STARTING")
+@patch("nest_lock_watchdog.get_ha_entity_state")
+def test_audit_defers_while_ha_starting(mock_get_ha, mock_core):
+    mock_get_ha.return_value = {"state": "unknown"}
+
+    healthy, reason, details = audit_lock_health("http://fake-ha", "fake-token")
+    assert healthy is True
+    assert "Deferred" in reason
+    assert details["ha_core_state"] == "STARTING"
+
+
+@patch("nest_lock_watchdog.get_ha_core_state", return_value="RUNNING")
+@patch("nest_lock_watchdog.get_ha_entity_state")
+def test_audit_defers_during_fresh_unknown_grace_window(mock_get_ha, mock_core):
+    fresh_time = datetime.now(timezone.utc) - timedelta(seconds=30)
+    mock_get_ha.return_value = {
+        "state": "unknown",
+        "last_changed": fresh_time.isoformat(),
+    }
+
+    healthy, reason, details = audit_lock_health("http://fake-ha", "fake-token")
+    assert healthy is True
+    assert "Deferred" in reason
+
+
+@patch("nest_lock_watchdog.get_ha_core_state", return_value=None)
+@patch("nest_lock_watchdog.get_ha_entity_state", return_value=None)
+def test_audit_defers_when_ha_unreachable_mid_restart(mock_get_ha, mock_core):
+    healthy, reason, details = audit_lock_health("http://fake-ha", "fake-token")
+    assert healthy is True
+    assert "Deferred" in reason
+
+
