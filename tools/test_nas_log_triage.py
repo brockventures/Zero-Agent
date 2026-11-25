@@ -1,13 +1,27 @@
-import unittest
-from unittest.mock import patch
+import json
+import os
+import re
 import sys
-if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
-from tools.nas_log_triage import run_nas_log_review
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from tools.nas_log_triage import (
+    REMOTE_BATCH_SCANNER,
+    fetch_unifi_ids_alerts,
+    format_autonomous_triage_prompt,
+    run_nas_log_review,
+)
+
 
 class TestNasLogTriage(unittest.TestCase):
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts", return_value={"ok": True, "alerts": [], "count": 0})
     @patch("tools.nas_log_triage.scan_all_nas_containers")
-    def test_zero_containers_fails(self, mock_scan):
+    def test_zero_containers_fails(self, mock_scan, _mock_ids):
         mock_scan.return_value = {
             "total_scanned": 0,
             "actionable_issues": [],
@@ -15,13 +29,14 @@ class TestNasLogTriage(unittest.TestCase):
             "host_errors": {"remote-host.local": "SSH timeout"},
             "duration_sec": 20.0
         }
-        ok, rep, extra = run_nas_log_review()
+        ok, rep, _extra = run_nas_log_review()
         self.assertFalse(ok)
         self.assertIn("Failed to scan", rep)
         self.assertNotIn("healthy", rep)
 
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts", return_value={"ok": True, "alerts": [], "count": 0})
     @patch("tools.nas_log_triage.scan_all_nas_containers")
-    def test_nominal_scan(self, mock_scan):
+    def test_nominal_scan(self, mock_scan, _mock_ids):
         mock_scan.return_value = {
             "total_scanned": 35,
             "actionable_issues": [],
@@ -32,22 +47,25 @@ class TestNasLogTriage(unittest.TestCase):
         ok, rep, extra = run_nas_log_review()
         self.assertTrue(ok)
         self.assertIn("All 35 containers healthy", rep)
+        self.assertNotIn("UniFi IDS", rep)
+        self.assertEqual(extra.get("unifi_ids_alerts"), {"ok": True, "alerts": [], "count": 0})
+        self.assertEqual(extra.get("total_issues"), 0)
+        prompt = format_autonomous_triage_prompt(extra)
+        self.assertNotIn("UniFi IDS", prompt)
+        self.assertNotIn("unifi_ids_alerts", prompt)
 
     def test_regex_oom_boundary(self):
-        import re
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         m = re.search(r"err_re = re\.compile\((r'[^']+')", REMOTE_BATCH_SCANNER)
         self.assertIsNotNone(m)
         pattern = eval(m.group(1))
-        rx = re.compile(pattern, re.I)
+        rx = re.compile(pattern, re.IGNORECASE)
         self.assertIsNone(rx.search("Living Room TV Connection reestablished!"))
         self.assertIsNotNone(rx.search("kernel: out of memory: oom-killer"))
         self.assertIsNotNone(rx.search("fatal error encountered"))
 
     def test_noise_re_cloudflared_disconnect(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         sample = '2026-09-23T04:16:42Z ERR Request failed error="stream 64477 canceled by remote with error code 0" connIndex=0 dest=https://outpost.brock.ventures/events'
         self.assertIsNotNone(rx.search(sample))
@@ -61,21 +79,21 @@ class TestNasLogTriage(unittest.TestCase):
         self.assertIsNotNone(rx.search('browserless.io:index:info Current period usage: {"date":1790567943803,"error":3}'))
 
     def test_noise_re_octoprint_init_videoin(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         sample = "i: init_VideoIn failed"
         self.assertIsNotNone(rx.search(sample))
+
     def test_noise_re_debug_level_ignored(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
+        self.assertIsNotNone(rx)
+
     def test_noise_re_zigpy_sleepy_delivery_timeout(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         samples = [
             "2026-10-05 21:45:32.187 WARNING (MainThread) [zigpy.application] Device <CustomZigpyDevice model='09B9' manuf='IKEA of Sweden' nwk=0xC9A1 ieee=10:35:97:00:00:15:b0:07 is_initialized=True> callback failed - DeliveryError('Failed to send request: <Status.APS_NO_ACK: 183>')",
@@ -89,9 +107,8 @@ class TestNasLogTriage(unittest.TestCase):
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")
 
     def test_noise_re_enphase_envoy_transient(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         samples = [
             "2026-10-06 21:43:27.828 ERROR (MainThread) [homeassistant.components.enphase_envoy.coordinator] Error fetching Envoy 482532028193 data: Error communicating with Envoy API on 198.51.100.170: aiohttp Cli",
@@ -103,9 +120,8 @@ class TestNasLogTriage(unittest.TestCase):
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")
 
     def test_noise_re_cloudflared_idle_dev_ports(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         samples = [
             '2026-10-06T23:50:48Z ERR  error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp 198.51.100.3:8000: connect: connection refused" connIndex=1 event=1 ingressRule=1 originService=http://discord-antigravity-agent:8000',
@@ -116,11 +132,9 @@ class TestNasLogTriage(unittest.TestCase):
         for s in samples:
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")
 
-
     def test_noise_re_broadlink_transient(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         samples = [
             "2026-10-07 21:47:14.671 ERROR (MainThread) [homeassistant.components.broadlink.updater] Error fetching RM4 mini remote (RM4 mini at 198.51.100.190) data: [Errno -4000] Network timeout: No response received within 10s",
@@ -129,12 +143,9 @@ class TestNasLogTriage(unittest.TestCase):
         for s in samples:
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")
 
-
-
     def test_noise_re_triage_enhancements(self):
-        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
         ns = {}
-        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)  # noqa: S102
         rx = ns["noise_re"]
         samples = [
             "--- End of inner exception stack trace ---",
@@ -167,9 +178,10 @@ class TestNasLogTriage(unittest.TestCase):
         for s in samples:
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")
 
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts", return_value={"ok": True, "alerts": [], "count": 0})
     @patch("tools.nas_log_triage.scan_all_nas_containers")
     @patch("tools.nas_log_triage.fetch_cisa_kev_catalog")
-    def test_kev_silent_when_patched(self, mock_kev, mock_scan):
+    def test_kev_silent_when_patched(self, mock_kev, mock_scan, _mock_ids):
         mock_kev.return_value = [
             {
                 "cveID": "CVE-2026-9999",
@@ -200,9 +212,10 @@ class TestNasLogTriage(unittest.TestCase):
         self.assertEqual(extra.get("total_issues"), 0)
         self.assertNotIn("Active Vulnerability", rep)
 
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts", return_value={"ok": True, "alerts": [], "count": 0})
     @patch("tools.nas_log_triage.scan_all_nas_containers")
     @patch("tools.nas_log_triage.fetch_cisa_kev_catalog")
-    def test_kev_flags_vulnerable_version(self, mock_kev, mock_scan):
+    def test_kev_flags_vulnerable_version(self, mock_kev, mock_scan, _mock_ids):
         mock_kev.return_value = [
             {
                 "cveID": "CVE-2026-9999",
@@ -234,6 +247,187 @@ class TestNasLogTriage(unittest.TestCase):
         self.assertIn("Active Vulnerability / Version Floor Risk Flagged", rep)
         self.assertIn("plex", rep)
         self.assertIn("CVE-2026-9999", rep)
+
+    @patch("tools.nas_log_triage.urllib.request.build_opener")
+    def test_fetch_unifi_ids_alerts_filters_local_dns_and_parses_risks(self, mock_build_opener):
+        captured_requests = []
+
+        login_resp = MagicMock()
+        login_resp.headers = {"X-Csrf-Token": "csrf-tok-123"}
+        login_resp.__enter__.return_value = login_resp
+        login_resp.__exit__.return_value = False
+
+        flows_payload = {
+            "data": {
+                "flows": [
+                    {
+                        "id": "flow-benign",
+                        "action": "block",
+                        "risk": {"level": "MEDIUM", "category": "dns_sinkhole"},
+                        "source": {"ip": "198.51.100.20", "name": "NasHost01"},
+                        "destination": {"ip": "127.0.0.1", "port": 53, "domain": "ads.example.invalid"},
+                    },
+                    {
+                        "id": "flow-high",
+                        "action": "block",
+                        "risk": {"level": "HIGH", "category": "malware_command_and_control"},
+                        "source": {"ip": "198.51.100.50", "port": 49152, "name": "IoT-Plug"},
+                        "destination": {"ip": "203.0.113.99", "port": 8080, "domain": "bad.example.net"},
+                        "ips": {"signature": "ET MALWARE Possible C2 Beacon"},
+                        "protocol": "tcp",
+                        "flow_start_time": 1764000000000,
+                    },
+                    {
+                        "id": "flow-med",
+                        "action": "allow",
+                        "risk": "MEDIUM",
+                        "source": {"ip": "198.51.100.60", "name": "Workstation"},
+                        "destination": {"ip": "203.0.113.45", "port": 4444},
+                        "signature": "ET SCAN Nmap Scripting Engine",
+                    },
+                ]
+            }
+        }
+        flows_resp = MagicMock()
+        flows_resp.read.return_value = json.dumps(flows_payload).encode("utf-8")
+        flows_resp.__enter__.return_value = flows_resp
+        flows_resp.__exit__.return_value = False
+
+        mock_opener = MagicMock()
+
+        def fake_open(req, timeout=10):
+            captured_requests.append((req, timeout))
+            if req.full_url.endswith("/api/auth/login"):
+                return login_resp
+            return flows_resp
+
+        mock_opener.open.side_effect = fake_open
+        mock_build_opener.return_value = mock_opener
+
+        env_patch = {
+            "UNIFI_BASE_URL": "https://198.51.100.1",
+            "UNIFI_USER": "audit-bot",
+            "UNIFI_PASSWORD": "test-password",
+        }
+        with patch.dict(os.environ, env_patch, clear=False):
+            result = fetch_unifi_ids_alerts(hours=24)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(len(result["alerts"]), 2)
+        self.assertEqual(result["alerts"][0]["risk"], "HIGH")
+        self.assertEqual(result["alerts"][0]["signature"], "ET MALWARE Possible C2 Beacon")
+        self.assertEqual(result["alerts"][0]["destination_ip"], "203.0.113.99")
+        self.assertEqual(result["alerts"][1]["risk"], "MEDIUM")
+        self.assertEqual(result["alerts"][1]["destination_ip"], "203.0.113.45")
+
+        self.assertEqual(len(captured_requests), 2)
+        login_req, flow_req = captured_requests[0][0], captured_requests[1][0]
+        self.assertEqual(login_req.full_url, "https://198.51.100.1/api/auth/login")
+        self.assertEqual(flow_req.full_url, "https://198.51.100.1/proxy/network/v2/api/site/default/traffic-flows")
+        self.assertEqual(flow_req.headers.get("X-csrf-token"), "csrf-tok-123")
+        body = json.loads(flow_req.data.decode("utf-8"))
+        self.assertEqual(body["risks"], ["HIGH", "MEDIUM"])
+        self.assertIn("timestampFrom", body)
+        self.assertIn("timestampTo", body)
+        self.assertGreater(body["timestampTo"], body["timestampFrom"])
+
+    @patch("tools.nas_log_triage.urllib.request.build_opener")
+    def test_fetch_unifi_ids_alerts_graceful_api_failure(self, mock_build_opener):
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = OSError("Connection timed out")
+        mock_build_opener.return_value = mock_opener
+
+        env_patch = {
+            "UNIFI_BASE_URL": "https://198.51.100.1",
+            "UNIFI_USER": "audit-bot",
+            "UNIFI_PASSWORD": "test-password",
+        }
+        with patch.dict(os.environ, env_patch, clear=False):
+            result = fetch_unifi_ids_alerts(hours=24)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Connection timed out", result["error"])
+        self.assertEqual(result["alerts"], [])
+        self.assertEqual(result["count"], 0)
+
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts")
+    @patch("tools.nas_log_triage.scan_all_nas_containers")
+    @patch("tools.nas_log_triage.evaluate_kev_risks", return_value=[])
+    def test_run_nas_log_review_surfaces_unifi_ids_alerts(self, _mock_kev, mock_scan, mock_ids):
+        mock_scan.return_value = {
+            "total_scanned": 39,
+            "actionable_issues": [],
+            "stale_transients": [],
+            "host_errors": {},
+            "versions_by_host": {},
+            "duration_sec": 1.5,
+        }
+        mock_ids.return_value = {
+            "ok": True,
+            "count": 2,
+            "alerts": [
+                {
+                    "risk": "HIGH",
+                    "action": "block",
+                    "source_name": "IoT-Cam",
+                    "source_ip": "198.51.100.55",
+                    "destination_ip": "203.0.113.88",
+                    "destination_port": 443,
+                    "destination_domain": "c2.example.net",
+                    "signature": "ET TROJAN Suspicious Outbound",
+                },
+                {
+                    "risk": "MEDIUM",
+                    "action": "allow",
+                    "source_name": "",
+                    "source_ip": "198.51.100.77",
+                    "destination_ip": "203.0.113.44",
+                    "destination_port": 22,
+                    "destination_domain": "",
+                    "signature": "ET SCAN SSH Probe",
+                },
+            ],
+        }
+
+        ok, rep, extra = run_nas_log_review()
+        self.assertTrue(ok)
+        self.assertEqual(extra["total_issues"], 2)
+        self.assertEqual(extra["unifi_ids_alerts"]["count"], 2)
+        self.assertIn("UniFi IDS Alerts (2)", rep)
+        self.assertIn("ET TROJAN Suspicious Outbound", rep)
+        self.assertIn("203.0.113.88:443", rep)
+
+        prompt = format_autonomous_triage_prompt(extra)
+        self.assertIn("### UniFi IDS Alerts:", prompt)
+        self.assertIn('"unifi_ids_alerts"', prompt)
+        self.assertIn("ET SCAN SSH Probe", prompt)
+
+    @patch("tools.nas_log_triage.fetch_unifi_ids_alerts")
+    @patch("tools.nas_log_triage.scan_all_nas_containers")
+    @patch("tools.nas_log_triage.evaluate_kev_risks", return_value=[])
+    def test_run_nas_log_review_graceful_on_unifi_failure(self, _mock_kev, mock_scan, mock_ids):
+        mock_scan.return_value = {
+            "total_scanned": 39,
+            "actionable_issues": [],
+            "stale_transients": [],
+            "host_errors": {},
+            "versions_by_host": {},
+            "duration_sec": 1.2,
+        }
+        mock_ids.return_value = {
+            "ok": False,
+            "error": "HTTP 401 Unauthorized",
+            "alerts": [],
+            "count": 0,
+        }
+
+        ok, rep, extra = run_nas_log_review()
+        self.assertTrue(ok)
+        self.assertEqual(extra["total_issues"], 0)
+        self.assertFalse(extra["unifi_ids_alerts"]["ok"])
+        self.assertNotIn("UniFi IDS", rep)
+        self.assertIn("All 39 containers healthy", rep)
 
 if __name__ == "__main__":
     unittest.main()

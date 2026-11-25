@@ -10,23 +10,29 @@ Features:
 - Clean 1-line nominal output when all systems are healthy.
 """
 
+import http.cookiejar
+import json
 import os
+import re
+import ssl
+import subprocess
 import sys
 import time
-import json
-import re
-import subprocess
-from pathlib import Path
+import urllib.request
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-for _p in ["/workspace", "/workspace/tools"]:
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+_TOOLS_DIR = str(Path(__file__).resolve().parent)
+for _p in (_REPO_ROOT, _TOOLS_DIR, "/workspace", "/workspace/tools"):
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.append(_p)
+
 
 # Resolve SSH and host configuration from nas_docker_mcp or environment
 def _resolve_nas_config():
@@ -36,7 +42,7 @@ def _resolve_nas_config():
         except ImportError:
             from nas_docker_mcp import _resolve_nas_config as _mcp_resolve
         return _mcp_resolve()
-    except Exception:
+    except Exception:  # noqa: BLE001
         ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
         return os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
 
@@ -327,13 +333,11 @@ def _is_version_below(running_ver: str, min_ver: str) -> bool:
 
 def fetch_cisa_kev_catalog(max_age_sec: int = 86400) -> list[dict]:
     """Fetch CISA KEV catalog with 24h on-disk cache and silent fallback on network failure."""
-    import urllib.request
-
     try:
         if KEV_CACHE_FILE.exists() and (time.time() - KEV_CACHE_FILE.stat().st_mtime) < max_age_sec:
             data = json.loads(KEV_CACHE_FILE.read_text())
             return data.get("vulnerabilities", []) if isinstance(data, dict) else []
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     try:
@@ -346,15 +350,15 @@ def fetch_cisa_kev_catalog(max_age_sec: int = 86400) -> list[dict]:
                     tmp_kev = KEV_CACHE_FILE.with_suffix(".tmp")
                     tmp_kev.write_text(raw, encoding="utf-8")
                     tmp_kev.replace(KEV_CACHE_FILE)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 return data["vulnerabilities"]
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             if KEV_CACHE_FILE.exists():
                 data = json.loads(KEV_CACHE_FILE.read_text())
                 return data.get("vulnerabilities", []) if isinstance(data, dict) else []
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return []
 
@@ -396,7 +400,7 @@ def evaluate_kev_risks(versions_by_host: dict, kev_catalog: list[dict] | None = 
     if not catalog:
         return risks
 
-    ver_extract_re = re.compile(r"(?:prior to|before|earlier than|<|<=)\s*v?(\d+\.\d+(?:\.\d+)*)", re.I)
+    ver_extract_re = re.compile(r"(?:prior to|before|earlier than|<|<=)\s*v?(\d+\.\d+(?:\.\d+)*)", re.IGNORECASE)
 
     for host, ver_map in versions_by_host.items():
         if not isinstance(ver_map, dict):
@@ -431,7 +435,7 @@ def evaluate_kev_risks(versions_by_host: dict, kev_catalog: list[dict] | None = 
 
     return risks
 
-def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20, port: str = None, key: str = None, user: str = None) -> dict:
+def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20, port: str | None = None, key: str | None = None, user: str | None = None) -> dict:
     """Run the batch scanner remotely on a host via SSH in a single pass."""
     script = REMOTE_BATCH_SCANNER.replace("__SINCE__", since)
     _, _, resolved_port = _resolve_nas_config()
@@ -444,14 +448,14 @@ def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20, port: st
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=6",
             f"{u}@{host}", "python3 -"
-        ], input=script, capture_output=True, text=True, timeout=timeout)
+        ], input=script, capture_output=True, text=True, timeout=timeout, check=False)
         if proc.returncode == 0 and proc.stdout.strip():
             return json.loads(proc.stdout.strip())
         else:
             err_snip = proc.stderr.strip()[:120] if proc.stderr else f"exit code {proc.returncode}"
             print(f"[NASTriage] Warning on {host}: {err_snip}", file=sys.stderr)
             return {"scanned": 0, "flagged": [], "error": err_snip}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[NASTriage] Error connecting to {host}: {e}", file=sys.stderr)
         return {"scanned": 0, "flagged": [], "error": str(e)}
 
@@ -482,8 +486,7 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
     hosts = [h1 or HOST_1_IP, h2 or HOST_2_IP]
     with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
         futures = {executor.submit(_ssh_python_batch, host, since=since): host for host in hosts}
-        for future in futures:
-            host = futures[future]
+        for future, host in futures.items():
             try:
                 res = future.result()
                 scanned = res.get("scanned", 0)
@@ -498,7 +501,7 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
                         stale.append(item)
                     else:
                         actionable.append(item)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 host_errors[host] = str(e)
 
     duration = time.time() - t0
@@ -524,6 +527,203 @@ def _format_kev_report_block(kev_risks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+UNIFI_ENV_FILE = Path("/secrets/env.json")
+_BENIGN_LOCAL_DNS_BLOCK_IPS = frozenset({"127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _get_unifi_credentials() -> tuple[str, str, str]:
+    """Load (base_url, username, password) from os.environ or /secrets/env.json."""
+    base = os.environ.get("UNIFI_BASE_URL", "")
+    user = os.environ.get("UNIFI_USER", "")
+    pw = os.environ.get("UNIFI_PASSWORD", "")
+    if (not base or not user or not pw) and UNIFI_ENV_FILE.exists():
+        try:
+            env_data = json.loads(UNIFI_ENV_FILE.read_text(encoding="utf-8"))
+            if isinstance(env_data, dict):
+                base = base or str(env_data.get("UNIFI_BASE_URL", ""))
+                user = user or str(env_data.get("UNIFI_USER", ""))
+                pw = pw or str(env_data.get("UNIFI_PASSWORD", ""))
+        except (OSError, ValueError, TypeError):
+            pass
+    return base.strip().rstrip("/"), user.strip(), pw
+
+
+def _extract_unifi_flows(raw_data: object) -> list[dict]:
+    """Extract flow records from UniFi traffic-flows response payload."""
+    if isinstance(raw_data, list):
+        return [f for f in raw_data if isinstance(f, dict)]
+    if isinstance(raw_data, dict):
+        if isinstance(raw_data.get("flows"), list):
+            return [f for f in raw_data["flows"] if isinstance(f, dict)]
+        data_field = raw_data.get("data")
+        if isinstance(data_field, dict) and isinstance(data_field.get("flows"), list):
+            return [f for f in data_field["flows"] if isinstance(f, dict)]
+        if isinstance(data_field, list):
+            return [f for f in data_field if isinstance(f, dict)]
+    return []
+
+
+def _normalize_unifi_flow(flow: dict) -> dict | None:
+    """Normalize a UniFi IDS/traffic-flow item and drop benign local DNS blocks."""
+    dest = flow.get("destination") if isinstance(flow.get("destination"), dict) else {}
+    src = flow.get("source") if isinstance(flow.get("source"), dict) else {}
+
+    dst_ip = str(
+        dest.get("ip")
+        or flow.get("destination_ip")
+        or flow.get("dest_ip")
+        or flow.get("dst_ip")
+        or ""
+    ).strip()
+    if dst_ip in _BENIGN_LOCAL_DNS_BLOCK_IPS:
+        return None
+
+    risk_val = flow.get("risk")
+    if isinstance(risk_val, dict):
+        risk_level = str(risk_val.get("level") or "").strip().upper()
+        risk_cat = str(risk_val.get("category") or "").strip()
+    else:
+        risk_level = str(risk_val or flow.get("risk_level") or "").strip().upper()
+        risk_cat = str(flow.get("category") or "").strip()
+
+    if risk_level in {"LOW", "NONE"}:
+        return None
+
+    ips_obj = flow.get("ips") if isinstance(flow.get("ips"), dict) else {}
+    signature = str(
+        ips_obj.get("signature")
+        or flow.get("signature")
+        or flow.get("threat_name")
+        or risk_cat
+        or ""
+    ).strip()
+
+    src_ip = str(
+        src.get("ip")
+        or flow.get("source_ip")
+        or flow.get("src_ip")
+        or ""
+    ).strip()
+    src_name = str(
+        src.get("name")
+        or src.get("hostname")
+        or flow.get("source_name")
+        or flow.get("client_name")
+        or ""
+    ).strip()
+    dst_port = dest.get("port") if dest.get("port") is not None else flow.get("destination_port") or flow.get("dst_port")
+    dst_domain = str(dest.get("domain") or flow.get("destination_domain") or flow.get("domain") or "").strip()
+    dst_country = str(dest.get("country") or flow.get("destination_country") or "").strip()
+    src_port = src.get("port") if src.get("port") is not None else flow.get("source_port") or flow.get("src_port")
+
+    return {
+        "id": flow.get("id", ""),
+        "risk": risk_level or "UNKNOWN",
+        "category": risk_cat,
+        "signature": signature,
+        "action": str(flow.get("action") or "").strip(),
+        "protocol": str(flow.get("protocol") or "").strip(),
+        "source_ip": src_ip,
+        "source_name": src_name,
+        "source_port": src_port,
+        "destination_ip": dst_ip,
+        "destination_port": dst_port,
+        "destination_domain": dst_domain,
+        "destination_country": dst_country,
+        "timestamp": flow.get("flow_start_time") or flow.get("timestamp") or flow.get("time") or "",
+    }
+
+
+def fetch_unifi_ids_alerts(hours: int = 24) -> dict:
+    """Query UCG-Max UniFi OS traffic-flows for HIGH/MEDIUM IDS threat alerts."""
+    base_url, user, password = _get_unifi_credentials()
+    if not base_url or not user or not password:
+        return {"ok": False, "error": "UniFi credentials not configured", "alerts": [], "count": 0}
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPCookieProcessor(cj),
+    )
+
+    try:
+        login_payload = json.dumps({"username": user, "password": password}).encode("utf-8")
+        login_req = urllib.request.Request(
+            f"{base_url}/api/auth/login",
+            data=login_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(login_req, timeout=8) as resp:
+            csrf_token = (
+                resp.headers.get("X-Csrf-Token")
+                or resp.headers.get("X-CSRF-Token")
+                or resp.headers.get("x-csrf-token")
+                or ""
+            )
+
+        now_ms = int(time.time() * 1000)
+        from_ms = now_ms - (max(1, int(hours)) * 3600 * 1000)
+        flow_headers = {"Content-Type": "application/json"}
+        if csrf_token:
+            flow_headers["X-Csrf-Token"] = csrf_token
+        flow_payload = json.dumps({
+            "timestampFrom": from_ms,
+            "timestampTo": now_ms,
+            "risks": ["HIGH", "MEDIUM"],
+        }).encode("utf-8")
+        flow_req = urllib.request.Request(
+            f"{base_url}/proxy/network/v2/api/site/default/traffic-flows",
+            data=flow_payload,
+            headers=flow_headers,
+            method="POST",
+        )
+        with opener.open(flow_req, timeout=10) as resp:
+            raw_body = resp.read().decode("utf-8", errors="replace")
+        raw_data = json.loads(raw_body)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "alerts": [], "count": 0}
+
+    alerts: list[dict] = []
+    for flow in _extract_unifi_flows(raw_data):
+        normalized = _normalize_unifi_flow(flow)
+        if normalized is not None:
+            alerts.append(normalized)
+
+    return {"ok": True, "alerts": alerts, "count": len(alerts)}
+
+
+def _format_unifi_ids_report_block(alerts: list[dict]) -> str:
+    if not alerts:
+        return ""
+    lines = [f"🚨 **UniFi IDS Alerts ({len(alerts)}):**"]
+    for alert in alerts[:10]:
+        risk = alert.get("risk") or "UNKNOWN"
+        src_name = alert.get("source_name") or ""
+        src_ip = alert.get("source_ip") or ""
+        if src_name and src_ip and src_name != src_ip:
+            src = f"{src_name} ({src_ip})"
+        else:
+            src = src_name or src_ip or "unknown"
+
+        dst_ip = alert.get("destination_ip") or "unknown"
+        dst_port = alert.get("destination_port")
+        dst = f"{dst_ip}:{dst_port}" if dst_port else dst_ip
+        if alert.get("destination_domain"):
+            dst = f"{alert['destination_domain']} ({dst})"
+
+        sig = alert.get("signature") or alert.get("category") or "IDS threat flow"
+        act = alert.get("action")
+        act_str = f" [{act}]" if act else ""
+        lines.append(f"- **[{risk}]**{act_str} `{src}` -> `{dst}` — {sig}")
+    if len(alerts) > 10:
+        lines.append(f"- *...and {len(alerts) - 10} more alert(s).*")
+    return "\n".join(lines)
+
+
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     """
     Bridge-compatible sidecar entry point.
@@ -542,7 +742,7 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     kev_risks = []
     try:
         kev_risks = evaluate_kev_risks(versions_by_host)
-    except Exception:
+    except Exception:  # noqa: BLE001
         kev_risks = []
     kev_report = _format_kev_report_block(kev_risks)
 
@@ -554,15 +754,26 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
         ha_telemetry = analyze_anomalies(auto_heal=True)
         if ha_telemetry.get("has_anomalies"):
             ha_report = format_report(ha_telemetry, quiet=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         ha_telemetry = {"ok": False, "error": str(e)}
 
+    # Poll UCG-Max UniFi IDS threat flows (silent on 0 alerts or API failure)
+    unifi_ids = {"ok": False, "alerts": [], "count": 0}
+    try:
+        unifi_ids = fetch_unifi_ids_alerts(24)
+    except Exception as e:  # noqa: BLE001
+        unifi_ids = {"ok": False, "error": str(e), "alerts": [], "count": 0}
+    ids_alerts = unifi_ids.get("alerts", []) if isinstance(unifi_ids, dict) else []
+    ids_count = int(unifi_ids.get("count", len(ids_alerts))) if isinstance(unifi_ids, dict) else 0
+    ids_report = _format_unifi_ids_report_block(ids_alerts)
+
     extra = {
-        "total_issues": len(actionable) + len(kev_risks),
-        "tier1_count": sum(1 for a in actionable if any("fatal" in s.lower() or "panic" in s.lower() or re.search(r"\boom\b", s, re.I) for s in a.get("sample_errors", []))) + len(kev_risks),
+        "total_issues": len(actionable) + len(kev_risks) + max(0, ids_count),
+        "tier1_count": sum(1 for a in actionable if any("fatal" in s.lower() or "panic" in s.lower() or re.search(r"\boom\b", s, re.IGNORECASE) for s in a.get("sample_errors", []))) + len(kev_risks),
         "tier2_count": len(actionable),
         "dossier": actionable,
         "kev_risks": kev_risks,
+        "unifi_ids_alerts": unifi_ids,
         "stale_transients": stale,
         "duration_sec": res["duration_sec"],
         "scanned": total_scanned,
@@ -577,6 +788,8 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
         rep = f"⚠️ **NAS Log Review** [{now_pt}]: Failed to scan containers across NAS clusters ({err_details})."
         if ha_report:
             rep = f"{rep}\n\n{ha_report}"
+        if ids_report:
+            rep = f"{rep}\n\n{ids_report}"
         return False, rep, extra
 
     # Nominal container logs: All scanned containers healthy or only harmless historical transients
@@ -588,6 +801,8 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
                 rep = f"{rep}\n\n{ha_report}"
             if kev_report:
                 rep = f"{rep}\n\n{kev_report}"
+            if ids_report:
+                rep = f"{rep}\n\n{ids_report}"
             return False, rep, extra
         monitored_ha = ha_telemetry.get("monitored_count", 0)
         unifi_cnt = ha_telemetry.get("unifi_clients_count", 0)
@@ -598,6 +813,8 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
             rep = f"{rep}\n\n{ha_report}"
         if kev_report:
             rep = f"{rep}\n\n{kev_report}"
+        if ids_report:
+            rep = f"{rep}\n\n{ids_report}"
         return True, rep, extra
 
     # Candidate issues detected
@@ -626,6 +843,9 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     if kev_report:
         lines.append(f"\n{kev_report}")
 
+    if ids_report:
+        lines.append(f"\n{ids_report}")
+
     return True, "\n".join(lines).strip(), extra
 
 
@@ -636,9 +856,16 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
     kev_risks = extra.get("kev_risks", [])
     stale = extra.get("stale_transients", [])
     ha_telemetry = extra.get("ha_telemetry", {})
+    raw_ids = extra.get("unifi_ids_alerts", {})
+    if isinstance(raw_ids, dict):
+        ids_alerts = raw_ids.get("alerts", [])
+    elif isinstance(raw_ids, list):
+        ids_alerts = raw_ids
+    else:
+        ids_alerts = []
     total = len(actionable)
 
-    dossier_json = json.dumps({
+    dossier_payload = {
         "actionable_containers": actionable,
         "kev_vulnerability_risks": kev_risks,
         "cleared_stale_transients": [s["container"] for s in stale],
@@ -648,13 +875,18 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
             "amplitude_anomalies": ha_telemetry.get("amplitude_anomalies", []),
             "network_anomalies": ha_telemetry.get("network_anomalies", []),
         } if ha_telemetry.get("has_anomalies") else "nominal"
-    }, indent=2)
+    }
+    if ids_alerts:
+        dossier_payload["unifi_ids_alerts"] = ids_alerts
+
+    dossier_json = json.dumps(dossier_payload, indent=2)
+    ids_section = f"\n\n### UniFi IDS Alerts:\n{_format_unifi_ids_report_block(ids_alerts)}" if ids_alerts else ""
 
     return (
         f"Nightly Autonomous NAS Log & Telemetry Triage [{now_pt}]:\n"
         f"The log harvester scanned {extra.get('scanned', 39)} running containers across Host1 (.82) and Host2 (.84) "
         f"and flagged candidate issues in {total} container(s).\n\n"
-        f"### Incident Dossier:\n```json\n{dossier_json}\n```\n\n"
+        f"### Incident Dossier:\n```json\n{dossier_json}\n```{ids_section}\n\n"
         f"### Autonomous Directives:\n"
         f"1. **Forensic Liveness & Root-Cause Analysis:** Silently investigate each flagged container and any HA telemetry anomalies. Determine if errors are actively recurring or transient hiccups.\n"
         f"2. **Autonomous Safe Remediation:** For actionable code, config, schema, or mapping issues within homelab policy "
