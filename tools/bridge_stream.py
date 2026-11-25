@@ -514,6 +514,38 @@ def check_transcript_turn_status(
     return {"is_complete": False, "content": None, "reason": "no_entries"}
 
 
+def _is_background_task_launch(payload_str: str) -> bool:
+    """Return True if a serialized tool step/event indicates a non-daemon background task launch."""
+    if not payload_str or not isinstance(payload_str, str):
+        return False
+    low = payload_str.lower()
+    if re.search(r'\\?"is_?daemon\\?"\s*:\s*true\b', low):
+        return False
+    return (
+        "tool is running as a background task" in low
+        or "running as a background task with task id" in low
+    )
+
+
+def _is_background_task_completion(payload_str: str) -> bool:
+    """Return True if a serialized system_message step/event indicates background task/subagent completion."""
+    if not payload_str or not isinstance(payload_str, str):
+        return False
+    low = payload_str.lower()
+    return any(
+        marker in low
+        for marker in (
+            "task id",
+            "finished with result",
+            "/task-",
+            "sender=",
+            "a subagent has completed",
+            "an async",
+            "background task",
+        )
+    )
+
+
 class AgyStreamParser:
     """Deterministic state-machine parser for agy stream-json output."""
 
@@ -528,6 +560,7 @@ class AgyStreamParser:
         self.current_agent_step_index: Optional[int] = None
         self.interrupted_since_last_step: bool = False
         self.deferred_ack_text: str = ""
+        self.has_pending_background_task: bool = False
 
     def _capture_deferred_ack(self) -> None:
         """Capture preliminary finding ending with [[defer]] before accumulated segment is cleared for a tool."""
@@ -544,7 +577,7 @@ class AgyStreamParser:
         self.deferred_ack_text = ""
         return ack
 
-    def reset_pre_completion_draft(self) -> None:
+    def reset_pre_completion_draft(self, clear_pending_task: bool = False) -> None:
         """Discard premature response drafts emitted before an active background task or tool completed."""
         self.accumulated_segment.clear()
         self.last_substantive_response = ""
@@ -552,6 +585,9 @@ class AgyStreamParser:
         self.final_result_response = ""
         self.is_explicit_silence = False
         self.current_agent_step_index = None
+        self.interrupted_since_last_step = False
+        if clear_pending_task:
+            self.has_pending_background_task = False
 
     @staticmethod
     def _is_silence_or_placeholder(text: str) -> bool:
@@ -628,24 +664,33 @@ class AgyStreamParser:
             tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
 
             if (stype in ("tool",) or tname):
-                # Tool execution: clear pre-tool narration and any stale intermediate result, preserving substantive response across system tasks
+                # Tool execution: clear pre-tool narration, rotated drafts, and stale intermediate results
                 self._capture_deferred_ack()
                 self.accumulated_segment.clear()
+                self.last_substantive_response = ""
                 self.interrupted_draft = ""
                 self.final_result_response = ""
                 self.is_explicit_silence = False
                 self.current_agent_step_index = None
+                if _is_background_task_launch(json.dumps(step)):
+                    self.has_pending_background_task = True
 
             elif stype in ("system_message", "system", "error_message", "error"):
-                # Asynchronous system event or stream interruption: rotate substantive draft for reconciliation
+                # Asynchronous system event or stream interruption
                 step_str = json.dumps(step).lower()
                 is_int = (
                     "interrupted" in step_str
                     or stype in ("error_message", "error")
                     or step.get("state") == "ERROR"
                 )
-                self._rotate_accumulated_segment(interrupted=is_int)
-                self.current_agent_step_index = None
+                if not is_int and (
+                    self.has_pending_background_task
+                    or _is_background_task_completion(step_str)
+                ):
+                    self.reset_pre_completion_draft(clear_pending_task=True)
+                else:
+                    self._rotate_accumulated_segment(interrupted=is_int)
+                    self.current_agent_step_index = None
 
             elif stype == "agent_response":
                 sidx = step.get("step_index")
@@ -676,10 +721,13 @@ class AgyStreamParser:
         elif ev_type in ("tool", "tool_call", "tool_use"):
             self._capture_deferred_ack()
             self.accumulated_segment.clear()
+            self.last_substantive_response = ""
             self.interrupted_draft = ""
             self.final_result_response = ""
             self.is_explicit_silence = False
             self.current_agent_step_index = None
+            if _is_background_task_launch(json.dumps(event)):
+                self.has_pending_background_task = True
 
         elif ev_type in ("system_message", "system", "error", "error_message"):
             ev_str = json.dumps(event).lower()
@@ -688,8 +736,14 @@ class AgyStreamParser:
                 or ev_type in ("error", "error_message")
                 or event.get("type") == "ERROR_MESSAGE"
             )
-            self._rotate_accumulated_segment(interrupted=is_int)
-            self.current_agent_step_index = None
+            if not is_int and (
+                self.has_pending_background_task
+                or _is_background_task_completion(ev_str)
+            ):
+                self.reset_pre_completion_draft(clear_pending_task=True)
+            else:
+                self._rotate_accumulated_segment(interrupted=is_int)
+                self.current_agent_step_index = None
 
         elif ev_type in ("content", "message", "text", "delta"):
             content = event.get("content") or event.get("text") or event.get("delta")

@@ -703,6 +703,187 @@ class TestBridgeStream(unittest.TestCase):
         self.assertIsNone(status["content"])
         self.assertEqual(status["step_index"], 1)
 
+    def test_background_task_launch_and_completion_discards_pre_task_wait_chatter(self):
+        """Verify background task launch -> unflagged wait chatter -> task-completion system_message outputs ONLY final reply."""
+        parser = AgyStreamParser(conv_id="conv-bg-wait-chatter")
+        # Step 1: Tool launches a background task
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "result": "Tool is running as a background task with task ID task-818."
+                },
+            },
+        })
+        self.assertTrue(parser.has_pending_background_task)
+
+        # Step 2: Arbitrary unflagged wait text / self-talk emitted before task finishes
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "step_index": 2,
+                "text_delta": "Testing... wait NO! Do NOT emit ANY visible text!",
+                "state": "DONE",
+            },
+        })
+
+        # Step 3: Task completion system_message arrives -> must discard pre-completion chatter completely
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+                "content": "Background task task-818 finished with result: exit code 0",
+            },
+        })
+        self.assertFalse(parser.has_pending_background_task)
+        self.assertEqual(parser.last_substantive_response, "")
+        self.assertEqual(len(parser.accumulated_segment), 0)
+
+        # Step 4: Final reply arrives
+        final_reply = "Deployment completed cleanly and all health checks passed."
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "step_index": 3,
+                "text_delta": final_reply,
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(parser.get_final_response(), final_reply)
+
+        # Also verify top-level tool / system_message event branches mirror step_update behavior
+        top_parser = AgyStreamParser(conv_id="conv-bg-top-level")
+        top_parser.process_event({
+            "event": "tool_use",
+            "tool_name": "run_command",
+            "output": "Running as a background task with task ID task-909",
+        })
+        self.assertTrue(top_parser.has_pending_background_task)
+        top_parser.process_event({
+            "event": "content",
+            "content": "Hold on, waiting for background worker to finish.",
+        })
+        top_parser.process_event({
+            "event": "system_message",
+            "content": "Task ID task-909 finished with result: ok",
+        })
+        self.assertFalse(top_parser.has_pending_background_task)
+        self.assertEqual(top_parser.last_substantive_response, "")
+        top_parser.process_event({
+            "event": "content",
+            "content": "Final top-level reply.",
+        })
+        self.assertEqual(top_parser.get_final_response(), "Final top-level reply.")
+
+    def test_pre_tool_text_rotated_by_system_message_cleared_by_subsequent_tool_call(self):
+        """Verify pre-tool text rotated into last_substantive_response by system_message is cleared on next tool call."""
+        parser = AgyStreamParser(conv_id="conv-tool-clears-last")
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "Checking the logs right now, stand by.",
+                "state": "DONE",
+            },
+        })
+        # Non-task system_message rotates text into last_substantive_response
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+            },
+        })
+        self.assertEqual(
+            parser.last_substantive_response,
+            "Checking the logs right now, stand by.",
+        )
+
+        # Subsequent tool call must clear last_substantive_response so pre-tool chatter never leaks
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "read_file",
+            },
+        })
+        self.assertEqual(parser.last_substantive_response, "")
+        self.assertEqual(parser.get_final_response(), "")
+
+        # Final post-tool answer is returned cleanly without pre-tool chatter
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "Logs show zero errors over the last 24h.",
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(
+            parser.get_final_response(),
+            "Logs show zero errors over the last 24h.",
+        )
+
+        # Verify top-level tool_call also clears last_substantive_response
+        parser.last_substantive_response = "Stale rotated draft"
+        parser.process_event({"event": "tool_call", "tool_name": "run_command"})
+        self.assertEqual(parser.last_substantive_response, "")
+
+    def test_reset_pre_completion_draft_pending_task_flag_and_daemon_carveout(self):
+        """Verify reset_pre_completion_draft preserves has_pending_background_task by default, clears on flag, and ignores daemons."""
+        parser = AgyStreamParser(conv_id="conv-daemon-carveout")
+
+        # Daemon tool payloads must NOT arm has_pending_background_task
+        for daemon_step in (
+            {
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "parameters": {"CommandLine": "npm run dev", "IsDaemon": True},
+                    "result": "Tool is running as a background task with task ID task-daemon-1",
+                },
+            },
+            {
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "parameters": {"CommandLine": "tail -f app.log", "is_daemon": True},
+                    "result": "Running as a background task with task ID task-daemon-2",
+                },
+            },
+        ):
+            parser.process_event({"event": "step_update", "step_update": daemon_step})
+            self.assertFalse(parser.has_pending_background_task)
+
+        # Non-daemon background task arms has_pending_background_task
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "parameters": {"CommandLine": "pytest", "IsDaemon": False},
+                    "result": "Tool is running as a background task with task ID task-fg-1",
+                },
+            },
+        })
+        self.assertTrue(parser.has_pending_background_task)
+        parser.interrupted_since_last_step = True
+        parser.last_substantive_response = "Premature wait chatter"
+
+        # Default reset preserves has_pending_background_task while clearing drafts and interrupted flag
+        parser.reset_pre_completion_draft()
+        self.assertTrue(parser.has_pending_background_task)
+        self.assertFalse(parser.interrupted_since_last_step)
+        self.assertEqual(parser.last_substantive_response, "")
+
+        # Explicit clear_pending_task=True disarms has_pending_background_task
+        parser.reset_pre_completion_draft(clear_pending_task=True)
+        self.assertFalse(parser.has_pending_background_task)
+
 
 class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration unit tests for TurnCoordinator and bridge_runner stream interruption recovery."""
@@ -794,6 +975,101 @@ class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(resp, "Build succeeded.")
+        mock_recycle.assert_not_called()
+
+    async def test_turn_coordinator_discards_intermediate_result_via_stream_pending_bg_flag(self):
+        """Verify execute_stream_loop intercepts premature result via stream_parser.has_pending_background_task even on transcript-flush race or missing conv_id."""
+        from tools.bridge_engine import TurnCoordinator
+
+        coord = TurnCoordinator(
+            channel_id=1542081375287640084,
+            prompt="Run long check",
+            mode="home",
+            reply_target=MagicMock(),
+            status_msg=None,
+            conv_id=None,
+        )
+
+        # Backdate turn_start_time so stale-result <1.5s filter does not mask the pending-bg guard
+        coord.turn_start_time -= 5.0
+
+        lines = [
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": {
+                        "result": "Tool is running as a background task with task ID task-race-1."
+                    },
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "step_index": 1,
+                    "text_delta": "Testing... wait NO! Do NOT emit ANY visible text!",
+                    "state": "DONE",
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "Testing... wait NO! Do NOT emit ANY visible text!",
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "system_message",
+                    "content": "Background task task-race-1 finished with result: exit code 0",
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "step_index": 2,
+                    "text_delta": "All background checks completed cleanly.",
+                    "state": "DONE",
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "conversation_id": "conv-bg-race-1",
+                    "status": "SUCCESS",
+                    "response": "All background checks completed cleanly.",
+                },
+            }).encode() + b"\n",
+            b"",
+        ]
+        line_iter = iter(lines)
+        reader = AsyncMock()
+        reader.readline = AsyncMock(side_effect=lambda: next(line_iter))
+
+        parser = AgyStreamParser()
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 9993
+        mock_recycle = AsyncMock()
+
+        with patch("tools.task_settle.get_turn_pending_tasks", return_value=[]), \
+             patch("tools.bridge_engine.check_transcript_turn_status", return_value={"is_complete": False, "has_active_tool": False, "reason": "no_entries"}), \
+             patch("tools.bridge_engine.set_channel_session_id"):
+            resp = await coord.execute_stream_loop(
+                proc=proc,
+                stdout_reader=reader,
+                stream_parser=parser,
+                timer=timer,
+                rules={"live_status_ticker_enabled": False},
+                on_recycle=mock_recycle,
+            )
+
+        self.assertEqual(resp, "All background checks completed cleanly.")
+        self.assertFalse(parser.has_pending_background_task)
         mock_recycle.assert_not_called()
 
     def test_bridge_runner_transient_stream_drop_retry_detection(self):

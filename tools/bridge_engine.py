@@ -644,8 +644,11 @@ class TurnCoordinator:
                             timer.mark_event(is_token=True)
                         self.current_action = "Drafting response..."
                 if step.get("state") == "DONE" and self.had_substantive_delta:
-                    is_pending = False
-                    if self.conv_id:
+                    is_pending = (
+                        getattr(stream_parser, "has_pending_background_task", False)
+                        is True
+                    )
+                    if not is_pending and self.conv_id:
                         try:
                             from tools.task_settle import get_turn_pending_tasks
                             is_pending = bool(get_turn_pending_tasks(self.conv_id))
@@ -666,8 +669,10 @@ class TurnCoordinator:
                 self.conv_id = res_cid
 
             # Do not arm result_received_at if background tasks are still pending
-            is_intermediate = False
-            if self.conv_id:
+            is_intermediate = (
+                getattr(stream_parser, "has_pending_background_task", False) is True
+            )
+            if not is_intermediate and self.conv_id:
                 try:
                     from tools.task_settle import get_turn_pending_tasks
                     if get_turn_pending_tasks(str(self.conv_id)):
@@ -895,13 +900,20 @@ class TurnCoordinator:
                     get_last_agy_error() if get_last_agy_error else None
                 )
                 has_terminal_error = bool(last_err_now or res_data.get("error"))
-                if active_cid and not has_terminal_error:
+                has_pending_bg = (
+                    getattr(stream_parser, "has_pending_background_task", False)
+                    is True
+                )
+                if (active_cid or has_pending_bg) and not has_terminal_error:
                     try:
-                        from tools.task_settle import get_turn_pending_tasks
-                        pending_sdk_tasks = get_turn_pending_tasks(str(active_cid))
-                        t_status = check_transcript_turn_status(
-                            str(active_cid), min_step_index=self.baseline_step_index
-                        )
+                        pending_sdk_tasks = []
+                        t_status = {}
+                        if active_cid:
+                            from tools.task_settle import get_turn_pending_tasks
+                            pending_sdk_tasks = get_turn_pending_tasks(str(active_cid))
+                            t_status = check_transcript_turn_status(
+                                str(active_cid), min_step_index=self.baseline_step_index
+                            )
                         candidate_resp = (
                             stream_parser.get_final_response(fallback_result=res_resp)
                             or res_resp
@@ -926,18 +938,23 @@ class TurnCoordinator:
                             or bool(res_resp.strip())
                         )
                         is_unflushed_tool_output_race = (
-                            len(pending_sdk_tasks) == 0
+                            not has_pending_bg
+                            and len(pending_sdk_tasks) == 0
                             and t_status.get("reason") == "tool_output_pending"
                             and has_result_done
                             and has_substantive_resp
                         )
-                        if pending_sdk_tasks or (
-                            t_status.get("has_active_tool")
-                            and not is_unflushed_tool_output_race
+                        if (
+                            has_pending_bg
+                            or pending_sdk_tasks
+                            or (
+                                t_status.get("has_active_tool")
+                                and not is_unflushed_tool_output_race
+                            )
                         ):
                             print(
                                 f"[BridgeEngine] ⏳ Intermediate result received in #{worker_name} while background task/tool active "
-                                f"(tasks={len(pending_sdk_tasks)}, reason={t_status.get('reason')}); continuing stdout stream..."
+                                f"(tasks={len(pending_sdk_tasks)}, stream_bg={has_pending_bg}, reason={t_status.get('reason')}); continuing stdout stream..."
                             )
                             self.result_received_at = None
                             stream_parser.reset_pre_completion_draft()
