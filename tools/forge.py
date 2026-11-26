@@ -12348,11 +12348,16 @@ def _short_pt_str(ts: Optional[float] = None) -> str:
 
 
 def _truncate_label(text: str, max_len: int = 56) -> str:
-    """Truncate a label cleanly at a word boundary without ugly mid-word cuts."""
+    """Truncate a label cleanly at a word boundary without ugly mid-word or dangling-conjunction cuts."""
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(clean) <= max_len:
         return clean
-    clipped = clean[: max_len - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    clipped = clean[: max_len - 1].rsplit(" ", 1)[0].rstrip(" ,;:-(&/")
+    dangling = {"&", "and", "or", "in", "to", "for", "of", "with", "the", "a", "an", "on", "at", "by"}
+    words = clipped.split()
+    while len(words) > 2 and words[-1].lower().rstrip(",;:-") in dangling:
+        words.pop()
+    clipped = " ".join(words).rstrip(" ,;:-(&/")
     return f"{clipped or clean[: max_len - 1]}…"
 
 
