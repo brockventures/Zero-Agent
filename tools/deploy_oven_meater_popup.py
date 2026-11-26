@@ -133,6 +133,60 @@ const OVEN_MEATER_CONFIG = {
       "Pork Shoulder (203°F)",
       "Brisket (203°F)",
     ],
+    proteinCategories: [
+      {
+        id: "poultry",
+        label: "Poultry",
+        icon: "poultry",
+        cuts: [
+          { label: "Turkey Breast (165°F)", cut: "Turkey Breast", doneness: "USDA Safe", targetF: 165, restMin: 20, presetOption: "Turkey Breast (165°F)" },
+          { label: "Turkey Thigh (175°F)", cut: "Turkey Thigh", doneness: "Dark Meat", targetF: 175, restMin: 20, presetOption: "Turkey Thigh (175°F)" },
+          { label: "Whole Chicken (165°F)", cut: "Whole Chicken", doneness: "USDA Safe", targetF: 165, restMin: 15, presetOption: "Chicken (165°F)" },
+          { label: "Chicken Breast (165°F)", cut: "Chicken Breast", doneness: "White Meat", targetF: 165, restMin: 5, presetOption: "Chicken (165°F)" },
+          { label: "Duck Breast Med-Rare (135°F)", cut: "Duck Breast", doneness: "Med-Rare", targetF: 135, restMin: 10, presetOption: "Duck Breast Med-Rare (135°F)" },
+        ],
+      },
+      {
+        id: "beef",
+        label: "Beef",
+        icon: "beef",
+        cuts: [
+          { label: "Prime Rib Med-Rare (130°F)", cut: "Prime Rib", doneness: "Med-Rare", targetF: 130, restMin: 25, presetOption: "Prime Rib Med-Rare (130°F)" },
+          { label: "Steak Rare (125°F)", cut: "Steak Rare", doneness: "Rare", targetF: 125, restMin: 8, presetOption: "Steak Rare (125°F)" },
+          { label: "Steak Med-Rare (135°F)", cut: "Steak Med-Rare", doneness: "Med-Rare", targetF: 135, restMin: 8, presetOption: "Steak Med-Rare (135°F)" },
+          { label: "Steak Medium (145°F)", cut: "Steak Medium", doneness: "Medium", targetF: 145, restMin: 8, presetOption: "Steak Medium (145°F)" },
+          { label: "Brisket (203°F)", cut: "Brisket", doneness: "BBQ Tender", targetF: 203, restMin: 30, presetOption: "Brisket (203°F)" },
+        ],
+      },
+      {
+        id: "pork",
+        label: "Pork",
+        icon: "pork",
+        cuts: [
+          { label: "Pork Chop (145°F)", cut: "Pork Chop", doneness: "Medium", targetF: 145, restMin: 5, presetOption: "Pork Chop (145°F)" },
+          { label: "Pork Tenderloin (145°F)", cut: "Pork Tenderloin", doneness: "Medium", targetF: 145, restMin: 5, presetOption: "Pork Tenderloin (145°F)" },
+          { label: "Pork Shoulder / Butt (203°F)", cut: "Pork Shoulder / Butt", doneness: "Pulled BBQ", targetF: 203, restMin: 30, presetOption: "Pork Shoulder (203°F)" },
+          { label: "Baby Back Ribs (198°F)", cut: "Baby Back Ribs", doneness: "BBQ Tender", targetF: 198, restMin: 15, presetOption: "Baby Back Ribs (198°F)" },
+        ],
+      },
+      {
+        id: "lamb_fish",
+        label: "Lamb & Fish",
+        icon: "lamb_fish",
+        cuts: [
+          { label: "Rack of Lamb Med-Rare (135°F)", cut: "Rack of Lamb", doneness: "Med-Rare", targetF: 135, restMin: 10, presetOption: "Rack of Lamb Med-Rare (135°F)" },
+          { label: "Salmon (125°F)", cut: "Salmon", doneness: "Medium", targetF: 125, restMin: 3, presetOption: "Salmon (125°F)" },
+          { label: "White Fish (140°F)", cut: "White Fish", doneness: "Flaky", targetF: 140, restMin: 3, presetOption: "White Fish (140°F)" },
+        ],
+      },
+      {
+        id: "custom",
+        label: "Custom",
+        icon: "custom",
+        note: "Use the -5° / -1° / +1° / +5° stepper above to dial in any custom target temperature (100°F–225°F).",
+        cuts: [],
+      },
+    ],
   },
 };
 /* OVEN_MEATER_CONFIG_END */"""
@@ -140,6 +194,11 @@ const OVEN_MEATER_CONFIG = {
 OVEN_MEATER_ICONS_JS = """  /* OVEN_MEATER_ICONS_BEGIN */
   oven: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M18,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V4A2,2 0 0,0 18,2M7.5,4.5A1,1 0 0,1 8.5,5.5A1,1 0 0,1 7.5,6.5A1,1 0 0,1 6.5,5.5A1,1 0 0,1 7.5,4.5M12,4.5A1,1 0 0,1 13,5.5A1,1 0 0,1 12,6.5A1,1 0 0,1 11,5.5A1,1 0 0,1 12,4.5M16.5,4.5A1,1 0 0,1 17.5,5.5A1,1 0 0,1 16.5,6.5A1,1 0 0,1 15.5,5.5A1,1 0 0,1 16.5,4.5M18,19H6V9H18V19M12,11C10.5,12.5 9.8,13.9 9.8,15.1A2.2,2.2 0 0,0 12,17.3A2.2,2.2 0 0,0 14.2,15.1C14.2,13.9 13.5,12.5 12,11Z"/></svg>`,
   meater: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M20.2,3.8A2.8,2.8 0 0,0 16.2,3.8L13.4,6.6L17.4,10.6L20.2,7.8A2.8,2.8 0 0,0 20.2,3.8M12.3,7.7L4.4,15.6L2.5,20.5L3.5,21.5L8.4,19.6L16.3,11.7L12.3,7.7M8.5,2.5A7.5,7.5 0 0,0 3.2,4.7L4.6,6.1A5.5,5.5 0 0,1 8.5,4.5V2.5M8.5,6.5A3.5,3.5 0 0,0 6,7.5L7.4,8.9A1.5,1.5 0 0,1 8.5,8.5V6.5Z"/></svg>`,
+  poultry: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M18.06,5.94C15.9,3.78 12.55,3.5 10.07,5.28C7.94,6.8 7.12,9.45 7.77,11.88L4.9,14.75C4.12,14.55 3.26,14.76 2.66,15.36C1.78,16.24 1.78,17.66 2.66,18.54C3.09,18.97 3.67,19.18 4.25,19.18C4.82,19.18 5.4,18.97 5.84,18.54C5.41,18.97 5.2,19.55 5.2,20.13C5.2,20.7 5.41,21.28 5.84,21.72C6.72,22.6 8.14,22.6 9.02,21.72C9.62,21.12 9.83,20.26 9.63,19.48L12.5,16.61C14.93,17.26 17.58,16.44 19.1,14.31C20.88,11.83 20.6,8.48 18.06,5.94Z"/></svg>`,
+  beef: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M18.5,4C15.8,2.5 11.4,3.1 8.4,5.4C5.1,7.9 3,11.7 3,15.2C3,18.4 5.6,21 9.2,21C12.3,21 14.7,19.3 16.9,17.4C19.3,15.3 21,12.8 21,9.5C21,7.1 20.1,4.9 18.5,4M15.5,11.8C14.1,13 12.1,13.2 10.9,12C9.7,10.8 9.9,8.8 11.3,7.6C12.7,6.4 14.7,6.2 15.9,7.4C17.1,8.6 16.9,10.6 15.5,11.8M7.8,17.2C6.7,17.2 5.8,16.3 5.8,15.2C5.8,14.1 6.7,13.2 7.8,13.2C8.9,13.2 9.8,14.1 9.8,15.2C9.8,16.3 8.9,17.2 7.8,17.2Z"/></svg>`,
+  pork: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M19.8,10.5C19.5,8.2 17.9,6.4 15.7,5.7L17,3.5L14.3,4.3C13.4,4.1 12.4,4 11.5,4C7.5,4 4.2,6.6 3.5,10.1C2.6,10.3 2,11.1 2,12C2,13 2.7,13.8 3.6,14C4.1,15.3 5,16.4 6.2,17.2L5.5,20H8.2L8.7,18.3C9.6,18.6 10.5,18.7 11.5,18.7C12.5,18.7 13.4,18.5 14.3,18.3L14.8,20H17.5L16.8,17.1C18,16.2 19,15 19.5,13.5H21.5V10.5H19.8M15.5,10.5A1.2,1.2 0 0,1 14.3,9.3A1.2,1.2 0 0,1 15.5,8.1A1.2,1.2 0 0,1 16.7,9.3A1.2,1.2 0 0,1 15.5,10.5Z"/></svg>`,
+  lamb_fish: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12,6C16.4,6 20.1,8.4 22,12C20.1,15.6 16.4,18 12,18C9.3,18 6.9,17 5,15.3L2,18V6L5,8.7C6.9,7 9.3,6 12,6M16.5,10.2A1.8,1.8 0 0,0 14.7,12A1.8,1.8 0 0,0 16.5,13.8A1.8,1.8 0 0,0 18.3,12A1.8,1.8 0 0,0 16.5,10.2Z"/></svg>`,
+  custom: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M15,13V5A3,3 0 0,0 9,5V13A5,5 0 1,0 15,13M12,4A1,1 0 0,1 13,5V8H11V5A1,1 0 0,1 12,4Z"/></svg>`,
   /* OVEN_MEATER_ICONS_END */"""
 
 OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
@@ -554,6 +613,173 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
           background: rgba(255, 146, 72, 0.26);
           color: #ffffff;
         }
+        .cm-protein-picker {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+        }
+        .cm-protein-tabs {
+          display: grid;
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .cm-protein-tab {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 5px;
+          padding: 9px 6px;
+          border-radius: 13px;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          background: rgba(255, 255, 255, 0.05);
+          color: #c8dced;
+          font-size: 12.5px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .cm-protein-tab:hover {
+          background: rgba(255, 255, 255, 0.11);
+          border-color: rgba(255, 184, 118, 0.45);
+          color: #ffffff;
+        }
+        .cm-protein-tab.active {
+          border-color: rgba(255, 146, 72, 0.92);
+          background: rgba(255, 146, 72, 0.24);
+          color: #fff3e6;
+          box-shadow: 0 0 14px rgba(255, 146, 72, 0.24);
+        }
+        .cm-protein-icon {
+          width: 22px;
+          height: 22px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          color: #ffb578;
+        }
+        .cm-protein-tab.active .cm-protein-icon {
+          color: #ffd8b3;
+        }
+        .cm-protein-icon svg {
+          width: 20px;
+          height: 20px;
+        }
+        .cm-protein-lbl {
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          max-width: 100%;
+        }
+        .cm-cut-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(195px, 1fr));
+          gap: 8px;
+        }
+        .cm-cut-card {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          text-align: left;
+          padding: 10px 12px;
+          border-radius: 12px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.045);
+          color: #e2ecf7;
+          cursor: pointer;
+          transition: background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+        }
+        .cm-cut-card:hover {
+          background: rgba(255, 255, 255, 0.1);
+          border-color: rgba(255, 184, 118, 0.42);
+        }
+        .cm-cut-card.active {
+          border-color: rgba(255, 146, 72, 0.9);
+          background: rgba(255, 146, 72, 0.22);
+          color: #ffffff;
+          box-shadow: 0 0 12px rgba(255, 146, 72, 0.2);
+        }
+        .cm-cut-top {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 6px;
+        }
+        .cm-cut-name {
+          font-size: 13.5px;
+          font-weight: 800;
+          color: #f8fafc;
+        }
+        .cm-cut-doneness {
+          font-size: 11px;
+          font-weight: 700;
+          padding: 2px 7px;
+          border-radius: 999px;
+          background: rgba(255, 146, 72, 0.18);
+          border: 1px solid rgba(255, 146, 72, 0.42);
+          color: #ffd9b8;
+          white-space: nowrap;
+        }
+        .cm-cut-meta {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          font-size: 12.5px;
+          font-weight: 700;
+        }
+        .cm-cut-temp {
+          color: #ffb578;
+          font-size: 14px;
+          font-weight: 800;
+        }
+        .cm-cut-rest {
+          color: #96b0ce;
+          font-size: 12px;
+        }
+        .cm-custom-note {
+          grid-column: 1 / -1;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 12px 14px;
+          border-radius: 13px;
+          border: 1px dashed rgba(255, 184, 118, 0.42);
+          background: rgba(255, 146, 72, 0.08);
+          color: #dbe7f3;
+        }
+        .cm-custom-note-left {
+          display: flex;
+          align-items: center;
+          gap: 11px;
+          min-width: 0;
+        }
+        .cm-custom-note-icon {
+          width: 32px;
+          height: 32px;
+          border-radius: 9px;
+          background: rgba(255, 146, 72, 0.2);
+          color: #ffb578;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
+        }
+        .cm-custom-note-icon svg {
+          width: 18px;
+          height: 18px;
+        }
+        .cm-custom-note-title {
+          font-size: 13.5px;
+          font-weight: 800;
+          color: #f8fafc;
+        }
+        .cm-custom-note-sub {
+          font-size: 12.5px;
+          color: #a7c1df;
+          margin-top: 2px;
+        }
         .cm-oven-grid {
           display: grid;
           grid-template-columns: repeat(2, 1fr);
@@ -851,12 +1077,15 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
 
   _openCookModal() {
     this._cookModalOpen = true;
+    this._cookProteinCat = this._detectProteinCategory(this._evalMeaterStatus());
     this._renderCookModal();
     this._fetchCookHistory();
   }
 
   _closeCookModal() {
     this._cookModalOpen = false;
+    this._cookProteinCat = null;
+    this._cookSelectedCut = null;
     const backdrop = this.shadowRoot?.getElementById("cookBackdrop");
     if (backdrop) {
       backdrop.classList.remove("open");
@@ -1133,6 +1362,85 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     });
   }
 
+  _detectProteinCategory(meater) {
+    const cats = OVEN_MEATER_CONFIG.meater.proteinCategories || [];
+    const preset = String(meater?.currentPreset || "").trim();
+    const presetLower = preset.toLowerCase();
+    if (preset && presetLower !== "custom") {
+      for (const cat of cats) {
+        for (const cut of cat.cuts || []) {
+          if (
+            cut.presetOption === preset ||
+            cut.label === preset ||
+            presetLower.includes(String(cut.cut || "").toLowerCase())
+          ) {
+            return cat.id;
+          }
+        }
+      }
+      if (/(turkey|chicken|duck|poultry)/.test(presetLower)) return "poultry";
+      if (/(prime rib|steak|brisket|beef|roast)/.test(presetLower)) return "beef";
+      if (/(pork|chop|tenderloin|shoulder|butt|rib)/.test(presetLower)) return "pork";
+      if (/(lamb|salmon|fish|seafood)/.test(presetLower)) return "lamb_fish";
+    }
+    const targetF = meater?.targetF;
+    if (targetF !== null && Number.isFinite(targetF)) {
+      for (const cat of cats) {
+        if ((cat.cuts || []).some((c) => c.targetF === targetF)) {
+          return cat.id;
+        }
+      }
+    }
+    return "custom";
+  }
+
+  _selectCookProteinCat(catId) {
+    if (!catId) return;
+    const cats = OVEN_MEATER_CONFIG.meater.proteinCategories || [];
+    if (!cats.some((c) => c.id === catId)) return;
+    this._cookProteinCat = catId;
+    if (this._cookModalOpen) {
+      this._renderCookModal();
+    }
+  }
+
+  _selectMeaterCut(catId, cutIdx) {
+    if (!this._hass) return;
+    const cats = OVEN_MEATER_CONFIG.meater.proteinCategories || [];
+    const cat = cats.find((c) => c.id === catId);
+    const idx = Number(cutIdx);
+    const cut = cat && Array.isArray(cat.cuts) ? cat.cuts[idx] : null;
+    if (!cut) return;
+    this._cookProteinCat = cat.id;
+    this._cookSelectedCut = `${cat.id}:${idx}`;
+    const m = this._evalMeaterStatus();
+    const opts = Array.isArray(m.presetOptions) ? m.presetOptions : [];
+    let presetToSelect = null;
+    if (cut.presetOption && opts.includes(cut.presetOption)) {
+      presetToSelect = cut.presetOption;
+    } else if (cut.label && opts.includes(cut.label)) {
+      presetToSelect = cut.label;
+    } else if (opts.includes("Custom")) {
+      presetToSelect = "Custom";
+    }
+    if (presetToSelect) {
+      this._hass.callService("select", "select_option", {
+        entity_id: OVEN_MEATER_CONFIG.meater.presetEntity,
+        option: presetToSelect,
+      });
+    }
+    if (Number.isFinite(cut.targetF)) {
+      const next = Math.max(m.minTarget, Math.min(m.maxTarget, Math.round(cut.targetF)));
+      this._hass.callService("number", "set_value", {
+        entity_id: OVEN_MEATER_CONFIG.meater.targetEntity,
+        value: next,
+      });
+    }
+    if (this._cookModalOpen) {
+      this._renderCookModal();
+    }
+  }
+
   _buildCookGaugeSvg(meater) {
     const cx = 86;
     const cy = 84;
@@ -1387,12 +1695,84 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
           ? "Pull Reached"
           : "Est. Pull --";
 
-    const presetHtml = meater.presetOptions
-      .map((opt) => {
-        const isActive = opt === meater.currentPreset;
-        return `<button class="cm-preset-btn ${isActive ? "active" : ""}" data-cm-action="preset" data-cm-preset="${this._escapeHtml(opt)}">${this._escapeHtml(opt)}</button>`;
+    const cats = OVEN_MEATER_CONFIG.meater.proteinCategories || [];
+    if (!this._cookProteinCat || !cats.some((c) => c.id === this._cookProteinCat)) {
+      this._cookProteinCat = this._detectProteinCategory(meater);
+    }
+    const activeCat = cats.find((c) => c.id === this._cookProteinCat) || cats[0];
+
+    const proteinTabsHtml = cats
+      .map((cat) => {
+        const isActive = cat.id === activeCat.id;
+        return `
+          <button class="cm-protein-tab ${isActive ? "active" : ""}" data-cm-action="protein-cat" data-cm-cat="${this._escapeHtml(cat.id)}" title="${this._escapeHtml(cat.label)}">
+            <span class="cm-protein-icon">${SVG_ICONS[cat.icon] || ""}</span>
+            <span class="cm-protein-lbl">${this._escapeHtml(cat.label)}</span>
+          </button>
+        `;
       })
       .join("");
+
+    let activeCutIdx = -1;
+    if (activeCat && Array.isArray(activeCat.cuts) && activeCat.cuts.length > 0) {
+      if (this._cookSelectedCut && this._cookSelectedCut.startsWith(`${activeCat.id}:`)) {
+        const parsedIdx = Number(this._cookSelectedCut.split(":")[1]);
+        if (
+          Number.isInteger(parsedIdx) &&
+          activeCat.cuts[parsedIdx] &&
+          (meater.targetF === null || activeCat.cuts[parsedIdx].targetF === meater.targetF)
+        ) {
+          activeCutIdx = parsedIdx;
+        }
+      }
+      if (activeCutIdx === -1 && meater.currentPreset && meater.currentPreset !== "Custom") {
+        activeCutIdx = activeCat.cuts.findIndex(
+          (c) => c.presetOption === meater.currentPreset || c.label === meater.currentPreset
+        );
+      }
+      if (activeCutIdx === -1 && meater.targetF !== null) {
+        activeCutIdx = activeCat.cuts.findIndex((c) => c.targetF === meater.targetF);
+      }
+    }
+
+    const cutGridHtml =
+      activeCat && activeCat.id === "custom"
+        ? `
+          <div class="cm-custom-note">
+            <div class="cm-custom-note-left">
+              <span class="cm-custom-note-icon">${SVG_ICONS.custom || ""}</span>
+              <div>
+                <div class="cm-custom-note-title">Manual Target Temperature (${meater.targetF !== null ? `${meater.targetF}°F` : "--°F"})</div>
+                <div class="cm-custom-note-sub">${this._escapeHtml(activeCat.note)}</div>
+              </div>
+            </div>
+            <button class="cm-preset-btn ${meater.currentPreset === "Custom" ? "active" : ""}" data-cm-action="preset" data-cm-preset="Custom">Custom</button>
+          </div>
+        `
+        : (activeCat?.cuts || [])
+            .map((cut, idx) => {
+              const isCutActive = idx === activeCutIdx;
+              return `
+                <button class="cm-cut-card ${isCutActive ? "active" : ""}" data-cm-action="protein-cut" data-cm-cat="${this._escapeHtml(activeCat.id)}" data-cm-cut-idx="${idx}" data-cm-preset="${this._escapeHtml(cut.presetOption || cut.label)}">
+                  <div class="cm-cut-top">
+                    <span class="cm-cut-name">${this._escapeHtml(cut.cut)}</span>
+                    <span class="cm-cut-doneness">${this._escapeHtml(cut.doneness)}</span>
+                  </div>
+                  <div class="cm-cut-meta">
+                    <span class="cm-cut-temp">${cut.targetF}°F</span>
+                    <span class="cm-cut-rest">${cut.restMin}m rest</span>
+                  </div>
+                </button>
+              `;
+            })
+            .join("");
+
+    const proteinPickerHtml = `
+      <div class="cm-protein-picker">
+        <div class="cm-protein-tabs">${proteinTabsHtml}</div>
+        <div class="cm-cut-grid">${cutGridHtml}</div>
+      </div>
+    `;
 
     const renderCavityCard = (cav) => {
       const tempTxt = cav.setTemp !== null ? `${cav.setTemp}°F` : "--";
@@ -1486,7 +1866,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
             <button class="cm-step-btn" data-cm-action="step-target" data-cm-delta="5">+5°</button>
           </div>
         </div>
-        <div class="cm-presets">${presetHtml}</div>
+        ${proteinPickerHtml}
       </div>
 
       <div class="cm-section-card">
@@ -1758,6 +2138,10 @@ OVEN_MEATER_LISTENERS_JS = """    /* OVEN_MEATER_LISTENERS_BEGIN */
         this._closeCookModal();
       } else if (act === "step-target") {
         this._stepMeaterTargetTemp(Number(btn.dataset.cmDelta));
+      } else if (act === "protein-cat") {
+        this._selectCookProteinCat(btn.dataset.cmCat);
+      } else if (act === "protein-cut") {
+        this._selectMeaterCut(btn.dataset.cmCat, Number(btn.dataset.cmCutIdx));
       } else if (act === "preset") {
         this._selectMeaterPreset(btn.dataset.cmPreset);
       } else if (act === "more-info") {
@@ -1924,8 +2308,16 @@ def verify_patched_card_contents(card_js: str) -> None:
         "OVEN_MEATER_CONFIG",
         "oven:",
         "meater:",
+        "poultry:",
+        "beef:",
+        "pork:",
+        "lamb_fish:",
+        "custom:",
+        "proteinCategories:",
         ".cook-hotspot",
         ".cook-modal",
+        ".cm-protein-tabs",
+        ".cm-cut-grid",
         "min(92vw, 780px)",
         "rgba(4, 8, 15, 0.44)",
         "cookBackdrop",
@@ -1943,8 +2335,13 @@ def verify_patched_card_contents(card_js: str) -> None:
         "_buildCookChartSvg",
         "_stepMeaterTargetTemp",
         "_selectMeaterPreset",
+        "_detectProteinCategory",
+        "_selectCookProteinCat",
+        "_selectMeaterCut",
         "_renderCookModal",
         "_positionCookModalAndCone",
+        'data-cm-action="protein-cat"',
+        'data-cm-action="protein-cut"',
         "Temperature History &amp; Projected Trend",
         "cm-chart-svg",
         'viewBox="0 0 172 156"',

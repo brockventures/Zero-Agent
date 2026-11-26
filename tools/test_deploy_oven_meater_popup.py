@@ -392,9 +392,10 @@ const climateHidden = {
 card._activeLens = "lights";
 card._updateState();
 
-// 6. Open Cook Monitor modal & verify live HTML, tether cone, stepper clamping, presets, and close
+// 6. Open Cook Monitor modal & verify live HTML, tether cone, stepper clamping, two-level protein picker, presets, and close
 card._openCookModal();
 const modalOpenHtml = cookModal.innerHTML;
+const initialProteinCat = card._cookProteinCat;
 const tetherOpenHtml = cookTetherSvg.innerHTML;
 const modalLeftWhenOpen = cookModal.style.left;
 const modalTopWhenOpen = cookModal.style.top;
@@ -404,6 +405,21 @@ card._stepMeaterTargetTemp(-5);
 card._stepMeaterTargetTemp(500); // clamped to maxTarget (225)
 card._stepMeaterTargetTemp(-500); // clamped to minTarget (100)
 card._selectMeaterPreset("Brisket (203°F)");
+
+// Test two-level visual protein & cut/doneness picker:
+// Switch to Beef tab -> renders Prime Rib, Steak Rare, Steak Med-Rare, Steak Medium, Brisket
+card._selectCookProteinCat("beef");
+const beefTabHtml = cookModal.innerHTML;
+// Select Brisket cut (beef idx 4, which exists in presetOptions -> selects "Brisket (203°F)" + sets target 203)
+card._selectMeaterCut("beef", 4);
+// Switch to Lamb & Fish tab and select Salmon (lamb_fish idx 1, not in presetOptions -> selects "Custom" + sets target 125)
+card._selectCookProteinCat("lamb_fish");
+const lambFishTabHtml = cookModal.innerHTML;
+card._selectMeaterCut("lamb_fish", 1);
+// Switch to Custom tab -> shows manual target note pointing to -5°/-1°/+1°/+5° stepper
+card._selectCookProteinCat("custom");
+const customTabHtml = cookModal.innerHTML;
+
 card._closeCookModal();
 const backdropAfterClose = cookBackdrop.classList.contains("open");
 const tetherAfterClose = cookTetherSvg.innerHTML;
@@ -427,7 +443,14 @@ console.log(JSON.stringify({
     hasRssi: modalOpenHtml.includes("-94 dBm"),
     hasUpperOven: modalOpenHtml.includes("Upper Oven"),
     hasLowerOven: modalOpenHtml.includes("Lower Oven") && modalOpenHtml.includes("350°F") && modalOpenHtml.includes("Convection Roast"),
-    hasPreset: modalOpenHtml.includes("Brisket (203°F)"),
+    autoSelectedPoultryCat: initialProteinCat === "poultry",
+    hasProteinTabs: modalOpenHtml.includes("cm-protein-tabs") && modalOpenHtml.includes('data-cm-action="protein-cat"'),
+    hasAllFiveProteinIcons: Boolean(SVG_ICONS.poultry && SVG_ICONS.beef && SVG_ICONS.pork && SVG_ICONS.lamb_fish && SVG_ICONS.custom),
+    hasCutGrid: modalOpenHtml.includes("cm-cut-grid") && modalOpenHtml.includes('data-cm-action="protein-cut"'),
+    hasPoultryCuts: modalOpenHtml.includes("Turkey Breast") && modalOpenHtml.includes("Turkey Thigh") && modalOpenHtml.includes("Whole Chicken") && modalOpenHtml.includes("Chicken Breast") && modalOpenHtml.includes("Duck Breast") && modalOpenHtml.includes("20m rest"),
+    hasBeefCuts: beefTabHtml.includes("Prime Rib") && beefTabHtml.includes("Steak Rare") && beefTabHtml.includes("Steak Med-Rare") && beefTabHtml.includes("Steak Medium") && beefTabHtml.includes("Brisket") && beefTabHtml.includes("30m rest"),
+    hasLambFishCuts: lambFishTabHtml.includes("Rack of Lamb") && lambFishTabHtml.includes("Salmon") && lambFishTabHtml.includes("White Fish") && lambFishTabHtml.includes("3m rest"),
+    hasCustomNote: customTabHtml.includes("cm-custom-note") && customTabHtml.includes("-5° / -1° / +1° / +5°"),
     hasGaugeSvg: modalOpenHtml.includes("cm-gauge-svg") && modalOpenHtml.includes('viewBox="0 0 172 156"'),
     hasChartHeader: modalOpenHtml.includes("Temperature History &amp; Projected Trend"),
     hasChartRatePill: modalOpenHtml.includes("+0.65°F/min"),
@@ -512,6 +535,26 @@ console.log(JSON.stringify({
             "domain": "select",
             "service": "select_option",
             "data": {"entity_id": "select.meater_meater_cook_preset", "option": "Brisket (203°F)"},
+        },
+        {
+            "domain": "select",
+            "service": "select_option",
+            "data": {"entity_id": "select.meater_meater_cook_preset", "option": "Brisket (203°F)"},
+        },
+        {
+            "domain": "number",
+            "service": "set_value",
+            "data": {"entity_id": "number.meater_meater_target_temperature", "value": 203},
+        },
+        {
+            "domain": "select",
+            "service": "select_option",
+            "data": {"entity_id": "select.meater_meater_cook_preset", "option": "Custom"},
+        },
+        {
+            "domain": "number",
+            "service": "set_value",
+            "data": {"entity_id": "number.meater_meater_target_temperature", "value": 125},
         },
     ]
 
