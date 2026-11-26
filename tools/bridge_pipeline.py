@@ -553,7 +553,7 @@ def prepare_turn_prompt(
 
     anti_leak_guidance = (
         "[Bridge Execution Invariant - Strictly Zero Internal Chatter Leaks]:\n"
-        "• Reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).\n"
+        '• Never emit interim wait/status chatter (e.g. "Running check now") when a tool detaches to a background task; end the turn silently so the task wakeup delivers the final answer, and reserve \'[NO_REPLY]\' strictly for unaddressed ambient chatter (never when tagged).\n'
         "• Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals into visible response text; output ONLY the final user-facing message."
         f"{early_ack_bullet}"
     )

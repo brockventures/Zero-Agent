@@ -139,16 +139,18 @@ class TestBridgePipelinePrompt(unittest.TestCase):
         self.assertIn("Pacific Time (PT)", prompt)
         self.assertIn("Hello Zero", prompt)
 
-    def test_prepare_turn_prompt_omits_option_b_silence_trigger_and_preserves_no_reply(self):
+    def test_prepare_turn_prompt_includes_silent_wait_guardrail_and_preserves_no_reply(self):
         prompt = prepare_turn_prompt(
             prompt="Run background task check",
             mode="home",
             channel_id=1542081375287640084,
             sess_key="home",
         )
-        self.assertNotIn("Never choose SDK Option B", prompt)
-        self.assertNotIn("stop calling tools silently", prompt)
-        self.assertIn("• Reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).", prompt)
+        self.assertIn(
+            '• Never emit interim wait/status chatter (e.g. "Running check now") when a tool detaches to a background task; end the turn silently so the task wakeup delivers the final answer, and reserve \'[NO_REPLY]\' strictly for unaddressed ambient chatter (never when tagged).',
+            prompt,
+        )
+        self.assertEqual(prompt.count("reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged)."), 1)
         self.assertIn(
             "• Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals into visible response text; output ONLY the final user-facing message.",
             prompt,

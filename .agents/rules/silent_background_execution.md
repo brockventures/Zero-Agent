@@ -15,14 +15,18 @@ description: Prohibits phantom forward intent promises, intermediate play-by-pla
      - **Tier 1 Inline Fast-Path (`<= 3 Tool Steps`, `<= 3 Files` & `< 90s` Total):** Stay inline ONLY when exact target lines are already known, verification is a fast local lint/unit check (`< 15s`), and the entire edit + test + commit/PR finishes in **2–3 tool calls** (`< 90s`). Execute the edit, scoped verification, and commit/push silently within the turn before emitting the completion message.
      - **Tier 2/3 FORGE Builds (`#forge` `1562899941595160657` — Everything Else, Even 1 File) & Long Jobs (`> 90s`):** Do **NOT** execute compiled toolchain builds (e.g. ESP32 PlatformIO C++ firmware), hardware/OTA flashes, Docker builds, CAD renders, `> 15s` test sweeps, new test suites, iterative edit-test-fix TDD loops (`4+ tool steps`, `> 3 files`, or `> 90s`), or cross-module changes inline in chat. Instead, write the validated `ForgePlan` JSON and either enqueue it via `python3 /workspace/tools/forge.py enqueue <plan.json>`, stage a Two-Stage Decision Card (`--handler "forge_enqueue" --post`), or launch `python3 /workspace/tools/forge.py job start` within the turn, then report the enqueued FORGE build or Decision Card cleanly.
 
-2. **SDK BACKGROUND TASK DETACHMENT & PRE-COMPLETION STREAM DISCARD:**
-   - When `run_command` or any asynchronous tool detaches a job into an SDK background task, the bridge deterministically discards any pre-completion wait chatter before the background task finishes.
+2. **PROHIBITION OF INTERMEDIATE TASK CHATTER (THE OPTION B TRAP):**
+   - When `run_command` or any asynchronous tool sends a job to the background and outputs the SDK template:
+     > `YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn. DO NOTHING ELSE.`
+   - Zero **MUST NEVER CHOOSE OPTION B**.
+   - In a Discord bridge environment, emitting visible text before background tasks complete risks prematurely closing the streaming turn or posting intermediate thinking/waiting chatter into Discord chat (e.g. *"Running check now...", "I have launched X in the background...", "I am pausing tool calls to allow X to complete..."*). (Note: The bridge also deterministically discards pre-completion drafts before the background task finishes.)
    - Do not narrate intermediate play-by-play progress across turns while a background task is running.
 
-3. **NATURAL TURN COMPLETION ON BACKGROUND TASKS:**
-   - If an SDK command detaches to the background:
-     - If you have other relevant commands, file edits, or lookups to perform, execute them normally.
-     - If there is no other tool work to run, end the turn naturally and let the task completion wakeup deliver the final answer; the bridge deterministically discards any pre-completion wait chatter.
+3. **MANDATORY SILENT WAITING DISCIPLINE:**
+   - Always choose **Option A** silently:
+     - If you have other relevant commands, file edits, or lookups to perform, execute them silently.
+     - If you are waiting for the task to complete, simply stop calling tools silently without emitting any interim status text (or inspect task status silently using `manage_task(Action="status")`), and let the task completion wakeup deliver the final answer; the bridge deterministically discards any pre-completion wait chatter.
+     - The messaging system will wake you up automatically via high-priority notification when the background task finishes.
    - Deliver strictly the **final substantive deliverable** once all background tasks and tests have completed.
 
 4. **BAN ON META-RECEIPT ECHOES (ANNOUNCING AN ANNOUNCEMENT):**
