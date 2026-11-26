@@ -16,6 +16,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.brief.config import (
     DEFAULT_CHANNEL_ID,
+    DEFAULT_GATE_WRITE_TOKEN_PATH,
+    DEFAULT_READONLY_TOKEN_PATH,
     BriefConfig,
     ensure_memory_scaffold,
     is_kill_switch_active,
@@ -48,6 +50,10 @@ def test_brief_toml_example_is_valid_and_pii_free() -> None:
     assert parsed["filtering"]["blocked_domains"] == ["marketing.example.net"]
     assert parsed["sessions"]["email_grain"] == "thread"
     assert parsed["safety"]["dry_run"] is True
+    assert parsed["oauth"]["readonly_token_path"] == "/secrets/brief_readonly_token.json"
+    assert parsed["oauth"]["allow_shared_readonly_fallback"] is True
+    assert parsed["gate"]["write_token_path"] == "/secrets/brief_write_token.json"
+    assert parsed["gate"]["allow_shared_oauth_fallback"] is False
     assert parsed["tasks"]["open_stale_days"] == 3
     assert parsed["tasks"]["blocked_stale_days"] == 6
     assert parsed["tasks"]["staleness_backoff_days"] == [3, 7, 14]
@@ -163,6 +169,63 @@ def test_config_wave2_tasks_and_dismissals_fields(
     assert clamped.task_staleness_backoff_days == [3, 7, 14]
     assert clamped.dismissal_mute_strikes == 1
     assert clamped.dismissal_window_days == 1
+
+
+def test_config_split_oauth_section_and_polling_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BRIEF_OWNER_EMAILS", raising=False)
+    defaults_cfg = BriefConfig()
+    assert defaults_cfg.readonly_token_path == DEFAULT_READONLY_TOKEN_PATH
+    assert defaults_cfg.allow_shared_readonly_fallback is True
+    assert defaults_cfg.gate_write_token_path == DEFAULT_GATE_WRITE_TOKEN_PATH
+    assert defaults_cfg.gate_allow_shared_oauth_fallback is False
+
+    # [oauth] takes precedence over [polling] fallback
+    oauth_toml = tmp_path / "oauth.toml"
+    oauth_toml.write_text(
+        "[oauth]\n"
+        'readonly_token_path = "/tmp/custom_ro.json"\n'
+        "allow_shared_readonly_fallback = false\n"
+        "[polling]\n"
+        'readonly_token_path = "/tmp/ignored_polling_ro.json"\n'
+        "allow_shared_readonly_fallback = true\n",
+        encoding="utf-8",
+    )
+    oauth_cfg = BriefConfig.load(
+        config_path=oauth_toml,
+        state_dir=tmp_path / "s_oauth",
+        memory_dir=tmp_path / "m_oauth",
+        secrets_path=tmp_path / "no-secrets.json",
+    )
+    assert oauth_cfg.readonly_token_path == Path("/tmp/custom_ro.json")
+    assert oauth_cfg.allow_shared_readonly_fallback is False
+
+    # [polling] acts as fallback when [oauth] is absent
+    polling_toml = tmp_path / "polling.toml"
+    polling_toml.write_text(
+        "[polling]\n"
+        'readonly_token_path = "/tmp/polling_ro.json"\n'
+        "allow_shared_readonly_fallback = false\n",
+        encoding="utf-8",
+    )
+    polling_cfg = BriefConfig.load(
+        config_path=polling_toml,
+        state_dir=tmp_path / "s_poll",
+        memory_dir=tmp_path / "m_poll",
+        secrets_path=tmp_path / "no-secrets.json",
+    )
+    assert polling_cfg.readonly_token_path == Path("/tmp/polling_ro.json")
+    assert polling_cfg.allow_shared_readonly_fallback is False
+
+    # __post_init__ coerces string paths and bool flags
+    coerced = BriefConfig(
+        readonly_token_path="/tmp/coerced_ro.json",  # type: ignore[arg-type]
+        allow_shared_readonly_fallback=0,  # type: ignore[arg-type]
+    )
+    assert coerced.readonly_token_path == Path("/tmp/coerced_ro.json")
+    assert coerced.allow_shared_readonly_fallback is False
 
 
 def test_layered_prompts_exist_and_cover_core_contracts() -> None:

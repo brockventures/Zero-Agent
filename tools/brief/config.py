@@ -15,6 +15,7 @@ DEFAULT_CHANNEL_ID = 1574655816236269569
 DEFAULT_STATE_DIR = Path("/workspace/data/brief")
 DEFAULT_MEMORY_DIR = Path("/workspace/memory/private/brief")
 DEFAULT_SECRETS_PATH = Path("/secrets/env.json")
+DEFAULT_READONLY_TOKEN_PATH = Path("/secrets/brief_readonly_token.json")
 DEFAULT_GATE_WRITE_TOKEN_PATH = Path("/secrets/brief_write_token.json")
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts" / "brief"
 
@@ -183,6 +184,10 @@ class BriefConfig:
     max_retries: int = 3
     stuck_delivery_seconds: int = 300
 
+    # [oauth]
+    readonly_token_path: Path = DEFAULT_READONLY_TOKEN_PATH
+    allow_shared_readonly_fallback: bool = True
+
     # [gate]
     gate_write_token_path: Path = DEFAULT_GATE_WRITE_TOKEN_PATH
     gate_allow_shared_oauth_fallback: bool = False
@@ -209,6 +214,8 @@ class BriefConfig:
         self.state_dir = Path(self.state_dir)
         self.memory_dir = Path(self.memory_dir)
         self.prompts_dir = Path(self.prompts_dir)
+        self.readonly_token_path = Path(self.readonly_token_path)
+        self.allow_shared_readonly_fallback = bool(self.allow_shared_readonly_fallback)
         self.gate_write_token_path = Path(self.gate_write_token_path)
         self.gate_allow_shared_oauth_fallback = bool(self.gate_allow_shared_oauth_fallback)
         self.gate_max_proposal_ttl_seconds = int(self.gate_max_proposal_ttl_seconds)
@@ -337,11 +344,16 @@ class BriefConfig:
         filtering = data.get("filtering", {})
         sessions = data.get("sessions", {})
         safety = data.get("safety", {})
+        oauth = data.get("oauth", {})
         gate = data.get("gate", {})
         tasks = data.get("tasks", {})
         dismissals = data.get("dismissals", {})
+        if not isinstance(polling, dict):
+            polling = {}
         if not isinstance(filtering, dict):
             filtering = {}
+        if not isinstance(oauth, dict):
+            oauth = {}
         if not isinstance(gate, dict):
             gate = {}
         if not isinstance(tasks, dict):
@@ -354,6 +366,17 @@ class BriefConfig:
         env_emails = _parse_email_list(os.environ.get("BRIEF_OWNER_EMAILS", ""))
         resolved_secrets = Path(secrets_path) if secrets_path is not None else None
         secret_emails = _load_secrets_owner_emails(resolved_secrets)
+
+        raw_readonly_token_path = oauth.get(
+            "readonly_token_path",
+            polling.get("readonly_token_path", DEFAULT_READONLY_TOKEN_PATH),
+        )
+        if isinstance(raw_readonly_token_path, str) and not raw_readonly_token_path.strip():
+            raw_readonly_token_path = DEFAULT_READONLY_TOKEN_PATH
+        raw_allow_readonly_fallback = oauth.get(
+            "allow_shared_readonly_fallback",
+            polling.get("allow_shared_readonly_fallback", True),
+        )
 
         raw_write_token_path = gate.get(
             "write_token_path",
@@ -398,6 +421,8 @@ class BriefConfig:
             dry_run=bool(safety.get("dry_run", True)),
             max_retries=int(safety.get("max_retries", 3)),
             stuck_delivery_seconds=int(safety.get("stuck_delivery_seconds", 300)),
+            readonly_token_path=Path(raw_readonly_token_path),
+            allow_shared_readonly_fallback=bool(raw_allow_readonly_fallback),
             gate_write_token_path=Path(raw_write_token_path),
             gate_allow_shared_oauth_fallback=bool(raw_allow_fallback),
             gate_max_proposal_ttl_seconds=int(raw_max_ttl),

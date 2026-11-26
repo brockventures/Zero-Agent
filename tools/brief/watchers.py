@@ -22,12 +22,17 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from tools.brief.config import BriefConfig, _normalize_domain, touch_heartbeat
+from tools.brief.config import (
+    DEFAULT_READONLY_TOKEN_PATH,
+    BriefConfig,
+    _normalize_domain,
+    touch_heartbeat,
+)
 from tools.brief.queue import BriefQueue
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BRIEF_READONLY_TOKEN_PATH = Path("/secrets/brief_readonly_token.json")
+DEFAULT_BRIEF_READONLY_TOKEN_PATH = DEFAULT_READONLY_TOKEN_PATH
 DEFAULT_GOOGLE_OAUTH_PATH = Path("/secrets/google_oauth.json")
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
@@ -271,22 +276,65 @@ def _validate_oauth_payload(data: Any) -> dict[str, str] | None:
     }
 
 
+def _check_secret_file_permissions(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return
+    if (mode & 0o077) != 0:
+        logger.warning(
+            "BRIEF read-only credentials file %s has overly permissive mode %04o; expected 0600.",
+            path,
+            mode & 0o777,
+        )
+
+
 def resolve_readonly_oauth_credentials(
     explicit_path: Path | str | None = None,
     *,
+    config: BriefConfig | None = None,
+    allow_shared_fallback: bool | None = None,
+    fallback_oauth_path: Path | str | None = None,
+    oauth_path: Path | str | None = None,
     timeout: float = 15.0,
     now_fn: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Resolve Google OAuth credentials and exchange refresh_token for an access_token.
 
-    Lookup order when `explicit_path` is None:
-      1. /secrets/brief_readonly_token.json
-      2. /secrets/google_oauth.json
+    Lookup order when `explicit_path` (or `oauth_path`) is None:
+      1. `config.readonly_token_path` (defaults to `/secrets/brief_readonly_token.json`)
+      2. `/secrets/google_oauth.json` (only when `allow_shared_readonly_fallback` is True)
     """
-    if explicit_path is not None:
-        candidates = [Path(explicit_path)]
+    resolved_explicit = explicit_path if explicit_path is not None else oauth_path
+    used_fallback = False
+
+    if resolved_explicit is not None:
+        readonly_path = Path(resolved_explicit)
+        allow_fb = False
+        candidates = [readonly_path]
     else:
-        candidates = [DEFAULT_BRIEF_READONLY_TOKEN_PATH, DEFAULT_GOOGLE_OAUTH_PATH]
+        if config is not None:
+            cfg_ro_path = Path(config.readonly_token_path)
+            if cfg_ro_path == DEFAULT_READONLY_TOKEN_PATH:
+                readonly_path = Path(DEFAULT_BRIEF_READONLY_TOKEN_PATH)
+            else:
+                readonly_path = cfg_ro_path
+        else:
+            readonly_path = Path(DEFAULT_BRIEF_READONLY_TOKEN_PATH)
+
+        if allow_shared_fallback is not None:
+            allow_fb = bool(allow_shared_fallback)
+        elif config is not None:
+            allow_fb = bool(config.allow_shared_readonly_fallback)
+        else:
+            allow_fb = True
+
+        fallback_path = (
+            Path(fallback_oauth_path)
+            if fallback_oauth_path is not None
+            else Path(DEFAULT_GOOGLE_OAUTH_PATH)
+        )
+        candidates = [readonly_path, fallback_path] if allow_fb else [readonly_path]
 
     chosen_path: Path | None = None
     validated: dict[str, str] | None = None
@@ -303,13 +351,26 @@ def resolve_readonly_oauth_credentials(
         validated = _validate_oauth_payload(parsed)
         if validated is not None:
             chosen_path = candidate
+            used_fallback = resolved_explicit is None and allow_fb and candidate != readonly_path
             break
 
     if validated is None or chosen_path is None:
+        if resolved_explicit is None and not allow_fb:
+            if not readonly_path.is_file():
+                raise RuntimeError(
+                    f"BRIEF read-only token missing at {readonly_path} and "
+                    "allow_shared_readonly_fallback is disabled."
+                )
+            raise RuntimeError(
+                f"Invalid or incomplete Google read-only OAuth payload in {readonly_path} "
+                "(allow_shared_readonly_fallback is disabled)."
+            )
         checked = ", ".join(str(p) for p in candidates)
         raise RuntimeError(
             f"No valid Google OAuth credentials found (checked: {checked})."
         )
+
+    _check_secret_file_permissions(chosen_path)
 
     form_body = urllib.parse.urlencode(
         {
@@ -342,6 +403,7 @@ def resolve_readonly_oauth_credentials(
         "token_type": str(token_payload.get("token_type") or "Bearer"),
         "scope": str(token_payload.get("scope") or ""),
         "credentials_path": str(chosen_path),
+        "used_shared_fallback": used_fallback,
     }
 
 
@@ -352,10 +414,20 @@ class GoogleReadonlyApiClient:
         self,
         *,
         credentials_path: Path | str | None = None,
+        oauth_path: Path | str | None = None,
+        config: BriefConfig | None = None,
+        allow_shared_fallback: bool | None = None,
+        fallback_oauth_path: Path | str | None = None,
         timeout: float = 15.0,
         now_fn: Callable[[], float] | None = None,
     ) -> None:
-        self.credentials_path = Path(credentials_path) if credentials_path is not None else None
+        resolved_explicit = credentials_path if credentials_path is not None else oauth_path
+        self.credentials_path = Path(resolved_explicit) if resolved_explicit is not None else None
+        self.config = config
+        self.allow_shared_fallback = allow_shared_fallback
+        self.fallback_oauth_path = (
+            Path(fallback_oauth_path) if fallback_oauth_path is not None else None
+        )
         self.timeout = float(timeout)
         self._now_fn = now_fn or time.time
         self._lock = threading.Lock()
@@ -373,6 +445,9 @@ class GoogleReadonlyApiClient:
                 return self._access_token
             resolved = resolve_readonly_oauth_credentials(
                 explicit_path=self.credentials_path,
+                config=self.config,
+                allow_shared_fallback=self.allow_shared_fallback,
+                fallback_oauth_path=self.fallback_oauth_path,
                 timeout=self.timeout,
                 now_fn=self._now_fn,
             )
@@ -618,6 +693,7 @@ class _BaseWatcher:
         api_client: Any = None,
         notify_fn: Callable[[str], None] | None = None,
         *,
+        oauth_path: Path | str | None = None,
         now_fn: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
@@ -626,7 +702,11 @@ class _BaseWatcher:
         self.config = config
         self._now_fn = now_fn or time.time
         self._sleep_fn = sleep_fn or time.sleep
-        self.api_client = api_client or GoogleReadonlyApiClient(now_fn=self._now_fn)
+        self.api_client = api_client or GoogleReadonlyApiClient(
+            credentials_path=oauth_path,
+            config=config,
+            now_fn=self._now_fn,
+        )
         self._notify_fn = notify_fn
 
     def _notify(self, message: str) -> None:
@@ -673,6 +753,7 @@ class GmailWatcher(_BaseWatcher):
         notify_fn: Callable[[str], None] | None = None,
         *,
         own_emails: Iterable[str] | None = None,
+        oauth_path: Path | str | None = None,
         now_fn: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
@@ -682,6 +763,7 @@ class GmailWatcher(_BaseWatcher):
             config,
             api_client=api_client,
             notify_fn=notify_fn,
+            oauth_path=oauth_path,
             now_fn=now_fn,
             sleep_fn=sleep_fn,
         )

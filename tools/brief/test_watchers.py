@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import sys
 import urllib.error
 import urllib.request
@@ -165,6 +166,149 @@ def test_resolve_readonly_oauth_credentials_precedence_and_get_only_client(
     assert profile["historyId"] == "999"
     api_methods = [m for m, url, _ in seen_requests if url != GOOGLE_TOKEN_URI]
     assert api_methods == ["GET"]
+
+
+def test_resolve_readonly_oauth_config_isolation_permissions_and_watcher_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    readonly_path = tmp_path / "brief_readonly_token.json"
+    fallback_path = tmp_path / "google_oauth.json"
+    explicit_path = tmp_path / "explicit_oauth.json"
+
+    fallback_path.write_text(
+        json.dumps(
+            {
+                "client_id": "fb-cid",
+                "client_secret": "fb-csec",
+                "refresh_token": "fb-rtok",
+            }
+        ),
+        encoding="utf-8",
+    )
+    fallback_path.chmod(0o600)
+
+    explicit_path.write_text(
+        json.dumps(
+            {
+                "client_id": "exp-cid",
+                "client_secret": "exp-csec",
+                "refresh_token": "exp-rtok",
+            }
+        ),
+        encoding="utf-8",
+    )
+    explicit_path.chmod(0o600)
+
+    monkeypatch.setattr("tools.brief.watchers.DEFAULT_GOOGLE_OAUTH_PATH", fallback_path)
+
+    class _FakeResp:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._buf = io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+        def read(self) -> bytes:
+            return self._buf.read()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def _fake_urlopen(req: urllib.request.Request, timeout: float = 15.0) -> _FakeResp:
+        if req.full_url == GOOGLE_TOKEN_URI:
+            body = req.data.decode("utf-8") if req.data else ""
+            if "ro-rtok" in body:
+                return _FakeResp({"access_token": "tok-ro", "expires_in": 3600})
+            if "exp-rtok" in body:
+                return _FakeResp({"access_token": "tok-exp", "expires_in": 3600})
+            return _FakeResp({"access_token": "tok-fb", "expires_in": 3600})
+        if req.full_url.endswith("/users/me/profile"):
+            return _FakeResp({"historyId": "321", "emailAddress": "brief@example.com"})
+        if "/calendars/primary/events" in req.full_url:
+            return _FakeResp({"nextSyncToken": "sync-321", "items": []})
+        raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    # 1. Missing readonly_token_path with allow_shared_readonly_fallback=False refuses shared fallback
+    strict_cfg = BriefConfig(
+        allowlisted_emails=["owner@example.com"],
+        readonly_token_path=readonly_path,
+        allow_shared_readonly_fallback=False,
+        state_dir=tmp_path / "state_strict",
+        memory_dir=tmp_path / "mem_strict",
+        prompts_dir=REPO_ROOT / "prompts" / "brief",
+    )
+    with pytest.raises(RuntimeError, match="allow_shared_readonly_fallback is disabled"):
+        resolve_readonly_oauth_credentials(config=strict_cfg, now_fn=lambda: 1000.0)
+
+    # 2. Missing readonly_token_path with allow_shared_readonly_fallback=True falls back cleanly
+    permissive_cfg = BriefConfig(
+        allowlisted_emails=["owner@example.com"],
+        readonly_token_path=readonly_path,
+        allow_shared_readonly_fallback=True,
+        state_dir=tmp_path / "state_fb",
+        memory_dir=tmp_path / "mem_fb",
+        prompts_dir=REPO_ROOT / "prompts" / "brief",
+    )
+    fb_creds = resolve_readonly_oauth_credentials(config=permissive_cfg, now_fn=lambda: 1000.0)
+    assert fb_creds["access_token"] == "tok-fb"
+    assert fb_creds["credentials_path"] == str(fallback_path)
+    assert fb_creds["used_shared_fallback"] is True
+
+    # 3. Overly permissive mode (> 0600) on readonly_token_path logs a warning; 0600 does not
+    readonly_path.write_text(
+        json.dumps(
+            {
+                "client_id": "ro-cid",
+                "client_secret": "ro-csec",
+                "refresh_token": "ro-rtok",
+            }
+        ),
+        encoding="utf-8",
+    )
+    readonly_path.chmod(0o644)
+    with caplog.at_level(logging.WARNING, logger="tools.brief.watchers"):
+        ro_creds_warn = resolve_readonly_oauth_credentials(
+            config=strict_cfg,
+            now_fn=lambda: 1000.0,
+        )
+    assert ro_creds_warn["access_token"] == "tok-ro"
+    assert ro_creds_warn["credentials_path"] == str(readonly_path)
+    assert ro_creds_warn["used_shared_fallback"] is False
+    assert any("expected 0600" in rec.message for rec in caplog.records)
+
+    caplog.clear()
+    readonly_path.chmod(0o600)
+    with caplog.at_level(logging.WARNING, logger="tools.brief.watchers"):
+        ro_creds_clean = resolve_readonly_oauth_credentials(
+            config=strict_cfg,
+            now_fn=lambda: 1000.0,
+        )
+    assert ro_creds_clean["access_token"] == "tok-ro"
+    assert not any("expected 0600" in rec.message for rec in caplog.records)
+
+    # 4. GmailWatcher & CalendarWatcher respect config and explicit oauth_path overrides
+    queue = BriefQueue(strict_cfg.db_path, allowlisted_senders=strict_cfg.allowlisted_emails)
+    queue.init_db()
+    cursors = CursorStore(strict_cfg.cursors_path)
+
+    gmail_watcher = GmailWatcher(queue, cursors, strict_cfg, now_fn=lambda: 1000.0)
+    assert gmail_watcher.api_client.config is strict_cfg
+    assert gmail_watcher.poll_once()["history_id"] == "321"
+
+    cal_watcher = CalendarWatcher(
+        queue,
+        cursors,
+        strict_cfg,
+        oauth_path=explicit_path,
+        now_fn=lambda: 1000.0,
+    )
+    assert cal_watcher.api_client.credentials_path == explicit_path
+    assert cal_watcher.api_client._get_token() == "tok-exp"
+    assert cal_watcher.poll_once()["sync_token"] == "sync-321"
 
 
 def test_should_prefilter_gmail_precedence_and_header_formats() -> None:
