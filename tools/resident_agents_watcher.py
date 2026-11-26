@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, I001, PIE810, RUF046, RUF059, RUF100, S110, SIM102, SIM103, SIM117, TRY004, UP006, UP017, UP035, UP045
 """ResidentAgents Subreddit Watcher, Auto-Approver & Daily Megathread Rotation Sidecar.
 
 Polls r/ResidentAgents (new.json, comments.json, about/modqueue.json, about/spam.json)
@@ -49,7 +50,7 @@ if sys.path[0] != _REPO_ROOT:
 
 from tools.channel_history import get_recent_messages
 from tools.outbox import queue_outbox_message
-from tools.pixel_browser import check_printer_conflict, pixel_session
+from tools.pixel_browser import check_printer_conflict, close_extra_tabs, pixel_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("resident_agents_watcher")
@@ -819,8 +820,9 @@ def post_reddit_comment_human_paced(
     min_dwell_sec: float = 12.0,
     max_dwell_sec: float = 25.0,
     dry_run: bool = False,
+    force_pixel: bool = False,
 ) -> Dict[str, Any]:
-    """Load a Reddit thread in Chromium with account cookies, scroll/dwell like a human, and submit a comment without voting."""
+    """Load a Reddit thread in Pixel 8 Pro Chrome Beta (u/RA_Zero), scroll/dwell like a human, verify active user is u/RA_Zero, and submit a comment without voting."""
     target_url = _normalize_old_reddit_url(thread_url)
     target_thing_id = (thing_id or "").strip()
     comment_text = (text or "").strip()
@@ -832,96 +834,87 @@ def post_reddit_comment_human_paced(
     if not comment_text:
         return {"ok": False, "error": "Comment text cannot be empty"}
 
-    cookie_file = Path(cookies_path)
-    if not cookie_file.exists():
-        return {"ok": False, "error": f"Cookies file not found: {cookies_path}"}
-    try:
-        cookies = _load_playwright_cookies(cookie_file)
-    except Exception as e:
-        return {"ok": False, "error": f"Failed to load cookies from {cookies_path}: {e}"}
-    if not cookies:
-        return {"ok": False, "error": f"No valid cookies found in {cookies_path}"}
-
     if dry_run:
         return {
             "ok": True,
             "dry_run": True,
+            "browser": "chrome_beta",
+            "expected_account": "RA_Zero",
             "thread_url": target_url,
             "thing_id": target_thing_id,
-            "cookies_count": len(cookies),
             "dwell_range_sec": [min_dwell_sec, max_dwell_sec],
         }
 
     from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-            ],
-        )
-        try:
-            context = browser.new_context(
-                viewport={"width": 1366, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-            )
-            context.add_cookies(cookies)
-            page = context.new_page()
-            page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
-            time.sleep(random.uniform(1.0, 2.0))
+    with pixel_session(force=force_pixel, browser="chrome_beta") as cdp_url:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            context = None
+            page = None
+            try:
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                close_extra_tabs(context)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+                time.sleep(random.uniform(1.0, 2.0))
 
-            dwell_sec = _human_scroll_and_dwell(page, min_dwell_sec=min_dwell_sec, max_dwell_sec=max_dwell_sec)
+                dwell_sec = _human_scroll_and_dwell(page, min_dwell_sec=min_dwell_sec, max_dwell_sec=max_dwell_sec)
 
-            submit_res = page.evaluate(
-                """async ({thing_id, text}) => {
-                    try {
-                        let uh = (
-                            document.querySelector('input[name="uh"]')?.value ||
-                            (window.reddit && window.reddit.modhash) ||
-                            ''
-                        );
-                        if (!uh) {
+                submit_res = page.evaluate(
+                    """async ({thing_id, text}) => {
+                        try {
                             const meRes = await fetch('https://old.reddit.com/api/me.json', {credentials: 'include'});
-                            if (meRes && meRes.ok) {
-                                const meJson = await meRes.json();
-                                uh = meJson?.data?.modhash || '';
+                            if (!meRes || !meRes.ok) {
+                                return {error: `Failed to verify active Reddit session (/api/me.json HTTP ${meRes ? meRes.status : 'err'})`};
                             }
+                            const meJson = await meRes.json();
+                            const activeUser = String(meJson?.data?.name || '').trim();
+                            if (activeUser.toLowerCase() !== 'ra_zero') {
+                                return {
+                                    error: `Active session is not u/RA_Zero (found: ${activeUser || 'logged_out'})`,
+                                    active_user: activeUser || null
+                                };
+                            }
+                            const uh = (
+                                meJson?.data?.modhash ||
+                                document.querySelector('input[name="uh"]')?.value ||
+                                (window.reddit && window.reddit.modhash) ||
+                                ''
+                            );
+                            if (!uh) {
+                                return {error: 'Missing modhash (u/RA_Zero session may be expired or logged out)'};
+                            }
+                            const params = new URLSearchParams({
+                                uh,
+                                thing_id,
+                                text,
+                                api_type: 'json'
+                            });
+                            const r = await fetch('https://old.reddit.com/api/comment', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                                body: params.toString(),
+                                credentials: 'include'
+                            });
+                            if (!r.ok) {
+                                return {error: `HTTP ${r.status}`};
+                            }
+                            const resJson = await r.json();
+                            return {...resJson, active_user: activeUser};
+                        } catch (e) {
+                            return {error: String(e)};
                         }
-                        if (!uh) {
-                            return {error: 'Missing modhash (session cookies may be expired or logged out)'};
-                        }
-                        const params = new URLSearchParams({
-                            uh,
-                            thing_id,
-                            text,
-                            api_type: 'json'
-                        });
-                        const r = await fetch('https://old.reddit.com/api/comment', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                            body: params.toString(),
-                            credentials: 'include'
-                        });
-                        if (!r.ok) {
-                            return {error: `HTTP ${r.status}`};
-                        }
-                        return await r.json();
-                    } catch (e) {
-                        return {error: String(e)};
-                    }
-                }""",
-                {"thing_id": target_thing_id, "text": comment_text},
-            )
-        finally:
-            browser.close()
+                    }""",
+                    {"thing_id": target_thing_id, "text": comment_text},
+                )
+            finally:
+                try:
+                    if context is not None:
+                        close_extra_tabs(context, keep_page=page)
+                except Exception:
+                    pass
+                browser.close()
 
     if not isinstance(submit_res, dict):
         return {"ok": False, "error": "Unexpected non-dict response from Reddit", "dwell_sec": round(dwell_sec, 2)}
@@ -940,6 +933,8 @@ def post_reddit_comment_human_paced(
 
     return {
         "ok": True,
+        "browser": "chrome_beta",
+        "account": submit_res.get("active_user") or "RA_Zero",
         "thread_url": target_url,
         "thing_id": target_thing_id,
         "comment_id": comment_id,
@@ -1681,7 +1676,7 @@ def main() -> None:
     parser.add_argument("--assign-links", action="store_true", help="Check #r-residentagents for Amos's L1..L6 candidate links and assign on-deck bot")
     parser.add_argument("--seed-terms", action="store_true", help="Force an immediate external subreddit discovery & organic 'resident agent' seeding pass via u/prime416")
     parser.add_argument("--date", type=str, default=None, help="Optional YYYY-MM-DD override for daily tip/link rotation")
-    parser.add_argument("--post-comment", type=str, default=None, help="Post a human-paced Reddit comment as u/RA_Zero via Playwright Chromium")
+    parser.add_argument("--post-comment", type=str, default=None, help="Post a human-paced Reddit comment as u/RA_Zero via Pixel 8 Pro Chrome Beta")
     parser.add_argument("--thread-url", type=str, default=None, help="Target Reddit thread URL for --post-comment")
     parser.add_argument("--thing-id", type=str, default=None, help="Target Reddit fullname (t3_... or t1_...) for --post-comment")
     args = parser.parse_args()
@@ -1694,6 +1689,7 @@ def main() -> None:
             thing_id=args.thing_id,
             text=args.post_comment,
             dry_run=args.test,
+            force_pixel=args.force,
         )
         print(json.dumps(res, indent=2))
         sys.exit(0 if res.get("ok") else 1)

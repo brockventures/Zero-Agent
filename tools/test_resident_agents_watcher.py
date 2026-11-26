@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001, F401, I001, RUF059, RUF100
 """Unit tests for tools/resident_agents_watcher.py."""
 
 from __future__ import annotations
@@ -558,33 +559,19 @@ def test_transient_pixel_poll_error_suppression_and_outage_alert(tmp_path: Path)
 
 
 def test_post_reddit_comment_human_paced(tmp_path: Path) -> None:
-    # Missing cookies file returns clean error
-    missing_res = post_reddit_comment_human_paced(
+    from contextlib import contextmanager
+
+    # Dry-run succeeds without touching Pixel session or requiring cookies on disk
+    dry_res = post_reddit_comment_human_paced(
         thread_url="https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
         thing_id="t3_1xbzkxr",
-        text="Test comment",
+        text="Dry run comment",
         cookies_path=str(tmp_path / "does_not_exist.json"),
+        dry_run=True,
     )
-    assert missing_res["ok"] is False
-    assert "not found" in missing_res["error"].lower()
-
-    cookies_file = tmp_path / "ra_zero_cookies.json"
-    cookies_file.write_text(
-        json.dumps(
-            [
-                {
-                    "name": "reddit_session",
-                    "value": "dummy_token",
-                    "domain": ".reddit.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "no_restriction",
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    assert dry_res["ok"] is True
+    assert dry_res["dry_run"] is True
+    assert dry_res["browser"] == "chrome_beta"
 
     mock_page = MagicMock()
     eval_calls = []
@@ -594,6 +581,7 @@ def test_post_reddit_comment_human_paced(tmp_path: Path) -> None:
         if "scrollBy" in script:
             return None
         return {
+            "active_user": "RA_Zero",
             "json": {
                 "errors": [],
                 "data": {
@@ -606,19 +594,26 @@ def test_post_reddit_comment_human_paced(tmp_path: Path) -> None:
                         }
                     ]
                 },
-            }
+            },
         }
 
     mock_page.evaluate.side_effect = fake_evaluate
     mock_context = MagicMock()
-    mock_context.new_page.return_value = mock_page
+    mock_context.pages = [mock_page]
     mock_browser = MagicMock()
-    mock_browser.new_context.return_value = mock_context
+    mock_browser.contexts = [mock_context]
     mock_pw = MagicMock()
-    mock_pw.chromium.launch.return_value = mock_browser
+    mock_pw.chromium.connect_over_cdp.return_value = mock_browser
     mock_cm = MagicMock()
     mock_cm.__enter__.return_value = mock_pw
     mock_cm.__exit__.return_value = False
+
+    session_calls = []
+
+    @contextmanager
+    def fake_pixel_session(force: bool = False, browser: str = "chrome"):
+        session_calls.append({"force": force, "browser": browser})
+        yield "http://127.0.0.1:9223"
 
     sleeps = []
     mock_pw_mod = types.ModuleType("playwright")
@@ -627,39 +622,72 @@ def test_post_reddit_comment_human_paced(tmp_path: Path) -> None:
     mock_pw_mod.sync_api = mock_sync_api
 
     with patch.dict(sys.modules, {"playwright": mock_pw_mod, "playwright.sync_api": mock_sync_api}), patch(
+        "tools.resident_agents_watcher.pixel_session", side_effect=fake_pixel_session
+    ), patch("tools.resident_agents_watcher.close_extra_tabs") as mock_close_tabs, patch(
         "tools.resident_agents_watcher.time.sleep", side_effect=lambda s: sleeps.append(s)
     ):
         res = post_reddit_comment_human_paced(
             thread_url="https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
             thing_id="t3_1xbzkxr",
             text="Concrete pattern -> fix -> question?",
-            cookies_path=str(cookies_file),
             min_dwell_sec=12.0,
             max_dwell_sec=25.0,
+            force_pixel=True,
         )
 
     assert res["ok"] is True
+    assert res["browser"] == "chrome_beta"
+    assert res["account"] == "RA_Zero"
     assert res["comment_id"] == "t1_new999"
     assert res["comment_url"] == "https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/new999/"
     assert 12.0 <= res["dwell_sec"] <= 25.0
 
-    # Verify thread opened on old.reddit.com with cookies loaded
-    mock_context.add_cookies.assert_called_once()
-    loaded_cookies = mock_context.add_cookies.call_args[0][0]
-    assert loaded_cookies[0]["sameSite"] == "None"
+    # Verify Pixel 8 Pro Chrome Beta session used over CDP
+    assert session_calls == [{"force": True, "browser": "chrome_beta"}]
+    mock_pw.chromium.connect_over_cdp.assert_called_once_with("http://127.0.0.1:9223")
+    assert mock_close_tabs.call_count >= 1
     mock_page.goto.assert_called_once_with(
         "https://old.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
         timeout=30000,
         wait_until="domcontentloaded",
     )
 
-    # Verify organic scroll calls and reading dwell delay (excluding initial 1-2s settle sleep)
+    # Verify organic scroll calls, active-account verification, reading dwell delay, and zero /api/vote calls
     scroll_calls = [c for c in eval_calls if "scrollBy" in c[0]]
     submit_calls = [c for c in eval_calls if "api/comment" in c[0]]
     assert len(scroll_calls) >= 3
     assert len(submit_calls) == 1
+    assert "/api/me.json" in submit_calls[0][0]
+    assert "ra_zero" in submit_calls[0][0]
     assert "/api/vote" not in submit_calls[0][0]
     assert 12.0 - 1e-6 <= sum(sleeps[1:]) <= 25.0 + 1e-6
+    mock_browser.close.assert_called_once()
+
+    # Verify wrong-account guard aborts without posting if Chrome Beta is not logged into u/RA_Zero
+    def fake_evaluate_wrong_account(script, arg=None):
+        if "scrollBy" in script:
+            return None
+        return {
+            "error": "Active session is not u/RA_Zero (found: prime416)",
+            "active_user": "prime416",
+        }
+
+    mock_page.evaluate.side_effect = fake_evaluate_wrong_account
+    mock_browser.close.reset_mock()
+
+    with patch.dict(sys.modules, {"playwright": mock_pw_mod, "playwright.sync_api": mock_sync_api}), patch(
+        "tools.resident_agents_watcher.pixel_session", side_effect=fake_pixel_session
+    ), patch("tools.resident_agents_watcher.close_extra_tabs"), patch(
+        "tools.resident_agents_watcher.time.sleep"
+    ):
+        wrong_res = post_reddit_comment_human_paced(
+            thread_url="https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
+            thing_id="t3_1xbzkxr",
+            text="Should abort if wrong user",
+        )
+
+    assert wrong_res["ok"] is False
+    assert "Active session is not u/RA_Zero" in wrong_res["error"]
     mock_browser.close.assert_called_once()
 
 

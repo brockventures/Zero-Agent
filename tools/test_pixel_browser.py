@@ -1,10 +1,11 @@
 """Unit tests for Pixel 8 Pro Mobile Browser Automation (tools/pixel_browser.py)."""
+# ruff: noqa: I001, RUF059, RUF100, SIM117
 
 from pathlib import Path
 import subprocess
 import sys
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 import urllib.error
 
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -17,13 +18,12 @@ if sys.path[0] != _REPO_ROOT:
 from tools.pixel_browser import (
     ADB_KEYEVENT_TIMEOUT_SEC,
     check_printer_conflict,
-    get_adb_command_prefix,
     get_device_status,
     pixel_session,
     wake_and_unlock,
     sleep_screen,
-    setup_cdp_forwarding,
     launch_chrome,
+    launch_chrome_beta,
 )
 
 
@@ -180,6 +180,56 @@ class TestPixelBrowser(unittest.TestCase):
         mock_page1.close.assert_not_called()
         mock_page2.close.assert_called_once()
         mock_page3.close.assert_called_once()
+
+    @patch("tools.pixel_browser.time.sleep")
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "usb"))
+    @patch("tools.pixel_browser.subprocess.run")
+    def test_launch_chrome_stops_beta_first(self, mock_run, mock_prefix, mock_sleep):
+        launch_chrome()
+        cmds = [c[0][0] for c in mock_run.call_args_list]
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual(cmds[0], ["adb", "-s", "husky", "shell", "am", "force-stop", "com.chrome.beta"])
+        self.assertEqual(
+            cmds[1],
+            ["adb", "-s", "husky", "shell", "am", "start", "-n", "com.android.chrome/com.google.android.apps.chrome.Main"],
+        )
+        mock_sleep.assert_called_once_with(1.0)
+
+    @patch("tools.pixel_browser.time.sleep")
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "usb"))
+    @patch("tools.pixel_browser.subprocess.run")
+    def test_launch_chrome_beta_stops_stable_first(self, mock_run, mock_prefix, mock_sleep):
+        launch_chrome_beta()
+        cmds = [c[0][0] for c in mock_run.call_args_list]
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual(cmds[0], ["adb", "-s", "husky", "shell", "am", "force-stop", "com.android.chrome"])
+        self.assertEqual(
+            cmds[1],
+            ["adb", "-s", "husky", "shell", "am", "start", "-n", "com.chrome.beta/com.google.android.apps.chrome.Main"],
+        )
+        mock_sleep.assert_called_once_with(1.5)
+
+    @patch("tools.pixel_browser.sleep_screen")
+    @patch("tools.pixel_browser.launch_chrome_beta")
+    @patch("tools.pixel_browser.launch_chrome")
+    @patch("tools.pixel_browser.setup_cdp_forwarding")
+    @patch("tools.pixel_browser.wake_and_unlock")
+    @patch("tools.pixel_browser.check_printer_conflict", return_value=(False, "Clear"))
+    def test_pixel_session_chrome_beta_and_cleanup(
+        self, mock_conflict, mock_wake, mock_cdp, mock_chrome, mock_chrome_beta, mock_sleep
+    ):
+        with pixel_session(browser="chrome_beta") as cdp_url:
+            self.assertIn("http://", cdp_url)
+            mock_wake.assert_called_once()
+            mock_chrome_beta.assert_called_once()
+            mock_chrome.assert_not_called()
+            mock_cdp.assert_called_once()
+        mock_sleep.assert_called_once()
+
+    def test_pixel_session_invalid_browser_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            with pixel_session(browser="firefox"):
+                pass
 
 
 if __name__ == "__main__":

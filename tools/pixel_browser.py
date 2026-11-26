@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, I001, PLW1510, RUF059, RUF100, S110, SIM117, UP006, UP035, UP045
 """Pixel 8 Pro Real-Device Browser Automation CLI (over ADB CDP).
 
 Enables headless browser automation on a physical Pixel 8 Pro (husky)
@@ -217,24 +218,54 @@ def setup_cdp_forwarding() -> bool:
 
 
 def launch_chrome():
-    """Ensure mobile Chrome is launched and in foreground without creating new tabs."""
+    """Ensure mobile Chrome is launched and in foreground without creating new tabs (stopping Chrome Beta first so @chrome_devtools_remote never collides)."""
     prefix, _ = get_adb_command_prefix()
+    try:
+        subprocess.run(
+            prefix + ["shell", "am", "force-stop", "com.chrome.beta"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
     am_cmd = ["am", "start", "-n", "com.android.chrome/com.google.android.apps.chrome.Main"]
     subprocess.run(prefix + ["shell"] + am_cmd, capture_output=True, timeout=5)
     time.sleep(1.0)
 
 
+def launch_chrome_beta():
+    """Ensure mobile Chrome Beta is launched and in foreground (stopping stock Chrome first so @chrome_devtools_remote is owned by Beta)."""
+    prefix, _ = get_adb_command_prefix()
+    try:
+        subprocess.run(
+            prefix + ["shell", "am", "force-stop", "com.android.chrome"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+    am_cmd = ["am", "start", "-n", "com.chrome.beta/com.google.android.apps.chrome.Main"]
+    subprocess.run(prefix + ["shell"] + am_cmd, capture_output=True, timeout=5)
+    time.sleep(1.5)
+
+
 @contextmanager
-def pixel_session(force: bool = False):
+def pixel_session(force: bool = False, browser: str = "chrome"):
     """Context manager guaranteeing screen sleep and CDP cleanup on exit."""
+    if browser not in ("chrome", "chrome_beta"):
+        raise ValueError(f"Unsupported browser {browser!r}; expected 'chrome' or 'chrome_beta'.")
+
     conflict, msg = check_printer_conflict()
     if conflict and not force:
         raise RuntimeError(f"Printer conflict guard active: {msg}. Pass --force to override.")
 
     prefix, transport = get_adb_command_prefix()
     wake_and_unlock()
+    if browser == "chrome_beta":
+        launch_chrome_beta()
+    else:
+        launch_chrome()
     setup_cdp_forwarding()
-    launch_chrome()
 
     try:
         cdp_host = "127.0.0.1" if transport == "local" else HOST2_IP
@@ -298,13 +329,15 @@ def browse_url(
     output_path: Optional[str] = None,
     timeout_ms: int = 25000,
     force: bool = False,
+    browser: str = "chrome",
 ) -> Dict[str, Any]:
-    """Execute browsing action on Pixel 8 Pro Chrome over CDP."""
+    """Execute browsing action on Pixel 8 Pro Chrome / Chrome Beta over CDP."""
     from playwright.sync_api import sync_playwright
 
     result: Dict[str, Any] = {
         "url": url,
         "action": action,
+        "browser": browser,
         "success": False,
         "title": None,
         "content": None,
@@ -312,11 +345,11 @@ def browse_url(
         "screenshot_path": None,
     }
 
-    with pixel_session(force=force) as cdp_url:
+    with pixel_session(force=force, browser=browser) as cdp_url:
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(cdp_url)
+            pw_browser = p.chromium.connect_over_cdp(cdp_url)
             try:
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                context = pw_browser.contexts[0] if pw_browser.contexts else pw_browser.new_context()
                 
                 # Pre-clean: close any extraneous background tabs before navigating
                 close_extra_tabs(context)
@@ -348,7 +381,7 @@ def browse_url(
                     close_extra_tabs(context, keep_page=page)
                 except Exception:
                     pass
-                browser.close()
+                pw_browser.close()
 
     return result
 
@@ -365,6 +398,7 @@ def main():
     browse_p.add_argument("url", help="Target URL to browse")
     browse_p.add_argument("--extract", choices=["text", "html", "cookies"], default="text", help="Content to extract")
     browse_p.add_argument("--timeout", type=int, default=25, help="Navigation timeout in seconds")
+    browse_p.add_argument("--browser", choices=["chrome", "chrome_beta"], default="chrome", help="Target mobile browser (chrome or chrome_beta)")
     browse_p.add_argument("--force", action="store_true", help="Override active 3D printer camera conflict guard")
 
     # screenshot
@@ -372,6 +406,7 @@ def main():
     snap_p.add_argument("url", help="Target URL to capture")
     snap_p.add_argument("--output", "-o", default="/workspace/data/pixel_browser_screenshot.png", help="Output PNG path")
     snap_p.add_argument("--timeout", type=int, default=25, help="Navigation timeout in seconds")
+    snap_p.add_argument("--browser", choices=["chrome", "chrome_beta"], default="chrome", help="Target mobile browser (chrome or chrome_beta)")
     snap_p.add_argument("--force", action="store_true", help="Override active 3D printer camera conflict guard")
 
     # cleanup-tabs
@@ -397,6 +432,7 @@ def main():
             action=args.extract,
             timeout_ms=args.timeout * 1000,
             force=args.force,
+            browser=args.browser,
         )
         if not res["success"]:
             print(json.dumps(res, indent=2), file=sys.stderr)
@@ -416,6 +452,7 @@ def main():
             output_path=args.output,
             timeout_ms=args.timeout * 1000,
             force=args.force,
+            browser=args.browser,
         )
         if not res["success"]:
             print(json.dumps(res, indent=2), file=sys.stderr)
