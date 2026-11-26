@@ -652,7 +652,8 @@ class TestForgeEngine(unittest.TestCase):
         self.assertNotIn("Completed Build 1", header_with_recent)
         self.assertNotIn("Failed Build 9", header_with_recent)
         for idx in range(2, 7):
-            self.assertIn(f"Completed Build {idx}", header_with_recent)
+            self.assertIn(f"- ✅ Completed Build {idx}", header_with_recent)
+        self.assertNotIn("PT*", header_with_recent)
         self.assertLess(header_with_recent.index("Completed Build 6"), header_with_recent.index("Completed Build 2"))
 
         # Verify shared FORGE_DB_PATH resolution prefers /baseball/data/forge.db when /baseball/data exists

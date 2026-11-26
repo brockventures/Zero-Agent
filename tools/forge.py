@@ -12456,7 +12456,7 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
     else:
         lines.append("\n**Recently Completed (Last 5)**")
         for rb in recent_completed:
-            lines.append(f"- ✅ {_truncate_label(rb['title'], 56)} · *{_short_pt_str(rb['updated_at'])}*")
+            lines.append(f"- ✅ {_truncate_label(rb['title'], 72)}")
 
     return "\n".join(lines)
 
