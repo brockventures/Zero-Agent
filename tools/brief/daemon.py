@@ -1042,13 +1042,14 @@ class BriefDaemonRunner:
                 errors["gate"] = str(exc)
 
         if self._is_due(self._last_watchdog_at, _WATCHDOG_INTERVAL_SECONDS, now_ts):
-            self._last_watchdog_at = now_ts
+            watchdog_now_ts = float(self._now_fn()) if now is None else now_ts
+            self._last_watchdog_at = watchdog_now_ts
             try:
                 summary["watchdog"] = self._watchdog_fn(
                     self.config,
                     self.queue,
                     dry_run=self.config.dry_run,
-                    now=now_ts,
+                    now=watchdog_now_ts,
                 )
             except Exception as exc:
                 logger.exception("Watchdog check failed")

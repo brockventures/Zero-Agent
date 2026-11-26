@@ -44,8 +44,8 @@ def test_check_brief_health_stale_and_corrupt_heartbeats(tmp_path: Path) -> None
     queue.init_db()
 
     now = 1795500000.0
-    # Exactly at 3x threshold is still healthy; > 3x is stale.
-    touch_heartbeat(cfg.heartbeats_dir, "router", now=now - 45.0)
+    # Router has a 60s minimum floor (3x 60s = 180s) so 30-90s LLM turns never false-alarm.
+    touch_heartbeat(cfg.heartbeats_dir, "router", now=now - 180.0)
     # Also verify .ts heartbeat files are supported alongside .hb.
     cfg.heartbeats_dir.mkdir(parents=True, exist_ok=True)
     (cfg.heartbeats_dir / "gmail_watcher.ts").write_text(f"{now - 361.0}\n", encoding="utf-8")
@@ -216,7 +216,7 @@ def test_run_watchdog_dedupes_ongoing_incident_across_minutes(tmp_path: Path) ->
     queue.init_db()
 
     t0 = 1795500000.0
-    touch_heartbeat(cfg.heartbeats_dir, "router", now=t0 - 120.0)
+    touch_heartbeat(cfg.heartbeats_dir, "router", now=t0 - 200.0)
 
     first = run_watchdog(cfg, queue, dry_run=True, now=t0)
     assert first["healthy"] is False
