@@ -399,3 +399,294 @@ def test_cli_morning_brief_route_once_status_watchdog_and_replay(
     assert cli.main(["replay"]) == 0
     replay_out = capsys.readouterr().out
     assert "Overall: PASS" in replay_out
+
+
+def test_cli_gate_status_mint_oauth_urls_and_exchange_oauth_code(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    from tools.brief.actions import READONLY_OAUTH_SCOPES, WRITE_OAUTH_SCOPES
+
+    state_dir = tmp_path / "state"
+    memory_dir = tmp_path / "memory"
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    readonly_tok = secrets_dir / "brief_readonly_token.json"
+    write_tok = secrets_dir / "brief_write_token.json"
+    oauth_client = secrets_dir / "google_oauth.json"
+    oauth_client.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "client_id": "cli-test-client.apps.googleusercontent.com",
+                    "client_secret": "CLI_TEST_CLIENT_SECRET_DO_NOT_LEAK",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg_path = memory_dir / "config.toml"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "[oauth]",
+                f'readonly_token_path = "{readonly_tok}"',
+                "allow_shared_readonly_fallback = false",
+                "",
+                "[gate]",
+                f'write_token_path = "{write_tok}"',
+                "allow_shared_oauth_fallback = false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. gate-status before token files exist
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "gate-status",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    gs_json = json.loads(capsys.readouterr().out)
+    assert gs_json["readonly_token_configured"] is False
+    assert gs_json["readonly_token_path"] == str(readonly_tok)
+    assert gs_json["allow_shared_readonly_fallback"] is False
+    assert gs_json["write_token_configured"] is False
+    assert gs_json["write_token_path"] == str(write_tok)
+    assert gs_json["allow_shared_oauth_fallback"] is False
+
+    # 2. mint-oauth-urls includes readonly_token_path and updated WRITE_OAUTH_SCOPES
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "mint-oauth-urls",
+                "--oauth-client-path",
+                str(oauth_client),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    mint_payload = json.loads(capsys.readouterr().out)
+    assert mint_payload["readonly_token_path"] == str(readonly_tok)
+    assert mint_payload["write_token_path"] == str(write_tok)
+    assert mint_payload["write_scopes"] == WRITE_OAUTH_SCOPES
+    assert "gmail.compose" in mint_payload["write_url"]
+    assert "CLI_TEST_CLIENT_SECRET_DO_NOT_LEAK" not in json.dumps(mint_payload)
+
+    # 3. exchange-oauth-code for readonly and write roles
+    class _FakeResp:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    def _fake_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> _FakeResp:
+        del timeout
+        raw_body = req.data.decode("utf-8") if req.data else ""
+        if "code=ro-auth-code" in raw_body:
+            return _FakeResp(
+                {
+                    "access_token": "ya29.ro-access",
+                    "refresh_token": "RO_REFRESH_SECRET_NEVER_PRINT",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": READONLY_OAUTH_SCOPES,
+                }
+            )
+        if "code=wr-auth-code" in raw_body:
+            return _FakeResp(
+                {
+                    "access_token": "ya29.wr-access",
+                    "refresh_token": "WR_REFRESH_SECRET_NEVER_PRINT",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": WRITE_OAUTH_SCOPES,
+                }
+            )
+        if "code=bad-scope-code" in raw_body:
+            return _FakeResp(
+                {
+                    "access_token": "ya29.bad-access",
+                    "refresh_token": "BAD_REFRESH",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": f"{WRITE_OAUTH_SCOPES} https://www.googleapis.com/auth/gmail.send",
+                }
+            )
+        raise AssertionError(f"Unexpected token request body: {raw_body}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "exchange-oauth-code",
+                "--role",
+                "readonly",
+                "--code",
+                "http://localhost/?code=ro-auth-code&scope=ignored",
+                "--oauth-client-path",
+                str(oauth_client),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    ro_out = capsys.readouterr().out
+    ro_json = json.loads(ro_out)
+    assert ro_json["ok"] is True
+    assert ro_json["role"] == "readonly"
+    assert ro_json["output_path"] == str(readonly_tok)
+    assert ro_json["written"] is True
+    assert "RO_REFRESH_SECRET_NEVER_PRINT" not in ro_out
+    assert "CLI_TEST_CLIENT_SECRET_DO_NOT_LEAK" not in ro_out
+    assert readonly_tok.is_file()
+    assert (readonly_tok.stat().st_mode & 0o777) == 0o600
+
+    staged_write = tmp_path / "staged" / "brief_write_token.json"
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "exchange-oauth-code",
+                "--role",
+                "write",
+                "--code",
+                "wr-auth-code",
+                "--output",
+                str(staged_write),
+                "--oauth-client-path",
+                str(oauth_client),
+            ]
+        )
+        == 0
+    )
+    wr_text = capsys.readouterr().out
+    assert "BRIEF Google OAuth write token saved" in wr_text
+    assert str(staged_write) in wr_text
+    assert "WR_REFRESH_SECRET_NEVER_PRINT" not in wr_text
+    assert "CLI_TEST_CLIENT_SECRET_DO_NOT_LEAK" not in wr_text
+    assert staged_write.is_file()
+    assert (staged_write.stat().st_mode & 0o777) == 0o600
+
+    # Copy staged token to configured path and verify gate-status text & JSON reflect both tokens
+    write_tok.write_text(staged_write.read_text(encoding="utf-8"), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "gate-status",
+            ]
+        )
+        == 0
+    )
+    gs_text = capsys.readouterr().out
+    assert f"Read-Only Token: configured ({readonly_tok})" in gs_text
+    assert f"Write Token    : configured ({write_tok})" in gs_text
+
+    # 4. Forbidden gmail.send scope fails closed without writing output
+    rejected_out = tmp_path / "rejected_write.json"
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "exchange-oauth-code",
+                "--role",
+                "write",
+                "--code",
+                "bad-scope-code",
+                "--output",
+                str(rejected_out),
+                "--oauth-client-path",
+                str(oauth_client),
+                "--json",
+            ]
+        )
+        == 1
+    )
+    err_json = json.loads(capsys.readouterr().out)
+    assert err_json["ok"] is False
+    assert "prohibited scope" in err_json["error"].lower()
+    assert not rejected_out.exists()
+
+    # 5. Read-only /secrets mount (EROFS) returns graceful --output staging hint without secrets
+    def _raise_erofs(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(cli, "exchange_oauth_authorization_code", _raise_erofs)
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(cfg_path),
+                "--state-dir",
+                str(state_dir),
+                "--memory-dir",
+                str(memory_dir),
+                "exchange-oauth-code",
+                "--role",
+                "write",
+                "--code",
+                "wr-auth-code",
+                "--oauth-client-path",
+                str(oauth_client),
+            ]
+        )
+        == 1
+    )
+    captured_ro = capsys.readouterr()
+    assert "--output" in captured_ro.err
+    assert "read-only" in captured_ro.err.lower()
+    assert "CLI_TEST_CLIENT_SECRET_DO_NOT_LEAK" not in captured_ro.err

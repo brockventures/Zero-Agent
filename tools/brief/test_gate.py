@@ -865,8 +865,8 @@ def test_gate_default_and_non_positive_proactive_limit_unlimited_while_positive_
         staged_calls: list[dict[str, Any]] = []
         gate = BriefApprovalGate(
             cfg,
-            stage_card_fn=lambda **kw: staged_calls.append(kw)
-            or {"decision_id": f"dec-{len(staged_calls)}"},
+            stage_card_fn=lambda calls=staged_calls, **kw: calls.append(kw)
+            or {"decision_id": f"dec-{len(calls)}"},
             now_fn=lambda: day_ts,
         )
         assert gate._can_send_proactive(day_ts) is True
@@ -912,4 +912,322 @@ def test_gate_default_and_non_positive_proactive_limit_unlimited_while_positive_
     assert res_pos["staged"] == 2
     assert res_pos["deferred_budget"] == 1
     assert gate_pos._can_send_proactive(day_ts + 60) is False
+
+
+class _FakeGmailDraftApi:
+    def __init__(self) -> None:
+        self.drafts: list[dict[str, Any]] = []
+        self.should_raise: Exception | None = None
+
+    def create_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.should_raise is not None:
+            raise self.should_raise
+        self.drafts.append(dict(payload))
+        msg_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        return {
+            "id": "r-draft-100",
+            "message": {
+                "id": "msg-draft-100",
+                "threadId": str(msg_obj.get("threadId") or "thr-draft-100"),
+            },
+        }
+
+
+def _sample_gmail_draft_proposal(
+    proposal_id: str = "prop-draft-1",
+    *,
+    to: Any = None,
+    cc: Any = None,
+    bcc: Any = None,
+    subject: str = "Project Update",
+    body: str = "Hi team,\n\nHere is the status update.",
+    thread_id: str | None = None,
+    expires_at: str = "2026-11-26T18:00:00-08:00",
+    from_session: str = "intake/gmail/thread-draft-1",
+    urgent: bool = False,
+) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "to": ["coach@example.org"] if to is None else to,
+        "subject": subject,
+        "body": body,
+    }
+    if cc is not None:
+        args["cc"] = cc
+    if bcc is not None:
+        args["bcc"] = bcc
+    if thread_id is not None:
+        args["thread_id"] = thread_id
+    return {
+        "id": proposal_id,
+        "action": "gmail.create_draft",
+        "args": args,
+        "reason": "Owner asked to prepare a draft reply.",
+        "expires_at": expires_at,
+        "from_session": from_session,
+        "urgent": urgent,
+    }
+
+
+def test_gmail_create_draft_decision_card_copy_variants() -> None:
+    long_subject = "Quarterly Roadmap Alignment Meeting Follow-Up With Extra Characters Beyond Fifty Eight"
+    long_body = "  " + ("A" * 450) + "  "
+    title_new, body_new = _build_decision_card_copy(
+        proposal_id="prop-draft-secret-id",
+        action="gmail.create_draft",
+        normalized_args={
+            "to": ["alice@example.com", "bob@example.org"],
+            "cc": ["carol@example.com"],
+            "bcc": ["audit@example.net"],
+            "subject": long_subject,
+            "body": long_body,
+        },
+        reason="Prepare status email draft.",
+        expires_ts=_ts_pt(2026, 11, 26, 18, 0),
+        urgent=False,
+        tz_name="America/Los_Angeles",
+    )
+    assert title_new == f"Create Gmail Draft: {long_subject[:58]}"
+    lines_new = body_new.splitlines()
+    preview_line = next(line for line in lines_new if line.startswith("**Draft Preview:** "))
+    preview_text = preview_line.removeprefix("**Draft Preview:** ")
+    assert len(preview_text) <= 400
+    assert preview_text.endswith("...")
+    assert lines_new == [
+        "**To:** alice@example.com, bob@example.org",
+        "**Cc:** carol@example.com",
+        "**Bcc:** audit@example.net",
+        f"**Subject:** {long_subject}",
+        preview_line,
+        "**Why:** Prepare status email draft.",
+        "",
+        f'**Approve Action:** Create Gmail draft to alice@example.com, bob@example.org with subject "{long_subject}" (saves to Drafts; does not send)',
+    ]
+    assert "prop-draft-secret-id" not in body_new
+    assert "gmail.create_draft" not in body_new
+
+    title_reply, body_reply = _build_decision_card_copy(
+        proposal_id="prop-draft-reply-id",
+        action="gmail.create_draft",
+        normalized_args={
+            "to": ["coach@example.org"],
+            "subject": "Re: Practice Schedule",
+            "body": "Looks good, see you Saturday.",
+            "thread_id": "thr-secret-999",
+        },
+        reason="Coach asked for confirmation.",
+        expires_ts=_ts_pt(2026, 11, 26, 18, 0),
+        urgent=True,
+        tz_name="America/Los_Angeles",
+    )
+    assert title_reply == "Reply Draft: Re: Practice Schedule"
+    assert body_reply.splitlines() == [
+        "**[URGENT]**",
+        "**To:** coach@example.org",
+        "**Subject:** Re: Practice Schedule",
+        "**Draft Preview:** Looks good, see you Saturday.",
+        "**Why:** Coach asked for confirmation.",
+        "",
+        '**Approve Action:** Create Gmail draft to coach@example.org with subject "Re: Practice Schedule" (saves to Drafts; does not send)',
+    ]
+    assert "thr-secret-999" not in body_reply
+
+
+def test_gmail_create_draft_staging_approve_edit_tamper_and_send_rejection(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path, dry_run=False)
+    now_ts = _ts_pt(2026, 11, 24, 10, 0)
+
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        _sample_gmail_draft_proposal(
+            "prop-draft-approve",
+            cc=["lead@example.com"],
+            thread_id="thr-100",
+        ),
+    )
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        _sample_gmail_draft_proposal(
+            "prop-draft-edit",
+            subject="Initial Subject",
+            body="Initial draft body.",
+        ),
+    )
+    tamper_file = write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        _sample_gmail_draft_proposal("prop-draft-tamper"),
+    )
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        {
+            "id": "prop-bad-gmail-send",
+            "action": "gmail.send",
+            "args": {"to": ["coach@example.org"], "subject": "Send", "body": "Forbidden"},
+            "reason": "Must be rejected.",
+            "expires_at": "2026-11-26T18:00:00-08:00",
+            "from_session": "intake/gmail/thread-send",
+        },
+    )
+
+    cards: dict[str, dict[str, Any]] = {}
+    alerts: list[str] = []
+    gmail_api = _FakeGmailDraftApi()
+    gate = BriefApprovalGate(
+        cfg,
+        stage_card_fn=lambda **kw: cards.setdefault(
+            kw["payload"]["proposal_id"],
+            {"decision_id": f"dec-{kw['payload']['proposal_id']}", **kw},
+        ),
+        api_client=gmail_api,
+        now_fn=lambda: now_ts,
+        alert_fn=lambda msg: alerts.append(msg) or True,
+    )
+
+    scan_res = gate.scan_pending_proposals(now=now_ts)
+    assert scan_res["staged"] == 3
+    assert scan_res["rejected"] == 1
+    assert scan_res["rejected_ids"] == ["prop-bad-gmail-send"]
+    assert (cfg.proposals_archive_dir / "prop-bad-gmail-send.rejected.json").is_file()
+
+    # 1. Approve snapshotted draft
+    app_res = gate.approve_proposal("prop-draft-approve", now=now_ts + 10)
+    assert app_res["ok"] is True
+    assert app_res["status"] == "executed"
+    assert app_res["receipt"]["draft_id"] == "r-draft-100"
+    assert app_res["receipt"]["message_id"] == "msg-draft-100"
+    assert (
+        app_res["receipt"]["gmail_url"]
+        == "https://mail.google.com/mail/u/0/#drafts?compose=msg-draft-100"
+    )
+    assert len(gmail_api.drafts) == 1
+    assert gmail_api.drafts[0]["message"]["threadId"] == "thr-100"
+    assert (cfg.proposals_archive_dir / "prop-draft-approve.executed.json").is_file()
+
+    # Replay protection
+    replay_res = gate.approve_proposal("prop-draft-approve", now=now_ts + 20)
+    assert replay_res["ok"] is False
+    assert replay_res["status"] == "executed"
+    assert len(gmail_api.drafts) == 1
+
+    # 2. Edit + Approve via FORGE entrypoint
+    edit_res = handle_forge_decision_approve(
+        cards["prop-draft-edit"]["payload"],
+        edited_payload={
+            "args": {
+                "to": ["updated@example.org"],
+                "subject": "Updated Subject",
+                "body": "Updated draft body.",
+            }
+        },
+        api_client=gmail_api,
+        now=now_ts + 30,
+    )
+    assert edit_res["ok"] is True
+    assert edit_res["status"] == "edited_executed"
+    assert edit_res["args"]["to"] == ["updated@example.org"]
+    assert edit_res["args"]["subject"] == "Updated Subject"
+    assert len(gmail_api.drafts) == 2
+    assert (cfg.proposals_archive_dir / "prop-draft-edit.edited_executed.json").is_file()
+
+    # 3. Tamper detection on disk refuses execution
+    tampered_data = json.loads(tamper_file.read_text(encoding="utf-8"))
+    tampered_data["args"]["to"] = ["attacker@example.net"]
+    tamper_file.write_text(json.dumps(tampered_data), encoding="utf-8")
+
+    tamper_res = gate.approve_proposal("prop-draft-tamper", now=now_ts + 40)
+    assert tamper_res["ok"] is False
+    assert tamper_res["status"] == "tampered"
+    assert len(gmail_api.drafts) == 2
+    assert len(alerts) == 1
+    assert (cfg.proposals_archive_dir / "prop-draft-tamper.tampered.json").is_file()
+
+    receipts = {ev["external_id"]: ev for ev in _fetch_internal_events(gate.queue)}
+    exec_ev = receipts["gate-receipt:prop-draft-approve:executed"]
+    assert "r-draft-100" in exec_ev["body"]
+    assert "msg-draft-100" in exec_ev["body"]
+    assert "https://mail.google.com/mail/u/0/#drafts?compose=msg-draft-100" in exec_ev["body"]
+    assert "gate-receipt:prop-draft-edit:edited_executed" in receipts
+    assert "gate-receipt:prop-draft-tamper:tampered" in receipts
+    assert "gate-receipt:prop-bad-gmail-send:rejected" in receipts
+
+
+def test_gmail_create_draft_dismissal_keys_and_gate_status(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path, dry_run=True)
+    now_ts = _ts_pt(2026, 11, 24, 11, 0)
+
+    assert _extract_dismissal_keys(
+        {
+            "action": "gmail.create_draft",
+            "args": {
+                "to": ["Vendor Sales <Sales@Vendor.Example.COM>"],
+                "subject": "Re: Renewal",
+                "body": "Thanks!",
+            },
+            "reason": "Draft response",
+            "from_session": "intake/gmail/thread-v1",
+        }
+    ) == ("sales@vendor.example.com", "gmail.create_draft")
+
+    assert _extract_dismissal_keys(
+        {
+            "action": "gmail.create_draft",
+            "args_json": json.dumps(
+                {
+                    "to": ["partner@agency.example.org"],
+                    "subject": "Intro",
+                    "body": "Hello",
+                }
+            ),
+            "reason": "Follow up",
+            "from_session": "intake/gmail/thread-v2",
+        }
+    ) == ("partner@agency.example.org", "gmail.create_draft")
+
+    gate = BriefApprovalGate(
+        cfg,
+        stage_card_fn=lambda **kw: {"decision_id": f"dec-{kw['payload']['proposal_id']}"},
+        now_fn=lambda: now_ts,
+    )
+
+    pre_status = gate.get_gate_status(now=now_ts)
+    assert pre_status["readonly_token_configured"] is False
+    assert pre_status["readonly_token_path"] == str(cfg.readonly_token_path)
+    assert pre_status["write_token_configured"] is False
+    assert pre_status["write_token_path"] == str(cfg.gate_write_token_path)
+    assert pre_status["allow_shared_readonly_fallback"] is True
+
+    ro_tok = tmp_path / "ro_token.json"
+    wr_tok = tmp_path / "wr_token.json"
+    ro_tok.write_text("{}", encoding="utf-8")
+    wr_tok.write_text("{}", encoding="utf-8")
+    cfg.readonly_token_path = ro_tok
+    cfg.gate_write_token_path = wr_tok
+    cfg.allow_shared_readonly_fallback = False
+
+    post_status = gate.get_gate_status(now=now_ts)
+    assert post_status["readonly_token_configured"] is True
+    assert post_status["readonly_token_path"] == str(ro_tok)
+    assert post_status["write_token_configured"] is True
+    assert post_status["write_token_path"] == str(wr_tok)
+    assert post_status["allow_shared_readonly_fallback"] is False
+
+    for idx in (1, 2, 3):
+        write_proposal_atomic(
+            cfg.proposals_pending_dir,
+            _sample_gmail_draft_proposal(
+                f"prop-draft-strike-{idx}",
+                to=["sales@vendor.example.com"],
+                subject=f"Follow up {idx}",
+            ),
+        )
+    assert gate.scan_pending_proposals(now=now_ts)["staged"] == 3
+    for idx in (1, 2, 3):
+        assert gate.dismiss_proposal(f"prop-draft-strike-{idx}", now=now_ts + idx)["ok"] is True
+
+    cands = gate.gate_store.list_three_strike_candidates(now=now_ts + 10)
+    assert len(cands) == 1
+    assert cands[0]["sender_key"] == "sales@vendor.example.com"
+    assert cands[0]["category_key"] == "gmail.create_draft"
+    assert cands[0]["strike_count"] == 3
 

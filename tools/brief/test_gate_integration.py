@@ -789,9 +789,12 @@ def test_cli_gate_commands_status_and_mint_oauth_urls(
     )
     mint_json = json.loads(capsys.readouterr().out)
     assert mint_json["readonly_scopes"] == READONLY_OAUTH_SCOPES
+    assert mint_json["readonly_token_path"] == str(cfg.readonly_token_path)
     assert mint_json["write_scopes"] == WRITE_OAUTH_SCOPES
+    assert mint_json["write_token_path"] == str(cfg.gate_write_token_path)
     assert "gmail.readonly" in mint_json["readonly_url"]
     assert "calendar.events" in mint_json["write_url"]
+    assert "gmail.compose" in mint_json["write_url"]
     assert "NEVER_ECHO_THIS_SECRET_VALUE" not in json.dumps(mint_json)
 
     assert (
@@ -812,6 +815,7 @@ def test_cli_gate_commands_status_and_mint_oauth_urls(
     )
     mint_text = capsys.readouterr().out
     assert "Read-Only URL" in mint_text
+    assert "Read-Only Dest" in mint_text
     assert "Write-Only URL" in mint_text
     assert "NEVER_ECHO_THIS_SECRET_VALUE" not in mint_text
 
@@ -843,8 +847,8 @@ def test_brief_edit_and_dismiss_modals_integration(
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
-    import tools.bridge as bridge
     import tools.forge as live_forge
+    from tools import bridge
 
     cfg = _write_gate_config(tmp_path, dry_run=True)
     forge_db = tmp_path / "forge.db"
@@ -1114,8 +1118,8 @@ def test_brief_option_b_silent_dismiss_and_edit_modal_routing(
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
-    import tools.bridge as bridge
     import tools.forge as live_forge
+    from tools import bridge
 
     cfg = _write_gate_config(tmp_path, dry_run=True)
     forge_db = tmp_path / "forge.db"
@@ -1226,4 +1230,243 @@ def test_brief_option_b_silent_dismiss_and_edit_modal_routing(
         assert isinstance(inter_edit.response.send_modal.call_args[0][0], live_forge.BriefProposalEditModal)
 
     asyncio.run(_run())
+
+
+def test_end_to_end_gmail_create_draft_forge_approve_edited_tamper_and_split_oauth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+    from email import message_from_bytes, policy
+
+    from tools.brief.actions import resolve_gate_write_credentials
+
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    write_token_path = secrets_dir / "brief_write_token.json"
+    write_token_path.write_text(
+        json.dumps(
+            {
+                "client_id": "test-client-id.apps.googleusercontent.com",
+                "client_secret": "test-write-secret-value",
+                "refresh_token": "write-only-draft-refresh",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "scope": WRITE_OAUTH_SCOPES,
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_token_path.chmod(0o600)
+
+    cfg = _write_gate_config(tmp_path, dry_run=False, write_token_path=write_token_path)
+    forge_db = tmp_path / "forge.db"
+    forge.init_forge_db(forge_db)
+    now_ts = _ts_pt(2026, 11, 24, 10, 0)
+
+    http_calls: list[dict[str, Any]] = []
+
+    class _FakeResp:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    def _fake_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> _FakeResp:
+        raw_body = req.data.decode("utf-8") if req.data else ""
+        http_calls.append(
+            {
+                "method": req.get_method(),
+                "url": req.full_url,
+                "headers": {k.lower(): v for k, v in req.header_items()},
+                "body": raw_body,
+                "timeout": timeout,
+            }
+        )
+        if req.full_url == "https://oauth2.googleapis.com/token":
+            assert "write-only-draft-refresh" in raw_body
+            return _FakeResp(
+                {
+                    "access_token": "ya29.write-draft-access",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": WRITE_OAUTH_SCOPES,
+                }
+            )
+        if req.full_url == "https://gmail.googleapis.com/gmail/v1/users/me/drafts":
+            idx = sum(1 for c in http_calls if c["url"].endswith("/users/me/drafts"))
+            parsed = json.loads(raw_body)
+            thread_id = str((parsed.get("message") or {}).get("threadId") or f"thr-{idx}")
+            return _FakeResp(
+                {
+                    "id": f"draft-{idx}",
+                    "message": {
+                        "id": f"msg-{idx}",
+                        "threadId": thread_id,
+                    },
+                }
+            )
+        raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        {
+            "id": "prop-draft-int-approve",
+            "action": "gmail.create_draft",
+            "args": {
+                "to": ["coach@example.org"],
+                "cc": ["assistant@example.org"],
+                "subject": "Re: Saturday Game Time",
+                "body": "We will arrive at 9:30 AM PT.",
+                "thread_id": "thr-game-1",
+            },
+            "reason": "Coach asked for arrival time.",
+            "expires_at": "2026-11-28T18:00:00-08:00",
+            "from_session": "intake/gmail/thr-game-1",
+            "urgent": False,
+        },
+    )
+    write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        {
+            "id": "prop-draft-int-edit",
+            "action": "gmail.create_draft",
+            "args": {
+                "to": ["vendor@example.com"],
+                "subject": "Initial Draft Subject",
+                "body": "Initial body text.",
+            },
+            "reason": "Prepare vendor follow-up.",
+            "expires_at": "2026-11-28T18:00:00-08:00",
+            "from_session": "intake/gmail/thr-vendor-1",
+            "urgent": False,
+        },
+    )
+    tamper_file = write_proposal_atomic(
+        cfg.proposals_pending_dir,
+        {
+            "id": "prop-draft-int-tamper",
+            "action": "gmail.create_draft",
+            "args": {
+                "to": ["finance@example.com"],
+                "subject": "Invoice Question",
+                "body": "Please clarify line 3.",
+            },
+            "reason": "Verify invoice line item.",
+            "expires_at": "2026-11-28T18:00:00-08:00",
+            "from_session": "intake/gmail/thr-fin-1",
+            "urgent": False,
+        },
+    )
+
+    stage_kwargs: list[dict[str, Any]] = []
+    gate = BriefApprovalGate(
+        cfg,
+        stage_card_fn=lambda **kw: stage_kwargs.append(dict(kw))
+        or forge.stage_decision(
+            category=kw["category"],
+            title=kw["title"],
+            summary=kw["summary"],
+            handler_type=kw["handler_type"],
+            payload=kw["payload"],
+            channel_id=kw["channel_id"],
+            ttl_seconds=kw["ttl_seconds"],
+            is_private=kw["is_private"],
+            db_path=forge_db,
+            post_to_discord=False,
+        ),
+        now_fn=lambda: now_ts,
+    )
+    scan_res = gate.scan_pending_proposals(now=now_ts)
+    assert scan_res["staged"] == 3
+    by_pid = {kw["payload"]["proposal_id"]: kw for kw in stage_kwargs}
+    assert by_pid["prop-draft-int-approve"]["title"] == "Reply Draft: Re: Saturday Game Time"
+    assert by_pid["prop-draft-int-edit"]["title"] == "Create Gmail Draft: Initial Draft Subject"
+    assert "(saves to Drafts; does not send)" in by_pid["prop-draft-int-approve"]["summary"]
+    assert "**Approve Action:**" in by_pid["prop-draft-int-edit"]["summary"]
+
+    dec_approve = gate.gate_store.get_proposal("prop-draft-int-approve")["decision_id"]
+    dec_edit = gate.gate_store.get_proposal("prop-draft-int-edit")["decision_id"]
+    dec_tamper = gate.gate_store.get_proposal("prop-draft-int-tamper")["decision_id"]
+    assert dec_approve and dec_edit and dec_tamper
+
+    # 1. Approve first draft through FORGE
+    res_app = forge.execute_decision(dec_approve, db_path=forge_db)
+    assert res_app["ok"] is True
+    assert res_app["status"] == "approved"
+    assert (cfg.proposals_archive_dir / "prop-draft-int-approve.executed.json").is_file()
+
+    # 2. Edit+Approve second draft through FORGE
+    res_edit = forge.execute_decision(
+        dec_edit,
+        override_payload={
+            "args": {
+                "to": ["vendor@example.com"],
+                "subject": "Edited Draft Subject",
+                "body": "Edited body text.",
+            }
+        },
+        db_path=forge_db,
+    )
+    assert res_edit["ok"] is True
+    assert res_edit["status"] == "edited_approved"
+    assert (cfg.proposals_archive_dir / "prop-draft-int-edit.edited_executed.json").is_file()
+
+    # 3. Tamper third draft on disk -> refused
+    tampered = json.loads(tamper_file.read_text(encoding="utf-8"))
+    tampered["args"]["body"] = "Tampered wire transfer instructions."
+    tamper_file.write_text(json.dumps(tampered), encoding="utf-8")
+    res_tamper = forge.execute_decision(dec_tamper, db_path=forge_db)
+    assert res_tamper["ok"] is False
+    assert gate.gate_store.get_proposal("prop-draft-int-tamper")["status"] == "tampered"
+
+    draft_posts = [c for c in http_calls if c["url"].endswith("/users/me/drafts")]
+    assert len(draft_posts) == 2
+    assert all(c["headers"]["authorization"] == "Bearer ya29.write-draft-access" for c in draft_posts)
+    edited_raw = json.loads(draft_posts[1]["body"])["message"]["raw"]
+    decoded_msg = message_from_bytes(
+        base64.urlsafe_b64decode(edited_raw.encode("ascii")),
+        policy=policy.default,
+    )
+    assert decoded_msg["Subject"] == "Edited Draft Subject"
+    assert "Edited body text." in decoded_msg.get_content()
+
+    receipts = {r["external_id"]: r for r in _fetch_internal_receipts(cfg.db_path)}
+    assert "draft-1" in receipts["gate-receipt:prop-draft-int-approve:executed"]["body"]
+    assert "msg-1" in receipts["gate-receipt:prop-draft-int-approve:executed"]["body"]
+    assert (
+        "https://mail.google.com/mail/u/0/#drafts?compose=msg-1"
+        in receipts["gate-receipt:prop-draft-int-approve:executed"]["body"]
+    )
+    assert "gate-receipt:prop-draft-int-edit:edited_executed" in receipts
+    assert "gate-receipt:prop-draft-int-tamper:tampered" in receipts
+
+    # 4. Security invariant: missing write token refuses shared fallback for gmail.create_draft even when enabled
+    write_token_path.unlink()
+    shared_fallback = secrets_dir / "google_oauth.json"
+    shared_fallback.write_text(
+        json.dumps(
+            {
+                "client_id": "shared-id",
+                "client_secret": "shared-secret",
+                "refresh_token": "shared-refresh",
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg.gate_allow_shared_oauth_fallback = True
+    with pytest.raises(RuntimeError, match="strictly prohibited"):
+        resolve_gate_write_credentials(
+            cfg,
+            action="gmail.create_draft",
+            fallback_oauth_path=shared_fallback,
+        )
 

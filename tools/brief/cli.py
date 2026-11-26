@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -19,6 +20,7 @@ from tools.brief.actions import (
     READONLY_OAUTH_SCOPES,
     WRITE_OAUTH_SCOPES,
     build_oauth_consent_urls,
+    exchange_oauth_authorization_code,
 )
 from tools.brief.config import (
     BriefConfig,
@@ -420,13 +422,19 @@ def _cmd_gate_status(args: argparse.Namespace) -> int:
             "staged_proposals": [],
             "quiet_hours": is_quiet_hours(cfg),
             "dry_run": bool(cfg.dry_run),
+            "readonly_token_configured": Path(cfg.readonly_token_path).is_file(),
+            "readonly_token_path": str(cfg.readonly_token_path),
+            "allow_shared_readonly_fallback": bool(cfg.allow_shared_readonly_fallback),
             "allow_shared_oauth_fallback": bool(cfg.gate_allow_shared_oauth_fallback),
             "write_token_configured": Path(cfg.gate_write_token_path).is_file(),
+            "write_token_path": str(cfg.gate_write_token_path),
         }
 
     if args.json:
         print(json.dumps(status_payload, indent=2, sort_keys=True))
     else:
+        readonly_state = "configured" if status_payload["readonly_token_configured"] else "missing"
+        write_state = "configured" if status_payload["write_token_configured"] else "missing"
         print("BRIEF Approval Gate Status")
         print(f"  Gate DB        : {cfg.gate_db_path} ({'present' if cfg.gate_db_path.is_file() else 'missing'})")
         print(f"  Pending Files  : {status_payload['pending_files']}")
@@ -438,7 +446,11 @@ def _cmd_gate_status(args: argparse.Namespace) -> int:
             f"rejected={status_payload['rejected']} tampered={status_payload['tampered']} "
             f"failed={status_payload['failed']}"
         )
-        print(f"  Write Token    : {'configured' if status_payload['write_token_configured'] else 'missing'}")
+        print(f"  Read-Only Token: {readonly_state} ({status_payload['readonly_token_path']})")
+        print(
+            f"  RO Fallback    : {'enabled' if status_payload['allow_shared_readonly_fallback'] else 'disabled'}"
+        )
+        print(f"  Write Token    : {write_state} ({status_payload['write_token_path']})")
         print(f"  Shared Fallback: {'enabled' if status_payload['allow_shared_oauth_fallback'] else 'disabled'}")
         print(f"  Quiet Hours    : {'active' if status_payload['quiet_hours'] else 'inactive'}")
         for item in status_payload["staged_proposals"]:
@@ -520,6 +532,7 @@ def _cmd_mint_oauth_urls(args: argparse.Namespace) -> int:
         "oauth_client_path": str(args.oauth_client_path),
         "redirect_uri": args.redirect_uri,
         "readonly_scopes": READONLY_OAUTH_SCOPES,
+        "readonly_token_path": str(cfg.readonly_token_path),
         "write_scopes": WRITE_OAUTH_SCOPES,
         "write_token_path": str(cfg.gate_write_token_path),
         **urls,
@@ -528,12 +541,88 @@ def _cmd_mint_oauth_urls(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print("BRIEF Google OAuth Split-Credential Consent URLs")
-        print(f"  Client File   : {args.oauth_client_path}")
+        print(f"  Client File      : {args.oauth_client_path}")
         print(f"  Read-Only Scopes : {READONLY_OAUTH_SCOPES}")
+        print(f"  Read-Only Dest   : {cfg.readonly_token_path}")
         print(f"  Read-Only URL    : {urls['readonly_url']}")
         print(f"  Write-Only Scopes: {WRITE_OAUTH_SCOPES}")
         print(f"  Write Token Dest : {cfg.gate_write_token_path}")
         print(f"  Write-Only URL   : {urls['write_url']}")
+    return 0
+
+
+def _cmd_exchange_oauth_code(args: argparse.Namespace) -> int:
+    cfg = _load_runtime_config(args)
+    default_output = (
+        Path(cfg.readonly_token_path)
+        if args.role == "readonly"
+        else Path(cfg.gate_write_token_path)
+    )
+    target_output = Path(args.output) if args.output is not None else default_output
+
+    try:
+        result = exchange_oauth_authorization_code(
+            args.code,
+            role=args.role,
+            oauth_client_path=args.oauth_client_path,
+            output_path=target_output,
+            redirect_uri=args.redirect_uri,
+        )
+    except OSError as exc:
+        if isinstance(exc, PermissionError) or exc.errno in (
+            errno.EROFS,
+            errno.EACCES,
+            errno.EPERM,
+        ):
+            hint = (
+                f"Cannot write {args.role} OAuth token to {target_output} ({exc.strerror or exc}). "
+                "If /secrets is mounted read-only, re-run with `--output <writable_path>` "
+                f"to stage the mode-0600 token file and move it to {default_output} on the host."
+            )
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "role": args.role,
+                            "output_path": str(target_output),
+                            "hint": hint,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"Error: {hint}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2, sort_keys=True))
+        else:
+            print(f"Error exchanging Google OAuth authorization code: {exc}", file=sys.stderr)
+        return 1
+    except (RuntimeError, ValueError) as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2, sort_keys=True))
+        else:
+            print(f"Error exchanging Google OAuth authorization code: {exc}", file=sys.stderr)
+        return 1
+
+    safe_payload = {
+        "ok": True,
+        **{
+            k: v
+            for k, v in result.items()
+            if k not in {"client_secret", "refresh_token", "access_token"}
+        },
+    }
+    if args.json:
+        print(json.dumps(safe_payload, indent=2, sort_keys=True))
+    else:
+        print(f"BRIEF Google OAuth {safe_payload['role']} token saved")
+        print(f"  Role   : {safe_payload['role']}")
+        print(f"  Output : {safe_payload['output_path']}")
+        print(f"  Scopes : {safe_payload['scope']}")
     return 0
 
 
@@ -734,7 +823,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mint_oauth = subparsers.add_parser(
         "mint-oauth-urls",
         parents=[common_subparser_opts],
-        help="Print narrow-scoped Google OAuth consent URLs (read-only vs calendar.events write).",
+        help="Print narrow-scoped Google OAuth consent URLs (read-only vs calendar.events + gmail.compose write).",
     )
     p_mint_oauth.add_argument(
         "--oauth-client-path",
@@ -749,6 +838,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mint_oauth.add_argument("--json", action="store_true", help="Output JSON.")
     p_mint_oauth.set_defaults(func=_cmd_mint_oauth_urls)
+
+    p_exchange_oauth = subparsers.add_parser(
+        "exchange-oauth-code",
+        parents=[common_subparser_opts],
+        help="Exchange a Google OAuth authorization code or redirect URL for a split token file.",
+    )
+    p_exchange_oauth.add_argument(
+        "--role",
+        required=True,
+        choices=("readonly", "write"),
+        help="Target split OAuth credential role ('readonly' or 'write').",
+    )
+    p_exchange_oauth.add_argument(
+        "--code",
+        required=True,
+        help="Authorization code or full redirect URL containing ?code=...",
+    )
+    p_exchange_oauth.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional output token JSON path (defaults to configured readonly or write token path).",
+    )
+    p_exchange_oauth.add_argument(
+        "--oauth-client-path",
+        type=Path,
+        default=DEFAULT_GOOGLE_OAUTH_PATH,
+        help="Path to Google OAuth client JSON (default: /secrets/google_oauth.json).",
+    )
+    p_exchange_oauth.add_argument(
+        "--redirect-uri",
+        default="http://localhost",
+        help="OAuth redirect URI (default: http://localhost).",
+    )
+    p_exchange_oauth.add_argument("--json", action="store_true", help="Output JSON.")
+    p_exchange_oauth.set_defaults(func=_cmd_exchange_oauth_code)
 
     return parser
 

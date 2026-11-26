@@ -249,14 +249,17 @@ def _extract_dismissal_keys(row: Mapping[str, Any]) -> tuple[str, str]:
             if found:
                 return found, category_key
 
-    # 2. Attendees list in args
-    attendees = args_map.get("attendees")
-    if attendees:
-        found = _extract_email_from_value(attendees) or _extract_domain_from_value(
-            attendees, allow_any_tld=True
-        )
-        if found:
-            return found, category_key
+    # 2. Attendees list or Gmail draft recipients (`to`) in args
+    recipient_targets: list[Any] = [args_map.get("attendees")]
+    if raw_action == "gmail.create_draft" or args_map.get("to"):
+        recipient_targets.append(args_map.get("to"))
+    for target in recipient_targets:
+        if target:
+            found = _extract_email_from_value(target) or _extract_domain_from_value(
+                target, allow_any_tld=True
+            )
+            if found:
+                return found, category_key
 
     # 3. Email addresses anywhere in reason, from_session, summary, or description
     for text_field in (
@@ -967,6 +970,14 @@ def _format_readable_pt_range(
     return f"Ends {_fmt_readable_date(end_dt)}, {_fmt_readable_time(end_dt)} {tz_label}"
 
 
+def _format_address_list(raw_val: Any) -> str:
+    if isinstance(raw_val, str):
+        return raw_val.strip()
+    if isinstance(raw_val, Sequence) and not isinstance(raw_val, (str, bytes, bytearray)):
+        return ", ".join(str(item).strip() for item in raw_val if str(item).strip())
+    return ""
+
+
 def _build_decision_card_copy(
     *,
     proposal_id: str,
@@ -979,6 +990,41 @@ def _build_decision_card_copy(
 ) -> tuple[str, str]:
     """Build mobile-friendly PT summary and explicit '**Approve Action:**' line."""
     del proposal_id, expires_ts
+    if action == "gmail.create_draft":
+        to_str = _format_address_list(normalized_args.get("to")) or "recipient"
+        cc_str = _format_address_list(normalized_args.get("cc"))
+        bcc_str = _format_address_list(normalized_args.get("bcc"))
+        subject_text = str(normalized_args.get("subject") or "").strip() or "New Draft"
+        thread_id = str(normalized_args.get("thread_id") or "").strip()
+        body_text = str(normalized_args.get("body") or "").strip()
+        body_preview = (
+            body_text if len(body_text) <= 400 else f"{body_text[:397].rstrip()}..."
+        )
+
+        title = (
+            f"Reply Draft: {subject_text[:64]}"
+            if thread_id
+            else f"Create Gmail Draft: {subject_text[:58]}"
+        )
+        lines: list[str] = []
+        if urgent:
+            lines.append("**[URGENT]**")
+        lines.append(f"**To:** {to_str}")
+        if cc_str:
+            lines.append(f"**Cc:** {cc_str}")
+        if bcc_str:
+            lines.append(f"**Bcc:** {bcc_str}")
+        lines.append(f"**Subject:** {subject_text}")
+        if body_preview:
+            lines.append(f"**Draft Preview:** {body_preview}")
+        lines.append(f"**Why:** {reason}")
+        lines.append("")
+        lines.append(
+            f'**Approve Action:** Create Gmail draft to {to_str} with subject "{subject_text}" '
+            "(saves to Drafts; does not send)"
+        )
+        return title, "\n".join(lines)
+
     summary_text = str(normalized_args.get("summary") or "").strip()
     when_str = _format_readable_pt_range(
         normalized_args.get("start"),
@@ -996,7 +1042,7 @@ def _build_decision_card_copy(
         title = f"Update Calendar: {title_label[:64]}"
         approve_line = f'Update "{title_label}" on your calendar{when_suffix}'
 
-    lines: list[str] = []
+    lines = []
     if urgent:
         lines.append("**[URGENT]**")
     if when_str:
@@ -1207,8 +1253,8 @@ class BriefApprovalGate:
                         ctx["sender"] = str(row["sender"]).strip()
                     if "body" not in ctx and row["body"]:
                         ctx["body"] = str(row["body"])
-            except Exception:
-                pass
+            except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+                logger.debug("Unable to enrich proposal bypass context from queue: %s", exc)
 
         return ctx
 
@@ -1465,10 +1511,9 @@ class BriefApprovalGate:
                         summary["deferred_quiet_hours"] += 1
                         continue
                     used_overnight_bypass = True
-            elif not urgent and not is_owner_session:
-                if not self._can_send_proactive(now_ts):
-                    summary["deferred_budget"] += 1
-                    continue
+            elif not urgent and not is_owner_session and not self._can_send_proactive(now_ts):
+                summary["deferred_budget"] += 1
+                continue
 
             args_sha256 = canonical_proposal_hash(action, normalized_args)
             args_json = json.dumps(normalized_args, sort_keys=True, ensure_ascii=False)
@@ -1936,8 +1981,12 @@ class BriefApprovalGate:
             "staged_proposals": staged_summaries,
             "quiet_hours": is_quiet_hours(self.config, now=now_ts),
             "dry_run": bool(self.config.dry_run),
+            "readonly_token_configured": Path(self.config.readonly_token_path).is_file(),
+            "readonly_token_path": str(self.config.readonly_token_path),
+            "allow_shared_readonly_fallback": bool(self.config.allow_shared_readonly_fallback),
             "allow_shared_oauth_fallback": bool(self.config.gate_allow_shared_oauth_fallback),
             "write_token_configured": Path(self.config.gate_write_token_path).is_file(),
+            "write_token_path": str(self.config.gate_write_token_path),
         }
 
 
