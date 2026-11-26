@@ -382,17 +382,17 @@ const doneSnap = {
   text: card._mockCards.floor3.meater._txt.textContent,
 };
 
-// 5. Climate lens hides running badges
+// 5. Cross-lens active badges stay active on climate lens
 card._activeLens = "climate";
 card._updateState();
-const climateHidden = {
+const climatePreserved = {
   ovenActive: card._mockCards.floor3.lgOven.classList.contains("active"),
   meaterActive: card._mockCards.floor3.meater.classList.contains("active"),
 };
 card._activeLens = "lights";
 card._updateState();
 
-// 6. Open Cook Monitor modal & verify live HTML, tether cone, stepper clamping, two-level protein picker, presets, and close
+// 6. Open Cook Monitor modal & verify live HTML, tether cone, optimistic stepper clamping, two-level protein picker, presets, and close
 card._openCookModal();
 const modalOpenHtml = cookModal.innerHTML;
 const initialProteinCat = card._cookProteinCat;
@@ -402,6 +402,9 @@ const modalTopWhenOpen = cookModal.style.top;
 const modalPosWhenOpen = cookModal.style.position;
 const backdropOpen = cookBackdrop.classList.contains("open");
 card._stepMeaterTargetTemp(-5);
+const afterStepMinus5Html = cookModal.innerHTML;
+card._stepMeaterTargetTemp(-1); // rapid tap stacks on optimistic 160 -> 159
+const afterStackedMinus1Html = cookModal.innerHTML;
 card._stepMeaterTargetTemp(500); // clamped to maxTarget (225)
 card._stepMeaterTargetTemp(-500); // clamped to minTarget (100)
 card._selectMeaterPreset("Brisket (203°F)");
@@ -410,8 +413,9 @@ card._selectMeaterPreset("Brisket (203°F)");
 // Switch to Beef tab -> renders Prime Rib, Steak Rare, Steak Med-Rare, Steak Medium, Brisket
 card._selectCookProteinCat("beef");
 const beefTabHtml = cookModal.innerHTML;
-// Select Brisket cut (beef idx 4, which exists in presetOptions -> selects "Brisket (203°F)" + sets target 203)
+// Select Brisket cut (beef idx 4, which exists in presetOptions -> selects "Brisket (203°F)" + sets optimistic target 203)
 card._selectMeaterCut("beef", 4);
+const afterBeefBrisketHtml = cookModal.innerHTML;
 // Switch to Lamb & Fish tab and select Salmon (lamb_fish idx 1, not in presetOptions -> selects "Custom" + sets target 125)
 card._selectCookProteinCat("lamb_fish");
 const lambFishTabHtml = cookModal.innerHTML;
@@ -430,7 +434,7 @@ console.log(JSON.stringify({
   tempChangeUpdated,
   pullSnap,
   doneSnap,
-  climateHidden,
+  climatePreserved,
   backdropOpen,
   backdropAfterClose,
   modalChecks: {
@@ -438,9 +442,14 @@ console.log(JSON.stringify({
     hasTarget: modalOpenHtml.includes("/ 165°F"),
     hasPullMarker: modalOpenHtml.includes("Pull 160°F"),
     hasAmbient: modalOpenHtml.includes("314°F"),
-    hasEta: modalOpenHtml.includes("1h (+0.65°/m)"),
+    hasProminentEta: modalOpenHtml.includes("cm-stat-eta") && modalOpenHtml.includes("cm-stat-eta-val") && modalOpenHtml.includes("1h") && modalOpenHtml.includes("Pull 160°F"),
+    hasSubtleRate: modalOpenHtml.includes("cm-stat-rate-sub") && modalOpenHtml.includes("+0.65°F/min"),
     hasBattery: modalOpenHtml.includes("98%"),
-    hasRssi: modalOpenHtml.includes("-94 dBm"),
+    noBleSignal: !modalOpenHtml.includes("BLE Signal") && !modalOpenHtml.includes("-94 dBm"),
+    hasMobileMediaCss: skeletonHtml.includes("@media (max-width: 640px)") && skeletonHtml.includes("@media (max-width: 400px)"),
+    hasImmediateStepRender: afterStepMinus5Html.includes("/ 160°F") && afterStepMinus5Html.includes(">160°F<") && afterStepMinus5Html.includes("Pull 155°F"),
+    hasStackedTapRender: afterStackedMinus1Html.includes("/ 159°F") && afterStackedMinus1Html.includes(">159°F<"),
+    hasImmediateCutRender: afterBeefBrisketHtml.includes("/ 203°F") && afterBeefBrisketHtml.includes(">203°F<"),
     hasUpperOven: modalOpenHtml.includes("Upper Oven"),
     hasLowerOven: modalOpenHtml.includes("Lower Oven") && modalOpenHtml.includes("350°F") && modalOpenHtml.includes("Convection Roast"),
     autoSelectedPoultryCat: initialProteinCat === "poultry",
@@ -511,7 +520,7 @@ console.log(JSON.stringify({
     assert res["tempChangeUpdated"] is True
     assert res["pullSnap"] == {"hasPullCls": True, "text": "122°F · Pull!"}
     assert res["doneSnap"] == {"hasDoneCls": True, "text": "122°F · Done"}
-    assert res["climateHidden"] == {"ovenActive": False, "meaterActive": False}
+    assert res["climatePreserved"] == {"ovenActive": True, "meaterActive": True}
     assert res["backdropOpen"] is True
     assert res["backdropAfterClose"] is False
     assert all(res["modalChecks"].values()), res["modalChecks"]
@@ -520,6 +529,11 @@ console.log(JSON.stringify({
             "domain": "number",
             "service": "set_value",
             "data": {"entity_id": "number.meater_meater_target_temperature", "value": 160},
+        },
+        {
+            "domain": "number",
+            "service": "set_value",
+            "data": {"entity_id": "number.meater_meater_target_temperature", "value": 159},
         },
         {
             "domain": "number",
@@ -828,5 +842,110 @@ console.log(JSON.stringify({ leftRes, rightRes, belowRes, aboveRes, narrowRes })
     assert res["narrowRes"]["pos"] == "relative"
     assert res["narrowRes"]["left"] is None
     assert "cook-tether-cone" in res["narrowRes"]["svg"]
+
+
+def test_migrates_stray_modal_refresh_out_of_ping_device_into_update_state() -> None:
+    stray_fixture = REALISTIC_CARD_FIXTURE.replace(
+        "  _renderThermostatModal() {}\n  _renderPresenceModal() {}",
+        """  _renderThermostatModal() {}
+  _renderPresenceModal() {}
+
+  _pingDevice(presId, notifySvc, devName) {
+    setTimeout(() => {
+      if (this._presenceModalOpen) this._renderPresenceModal();
+    /* OVEN_MEATER_MODAL_REFRESH_BEGIN */
+    if (this._cookModalOpen) {
+      this._fetchCookHistory(false);
+      this._renderCookModal();
+    }
+    /* OVEN_MEATER_MODAL_REFRESH_END */
+    }, 3500);
+  }""",
+    )
+    patched = mod.patch_card_js(stray_fixture)
+    patched_twice = mod.patch_card_js(patched)
+    assert patched == patched_twice
+    assert patched.count("/* OVEN_MEATER_MODAL_REFRESH_BEGIN */") == 1
+
+    ping_start = patched.index("_pingDevice(")
+    update_start = patched.index("_updateState(")
+    refresh_pos = patched.index("/* OVEN_MEATER_MODAL_REFRESH_BEGIN */")
+    assert "OVEN_MEATER_MODAL_REFRESH_BEGIN" not in patched[ping_start:update_start]
+    assert refresh_pos > update_start
+    assert (
+        "if (this._presenceModalOpen) this._renderPresenceModal();\n    /* OVEN_MEATER_MODAL_REFRESH_BEGIN */"
+        in patched[update_start:]
+    )
+
+
+def test_optimistic_target_temp_clears_on_live_match_and_ttl() -> None:
+    patched = mod.patch_card_js(REALISTIC_CARD_FIXTURE)
+    harness = (
+        patched
+        + """
+const card = new BrockHouseCyclesCard();
+card.shadowRoot = {
+  getElementById: () => null,
+  querySelector: () => null,
+};
+card._hass = {
+  callService: () => {},
+  states: {
+    "sensor.meater_meater_cook_status": { state: "Cooking", attributes: { target_temp_f: 165 } },
+    "binary_sensor.meater_meater_connected": { state: "on", attributes: {} },
+    "number.meater_meater_target_temperature": { state: "165", attributes: { min: 100, max: 225 } },
+  },
+};
+
+card._stepMeaterTargetTemp(-5);
+const optTarget = card._evalMeaterStatus().targetF;
+const optSet = card._optimisticTargetF;
+
+// Live HA state catches up to 160 -> optimistic state clears cleanly
+card._hass.states["number.meater_meater_target_temperature"].state = "160";
+const matchedTarget = card._evalMeaterStatus().targetF;
+const optAfterMatch = card._optimisticTargetF;
+
+// Stale optimistic state older than 6s TTL expires back to live HA value
+card._optimisticTargetF = 175;
+card._optimisticTargetAt = Date.now() - 7000;
+const expiredTarget = card._evalMeaterStatus().targetF;
+const optAfterExpiry = card._optimisticTargetF;
+
+console.log(JSON.stringify({
+  optTarget,
+  optSet,
+  matchedTarget,
+  optAfterMatch,
+  expiredTarget,
+  optAfterExpiry,
+}));
+"""
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".js", encoding="utf-8", delete=False) as tmp:
+        tmp.write(harness)
+        tmp_path = Path(tmp.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        res = json.loads(proc.stdout.strip())
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    assert res == {
+        "optTarget": 160,
+        "optSet": 160,
+        "matchedTarget": 160,
+        "optAfterMatch": None,
+        "expiredTarget": 160,
+        "optAfterExpiry": None,
+    }
+
 
 

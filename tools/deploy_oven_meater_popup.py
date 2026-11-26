@@ -488,6 +488,51 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
           margin-top: 4px;
           white-space: nowrap;
         }
+        .cm-stat-box.cm-stat-eta {
+          grid-column: 1 / -1;
+          background: linear-gradient(135deg, rgba(56, 189, 248, 0.12), rgba(255, 146, 72, 0.08));
+          border-color: rgba(56, 189, 248, 0.28);
+          padding: 12px 15px;
+        }
+        .cm-stat-eta-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .cm-stat-pull-badge {
+          font-size: 11.5px;
+          font-weight: 700;
+          padding: 2px 9px;
+          border-radius: 999px;
+          background: rgba(253, 224, 71, 0.14);
+          border: 1px solid rgba(253, 224, 71, 0.42);
+          color: #fde68a;
+          white-space: nowrap;
+        }
+        .cm-stat-eta-main {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 10px;
+          margin-top: 5px;
+          flex-wrap: wrap;
+        }
+        .cm-stat-eta-val {
+          font-size: 27px;
+          font-weight: 800;
+          letter-spacing: -0.02em;
+          line-height: 1.08;
+          color: #f8fafc;
+          white-space: nowrap;
+        }
+        .cm-stat-rate-sub {
+          font-size: 11.5px;
+          font-weight: 600;
+          color: #8da8c7;
+          white-space: nowrap;
+        }
         .cm-chart-card {
           background: rgba(7, 13, 24, 0.58);
           border: 1px solid rgba(255, 255, 255, 0.09);
@@ -831,6 +876,254 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
           padding: 8px 16px;
           border-radius: 11px;
         }
+        @media (max-width: 640px) {
+          .cook-backdrop {
+            padding: 8px;
+          }
+          .cook-modal {
+            width: 100%;
+            max-height: 95%;
+            border-radius: 16px;
+            padding: 14px 14px 16px;
+            gap: 11px;
+          }
+          .cm-head {
+            gap: 10px;
+          }
+          .cm-title-wrap {
+            gap: 9px;
+          }
+          .cm-head-icon {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+          }
+          .cm-head-icon svg {
+            width: 19px;
+            height: 19px;
+          }
+          .cm-title {
+            font-size: 17px;
+          }
+          .cm-sub {
+            font-size: 12px;
+          }
+          .cook-modal .rd-close {
+            width: 32px;
+            height: 32px;
+            font-size: 19px;
+            border-radius: 9px;
+          }
+          .cm-section-card {
+            border-radius: 14px;
+            padding: 12px;
+            gap: 10px;
+          }
+          .cm-sec-label {
+            font-size: 12px;
+            gap: 6px;
+          }
+          .cm-sec-label svg {
+            width: 15px;
+            height: 15px;
+          }
+          .cm-status-pill {
+            font-size: 11.5px;
+            padding: 4px 9px;
+          }
+          .cm-gauge-row {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 12px;
+          }
+          .cm-gauge-wrap {
+            width: 136px;
+            height: 124px;
+            margin: 0 auto;
+          }
+          .cm-gauge-temp {
+            font-size: 30px;
+          }
+          .cm-gauge-target {
+            font-size: 12.5px;
+            margin-top: 2px;
+          }
+          .cm-stats-grid {
+            width: 100%;
+            gap: 8px;
+          }
+          .cm-stat-box {
+            padding: 8px 10px;
+            border-radius: 11px;
+          }
+          .cm-stat-k {
+            font-size: 11px;
+          }
+          .cm-stat-v {
+            font-size: 16px;
+          }
+          .cm-stat-box.cm-stat-eta {
+            padding: 10px 12px;
+          }
+          .cm-stat-eta-val {
+            font-size: 22px;
+          }
+          .cm-stat-rate-sub {
+            font-size: 11px;
+          }
+          .cm-stat-pull-badge {
+            font-size: 10.5px;
+            padding: 2px 7px;
+          }
+          .cm-chart-card {
+            padding: 10px 10px 8px;
+            border-radius: 12px;
+            gap: 6px;
+          }
+          .cm-chart-title {
+            font-size: 11.5px;
+          }
+          .cm-chart-pill {
+            font-size: 11px;
+            padding: 2px 8px;
+          }
+          .cm-chart-svg-wrap,
+          .cm-chart-svg {
+            height: 150px;
+          }
+          .cm-stepper-card {
+            padding: 9px 10px;
+            gap: 8px;
+            border-radius: 12px;
+          }
+          .cm-step-group {
+            gap: 5px;
+          }
+          .cm-step-btn {
+            min-width: 40px;
+            height: 36px;
+            padding: 0 8px;
+            font-size: 13px;
+            border-radius: 9px;
+          }
+          .cm-step-readout {
+            min-width: 68px;
+          }
+          .cm-step-readout-val {
+            font-size: 19px;
+          }
+          .cm-step-readout-lbl {
+            font-size: 10px;
+          }
+          .cm-protein-tabs {
+            gap: 5px;
+          }
+          .cm-protein-tab {
+            padding: 7px 4px;
+            gap: 3px;
+            font-size: 11px;
+            border-radius: 10px;
+          }
+          .cm-protein-icon {
+            width: 18px;
+            height: 18px;
+          }
+          .cm-protein-icon svg {
+            width: 16px;
+            height: 16px;
+          }
+          .cm-cut-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 7px;
+          }
+          .cm-cut-card {
+            padding: 8px 9px;
+            gap: 4px;
+            border-radius: 10px;
+          }
+          .cm-cut-name {
+            font-size: 12.5px;
+          }
+          .cm-cut-doneness {
+            font-size: 10px;
+            padding: 1px 6px;
+          }
+          .cm-cut-meta {
+            font-size: 11.5px;
+          }
+          .cm-cut-temp {
+            font-size: 13px;
+          }
+          .cm-cut-rest {
+            font-size: 11px;
+          }
+          .cm-custom-note {
+            padding: 10px;
+            gap: 8px;
+            flex-wrap: wrap;
+          }
+          .cm-oven-grid {
+            gap: 8px;
+          }
+          .cm-oven-card {
+            padding: 10px 11px;
+            border-radius: 12px;
+            gap: 4px;
+          }
+          .cm-oven-name {
+            font-size: 13px;
+          }
+          .cm-oven-temp {
+            font-size: 22px;
+          }
+          .cm-oven-meta {
+            font-size: 12px;
+          }
+          .cook-modal .cm-foot .rd-mini-btn {
+            font-size: 12.5px;
+            padding: 7px 12px;
+            border-radius: 9px;
+          }
+        }
+        @media (max-width: 400px) {
+          .cook-backdrop {
+            padding: 4px;
+          }
+          .cook-modal {
+            padding: 11px 10px 13px;
+            border-radius: 14px;
+          }
+          .cm-gauge-wrap {
+            width: 120px;
+            height: 110px;
+          }
+          .cm-gauge-temp {
+            font-size: 26px;
+          }
+          .cm-chart-svg-wrap,
+          .cm-chart-svg {
+            height: 132px;
+          }
+          .cm-step-btn {
+            min-width: 34px;
+            height: 34px;
+            padding: 0 6px;
+            font-size: 12px;
+          }
+          .cm-step-readout {
+            min-width: 58px;
+          }
+          .cm-step-readout-val {
+            font-size: 17px;
+          }
+          .cm-protein-tabs {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+          }
+          .cm-cut-grid,
+          .cm-oven-grid {
+            grid-template-columns: 1fr;
+          }
+        }
         /* OVEN_MEATER_CSS_END */"""
 
 OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
@@ -950,12 +1243,22 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
 
     const targetNum = this._readNumericState(cfg.targetEntity);
     const attrTarget = statusSt?.attributes?.target_temp_f;
-    const targetF =
+    const liveTargetF =
       targetNum !== null
         ? Math.round(targetNum)
         : attrTarget !== undefined && attrTarget !== null && !Number.isNaN(Number(attrTarget))
           ? Math.round(Number(attrTarget))
           : null;
+    let targetF = liveTargetF;
+    if (this._optimisticTargetF !== undefined && this._optimisticTargetF !== null) {
+      const ageMs = Date.now() - (this._optimisticTargetAt || 0);
+      if (liveTargetF === this._optimisticTargetF || ageMs > 6000) {
+        this._optimisticTargetF = null;
+        this._optimisticTargetAt = 0;
+      } else {
+        targetF = this._optimisticTargetF;
+      }
+    }
 
     const targetSt = states[cfg.targetEntity];
     const minTarget = Number(targetSt?.attributes?.min ?? cfg.minTargetF) || cfg.minTargetF;
@@ -1348,10 +1651,15 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     const m = this._evalMeaterStatus();
     const base = m.targetF !== null ? m.targetF : 165;
     const next = Math.max(m.minTarget, Math.min(m.maxTarget, Math.round(base + delta)));
+    this._optimisticTargetF = next;
+    this._optimisticTargetAt = Date.now();
     this._hass.callService("number", "set_value", {
       entity_id: OVEN_MEATER_CONFIG.meater.targetEntity,
       value: next,
     });
+    if (this._cookModalOpen) {
+      this._renderCookModal();
+    }
   }
 
   _selectMeaterPreset(option) {
@@ -1431,6 +1739,8 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     }
     if (Number.isFinite(cut.targetF)) {
       const next = Math.max(m.minTarget, Math.min(m.maxTarget, Math.round(cut.targetF)));
+      this._optimisticTargetF = next;
+      this._optimisticTargetAt = Date.now();
       this._hass.callService("number", "set_value", {
         entity_id: OVEN_MEATER_CONFIG.meater.targetEntity,
         value: next,
@@ -1674,12 +1984,11 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     const tgtStr = meater.targetF !== null ? `/ ${meater.targetF}°F` : "/ --°F";
     const ambStr = meater.ambientF !== null ? `${Math.round(meater.ambientF)}°F` : "--";
     const etaStr = this._formatCookEta(meater.etaMin);
-    const rateStr =
+    const rateSubStr =
       meater.rateFPerMin !== null
-        ? ` (${meater.rateFPerMin >= 0 ? "+" : ""}${meater.rateFPerMin.toFixed(2)}°/m)`
+        ? `${meater.rateFPerMin >= 0 ? "+" : ""}${meater.rateFPerMin.toFixed(2)}°F/min`
         : "";
     const batStr = meater.batteryPct !== null ? `${Math.round(meater.batteryPct)}%` : "--";
-    const rssiStr = meater.rssi !== null ? `${meater.rssi} dBm` : "--";
     const pullTarget = meater.targetF !== null ? `${meater.targetF - OVEN_MEATER_CONFIG.meater.carryoverPullOffsetF}°F` : "--";
 
     const proj = this._computeCookProjection(meater, this._cookHistoryPoints);
@@ -1822,21 +2131,23 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
             </div>
           </div>
           <div class="cm-stats-grid">
+            <div class="cm-stat-box cm-stat-eta">
+              <div class="cm-stat-eta-head">
+                <div class="cm-stat-k">Estimated Time</div>
+                <span class="cm-stat-pull-badge">Pull ${pullTarget}</span>
+              </div>
+              <div class="cm-stat-eta-main">
+                <span class="cm-stat-eta-val">${etaStr}</span>
+                ${rateSubStr ? `<span class="cm-stat-rate-sub">${rateSubStr}</span>` : ""}
+              </div>
+            </div>
             <div class="cm-stat-box">
               <div class="cm-stat-k">Ambient</div>
               <div class="cm-stat-v">${ambStr}</div>
             </div>
             <div class="cm-stat-box">
-              <div class="cm-stat-k">ETA · Pull ${pullTarget}</div>
-              <div class="cm-stat-v">${etaStr}${rateStr}</div>
-            </div>
-            <div class="cm-stat-box">
               <div class="cm-stat-k">Battery</div>
               <div class="cm-stat-v">${batStr}</div>
-            </div>
-            <div class="cm-stat-box">
-              <div class="cm-stat-k">BLE Signal</div>
-              <div class="cm-stat-v">${rssiStr}</div>
             </div>
           </div>
         </div>
@@ -2181,7 +2492,7 @@ OVEN_MEATER_UPDATE_JS = """      /* OVEN_MEATER_UPDATE_BEGIN */
         if (ovenEl) {
           ovenEl.classList.remove("oven-active", "oven-cooling", "oven-done");
           ovenEl.classList.add(ovenEv.badgeClass);
-          ovenEl.classList.toggle("active", ovenEv.active && !isClimate);
+          ovenEl.classList.toggle("active", ovenEv.active);
           ovenEl.title = ovenEv.title;
           const ovenTxt = ovenEl.querySelector('[data-om-text="lg_oven"]');
           if (ovenTxt) ovenTxt.textContent = ovenEv.badgeText;
@@ -2191,7 +2502,7 @@ OVEN_MEATER_UPDATE_JS = """      /* OVEN_MEATER_UPDATE_BEGIN */
         if (meaterEl) {
           meaterEl.classList.remove("meater-standby", "meater-cooking", "meater-almost", "meater-pull", "meater-done");
           meaterEl.classList.add(meaterEv.badgeClass);
-          meaterEl.classList.toggle("active", meaterEv.active && !isClimate);
+          meaterEl.classList.toggle("active", meaterEv.active);
           meaterEl.title = `MEATER+ · ${meaterEv.cookStatus}`;
           const meaterTxt = meaterEl.querySelector('[data-om-text="meater"]');
           if (meaterTxt) meaterTxt.textContent = meaterEv.badgeText;
@@ -2318,6 +2629,9 @@ def verify_patched_card_contents(card_js: str) -> None:
         ".cook-modal",
         ".cm-protein-tabs",
         ".cm-cut-grid",
+        ".cm-stat-eta",
+        "@media (max-width: 640px)",
+        "_optimisticTargetF",
         "min(92vw, 780px)",
         "rgba(4, 8, 15, 0.44)",
         "cookBackdrop",
@@ -2522,14 +2836,21 @@ def patch_card_js(source_js: str) -> str:
         label="OVEN_MEATER_UPDATE",
     )
 
+    # Strip any existing OVEN_MEATER_MODAL_REFRESH block (including any stray block
+    # previously injected inside _pingDevice() / _ringTag()) before anchoring cleanly
+    # at the end of _updateState().
+    modal_refresh_re = re.compile(
+        r"[ \t]*/\*\s*OVEN_MEATER_MODAL_REFRESH_BEGIN\s*\*/[\s\S]*?/\*\s*OVEN_MEATER_MODAL_REFRESH_END\s*\*/(?:\r?\n)?",
+    )
+    out = modal_refresh_re.sub("", out)
+
     out = _replace_or_insert_block(
         out,
         "/* OVEN_MEATER_MODAL_REFRESH_BEGIN */",
         "/* OVEN_MEATER_MODAL_REFRESH_END */",
         OVEN_MEATER_MODAL_REFRESH_JS,
         (
-            r"if\s*\(this\._presenceModalOpen\)\s*this\._renderPresenceModal\(\);",
-            r"if\s*\(this\._thermoModalOpen\)\s*this\._renderThermostatModal\(\);",
+            r"if\s*\(this\._thermoModalOpen\)\s*this\._renderThermostatModal\(\);\s*\n\s*if\s*\(this\._presenceModalOpen\)\s*this\._renderPresenceModal\(\);",
             r"return\s+true;\s*\n\s*\}",
         ),
         insert_before=False,
