@@ -33,9 +33,4 @@ description: Hard constraint against server-wide or top-level unconstrained grep
    - NEVER run `grep`, `strings`, `hexdump`, `objdump`, or disassembly against compiled system binaries (e.g. `/usr/local/bin/agy`, `/usr/bin/*`) or multi-megabyte binary blobs.
    - Check documentation, CLI `--help` flags, or system APIs instead.
 
-7. **Prohibition of Recursive Disk-Usage Walks (`du`) & Unbounded Remote SSH Scans:**
-   - **NEVER** run `du` (including `du -sh`, `du -s`, or `du --max-depth=0`) across `<NAS_VOLUME>` roots, `$NAS_DOCKER_ROOT`, `/workspace`, `/workspace/data`, `/root`, `/docker`, `/archives`, or agent/bulk data trees (`discord-agy-agent`, `discord-vulcan-agent`, `discord-ivy-agent`) on spinning HDDs — even summary flags recursively walk every inode and stall NAS disk I/O.
-   - Use `df -h` for filesystem capacity or targeted metadata checks (`stat`, `ls -lh` on specific files), and restrict any local `du` strictly to small explicitly scoped workspace subdirectories (e.g. `/workspace/tools`).
-   - Remote SSH probes via `tools/nas_config.py` enforce server-side `timeout` termination so runaway commands are killed on the remote host instead of orphaned, and **never** auto-retry timed-out remote commands (preventing duplicate concurrent I/O storms).
-
-*Note: Enforced deterministically by `search_guard.py` and `tools/nas_config.py`.*
+*Note: Enforced deterministically by `search_guard.py`.*

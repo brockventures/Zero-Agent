@@ -17,9 +17,9 @@ description: Discord formatting invariants, link preview collapse, and mobile vi
   - Never use `file:///` links (use inline monospace backticks like `/app/bridge.py`).
   - Keep link labels strictly plain text (`[label](<url>):`). Never wrap links in bold/italics (`**[label](<url>):**` or `[**label**](<url>)`) or outer parentheses `([label](<url>))`.
   - Never wrap URLs or Discord mention/channel snowflakes (<@ID>, <@&ROLE_ID>, <#ID>) in backticks (e.g. `<https://...>` or `<@453030589914939393>`, never `` `<https://...>` `` or `` `<@453030589914939393>` ``), as backticks disable clickable links and live Discord pings.
-- **Inline Code Backtick (` `) Discipline — Commands & Copy-Paste Code Only:**
-  - Reserve inline backticks strictly for exact runnable commands (`pytest tests/test_foo.py`), CLI flags (`--model`), or literal code/path snippets when copy-paste precision is needed.
-  - **NEVER** wrap package names (write playwright, beautifulsoup4, ruff), file/tool names in prose (write Dockerfile), plain numbers, counts, ratios, percentages, dollar amounts, timestamps, dates, or English words in backticks (write **50/50**, **100%**, **$200/mo**, **7:00 AM PT**, and **Low** / **High** in plain text or bold, NEVER `` `50/50` ``, `` `100%` ``, `` `7:00 AM PT` ``, or `` `Low` ``).
+- **Inline Code Backtick (` `) Discipline — Code Only, Never Prose or Numbers:**
+  - Reserve inline backticks strictly for actual code identifiers: file paths (`/workspace/tools/bridge.py`), shell commands (`pytest`), CLI flags (`--model`), or literal variable/model IDs (`gemini-4-argon-low`).
+  - **NEVER** wrap plain numbers, counts, ratios, percentages, dollar amounts, timestamps, dates, or English words in backticks (write **50/50**, **100%**, **$200/mo**, **7:00 AM PT**, and **Low** / **High** in plain text or bold, NEVER `` `50/50` ``, `` `100%` ``, `` `7:00 AM PT` ``, or `` `Low` ``).
 
 ## 2. Mobile Viewport Discipline
 - **Ban Literal Unicode Bullets (`•`):** Discord treats `•` as plain text, breaking mobile hanging indents. ALWAYS use standard markdown hyphens (`- `) and 2-space indentation (`  - `) for nested bullets.
