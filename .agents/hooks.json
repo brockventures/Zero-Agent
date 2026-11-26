@@ -38,5 +38,27 @@
         "timeout": 30
       }
     ]
+  },
+  "hybrid-turn-steering": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 hooks/steering_hook.py || py hooks/steering_hook.py",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write_file|write_to_file|edit_file|replace_file_content|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 hooks/steering_hook.py || py hooks/steering_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }
