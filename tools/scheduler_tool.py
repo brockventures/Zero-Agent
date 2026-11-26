@@ -33,7 +33,7 @@ DEFAULT_JOBS = [
     {
         "id": "quant_daily_sweep",
         "name": "Multi-Venue Quant Closing Bell Sweep",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "daily",
         "hour_pt": 12,
         "minute_pt": 45,
@@ -44,7 +44,7 @@ DEFAULT_JOBS = [
     {
         "id": "kalshi_midday_heating",
         "name": "Kalshi Midday Heating & Euro Pre-Kickoff Sweep",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "daily",
         "hour_pt": 10,
         "minute_pt": 15,
@@ -55,7 +55,7 @@ DEFAULT_JOBS = [
     {
         "id": "quant_pregame_sweep",
         "name": "Quant US Pre-Game Lineup & Afternoon Peak Sweep",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "daily",
         "hour_pt": 15,
         "minute_pt": 30,
@@ -438,7 +438,7 @@ DEFAULT_JOBS = [
     {
         "id": "kalshi_paper_bot",
         "name": "Kalshi Weather Quant Paper Bot",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "daily",
         "hour_pt": 5,
         "minute_pt": 15,
@@ -449,7 +449,7 @@ DEFAULT_JOBS = [
     {
         "id": "kalshi_evening_review",
         "name": "Kalshi Daily Portfolio Review & Vault Report",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "daily",
         "hour_pt": 21,
         "minute_pt": 45,
@@ -518,7 +518,7 @@ DEFAULT_JOBS = [
     {
         "id": "kalshi_night_audit",
         "name": "Quant Post-00:00 UTC Crypto Close & Evening Sweep",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "daily",
         "hour_pt": 18,
         "minute_pt": 45,
