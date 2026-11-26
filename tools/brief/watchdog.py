@@ -190,7 +190,7 @@ def check_brief_health(
     component_intervals: dict[str, float] = {
         "gmail_watcher": float(config.gmail_interval_seconds),
         "calendar_watcher": float(config.calendar_interval_seconds),
-        "router": float(config.router_interval_seconds),
+        "router": max(float(config.router_interval_seconds), 60.0),
     }
 
     discovered = _discover_heartbeat_files(config.heartbeats_dir)
