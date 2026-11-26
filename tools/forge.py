@@ -12339,8 +12339,56 @@ def format_queue_digest(
     return "\n".join(lines)
 
 
+def _short_pt_str(ts: Optional[float] = None) -> str:
+    """Return a compact Pacific Time timestamp like 'Nov 26, 12:55 AM PT'."""
+    dt = datetime.fromtimestamp(ts, tz=PT_TZ) if ts is not None else datetime.now(PT_TZ)
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{dt.strftime('%b')} {dt.day}, {hour}:{dt.minute:02d} {ampm} PT"
+
+
+def _truncate_label(text: str, max_len: int = 56) -> str:
+    """Truncate a label cleanly at a word boundary without ugly mid-word cuts."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= max_len:
+        return clean
+    clipped = clean[: max_len - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return f"{clipped or clean[: max_len - 1]}…"
+
+
+def _format_header_decision_line(d: dict[str, Any]) -> str:
+    """Render a compact, scannable single-line pending approval item for the #forge pinned board."""
+    ch_ref = f"<#{d['channel_id']}>"
+    cat = str(d.get("category") or "").strip().lower()
+    handler = str(d.get("handler_type") or "").strip().lower()
+
+    if cat == "bridge_reload" or handler == "bridge_reload":
+        reason_title = ""
+        try:
+            payload = json.loads(d.get("payload_json") or "{}")
+            raw_reason = str(payload.get("reason") or "")
+            m = re.search(r"FORGE build\s+\S+\s*\((.+)\)", raw_reason)
+            if m:
+                reason_title = m.group(1).strip()
+        except Exception:
+            pass
+        if not reason_title:
+            raw_sum = str(d.get("summary") or "")
+            m2 = re.search(r"Build\s+`?fg-[^`\s]+`?\s*\(([^)]+)\)", raw_sum)
+            if m2:
+                reason_title = m2.group(1).strip()
+        if reason_title:
+            return f"- 🔄 **Reload Bridge:** {_truncate_label(reason_title, 48)} ({ch_ref})"
+        return f"- 🔄 **Reload Bridge** ({ch_ref})"
+
+    raw_title = str(d.get("title") or "").strip()
+    clean_title = re.sub(r"\s*\((?:fg|dec|dt)-[A-Za-z0-9_-]+\)", "", raw_title).strip()
+    clean_title = re.sub(r"^\[?[A-Z_]+\]?\s*", "", clean_title).strip() or raw_title
+    return f"- 🛡️ **{_truncate_label(clean_title, 56)}** ({ch_ref})"
+
+
 def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
-    """Render the live #forge top header message with backronym and active queues."""
+    """Render the live #forge pinned status board in a compact, scannable layout."""
     builds = _query_unified_rows(
         "SELECT * FROM forge_builds WHERE status IN ('queued', 'running', 'awaiting_approval')",
         db_path=db_path,
@@ -12369,45 +12417,41 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
         limit=5,
     )
 
-    lines = [
-        "### ⚒️ VULCAN (**V**erified **U**nattended **L**abor & **C**ode **A**nvil **N**ode)\n*FORGE Build Floor — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution*",
-        "",
-        "**Active FORGE Builds:**",
-    ]
+    lines = ["### ⚒️ VULCAN · FORGE Board", ""]
+
     if not builds:
-        lines.append("- *No active multi-chunk builds in queue.*")
+        lines.append("**Active Builds:** None")
     else:
+        lines.append("**Active Builds**")
         for b in builds:
-            lines.append(
-                f"- 🔨 **`{b['id']}` — {b['title']}** (`{b['status'].upper()}` · <#{b['origin_thread_id'] or b['origin_channel_id']}>)"
-            )
+            st = str(b["status"] or "running").replace("_", " ").title()
+            origin = b["origin_thread_id"] or b["origin_channel_id"]
+            lines.append(f"- 🔨 **{_truncate_label(b['title'], 56)}** · {st} (<#{origin}>)")
 
-    lines.append("\n**Active Background Tasks:**")
     if not jobs:
-        lines.append("- *No detached background tasks currently running.*")
+        lines.append("**Active Tasks:** None")
     else:
+        if builds:
+            lines.append("")
+        lines.append("**Active Tasks**")
         for j in jobs:
+            st = str(j["status"] or "running").replace("_", " ").title()
             ch_ref = _format_channel_mention(j["channel"])
-            lines.append(f"- ⚙️ **`{j['id']}` — {j['name']}** (`{j['status']}` · {ch_ref})")
+            lines.append(f"- ⚙️ **{_truncate_label(j['name'], 56)}** · {st} ({ch_ref})")
 
-    lines.append("\n**Pending Action Approvals (Decisions):**")
     if not decisions:
-        lines.append("- *Zero pending approval cards.*")
+        lines.append("**Pending Approvals:** None")
     else:
+        lines.append("\n**Pending Approvals**")
         for d in decisions:
-            lines.append(
-                f"- 🛡️ **`{d['id']}` [{d['category'].upper()}] {d['title']}** in <#{d['channel_id']}> — {d['summary'][:100]}"
-            )
+            lines.append(_format_header_decision_line(d))
 
-    lines.append("\n**Recently Completed Builds (Last 5):**")
     if not recent_completed:
-        lines.append("- *No completed builds recorded yet.*")
+        lines.append("\n**Recently Completed (Last 5):** None")
     else:
+        lines.append("\n**Recently Completed (Last 5)**")
         for rb in recent_completed:
-            title_txt = str(rb["title"] or "").strip()
-            if len(title_txt) > 72:
-                title_txt = title_txt[:69] + "..."
-            lines.append(f"- ✅ `{rb['id']}` — {title_txt} ({_now_pt_str(rb['updated_at'])})")
+            lines.append(f"- ✅ {_truncate_label(rb['title'], 56)} · *{_short_pt_str(rb['updated_at'])}*")
 
     return "\n".join(lines)
 
@@ -12436,6 +12480,7 @@ def _merge_remote_active_embeds_into_header(
     remote_build_lines: list[str] = []
     remote_job_lines: list[str] = []
     seen_ids: set[str] = set()
+    content_lower = content.lower()
 
     for msg in messages:
         try:
@@ -12453,47 +12498,50 @@ def _merge_remote_active_embeds_into_header(
             if not id_match:
                 continue
             entity_id = id_match.group(1)
-            if entity_id in seen_ids or f"`{entity_id}`" in content:
+            clean_title = re.sub(r"^[^\w\s]+\s*", "", title).strip()
+            short_title = _truncate_label(clean_title, 56)
+            if entity_id in seen_ids or f"`{entity_id}`" in content or (short_title and short_title.lower() in content_lower):
                 seen_ids.add(entity_id)
                 continue
             seen_ids.add(entity_id)
 
             first_line = desc.splitlines()[0] if desc else ""
             ch_match = re.search(r"(<#\d+>)", first_line)
-            ch_ref = ch_match.group(1) if ch_match else "`#forge`"
-            clean_title = re.sub(r"^[^\w\s]+\s*", "", title).strip()
+            ch_ref = ch_match.group(1) if ch_match else f"<#{FORGE_CHANNEL_ID}>"
 
             if entity_id.startswith("fg-") and desc.startswith(("**RUNNING**", "**QUEUED**", "**AWAITING APPROVAL**")):
-                st_label = first_line.split("**")[1] if "**" in first_line else "RUNNING"
-                remote_build_lines.append(f"- 🔨 **`{entity_id}` — {clean_title}** (`{st_label}` · {ch_ref})")
+                st_label = (first_line.split("**")[1] if "**" in first_line else "RUNNING").title()
+                remote_build_lines.append(f"- 🔨 **{short_title}** · {st_label} ({ch_ref})")
             elif entity_id.startswith("dt-") and desc.startswith("**RUNNING**"):
-                remote_job_lines.append(f"- ⚙️ **`{entity_id}` — {j_title if (j_title := clean_title) else clean_title}** (`running` · {ch_ref})")
+                remote_job_lines.append(f"- ⚙️ **{short_title}** · Running ({ch_ref})")
         except Exception:
             continue
 
     if remote_build_lines:
-        if "- *No active multi-chunk builds in queue.*" in content:
+        if "**Active Builds:** None" in content:
             content = content.replace(
-                "- *No active multi-chunk builds in queue.*",
-                "\n".join(remote_build_lines),
+                "**Active Builds:** None",
+                "**Active Builds**\n" + "\n".join(remote_build_lines),
+                1,
             )
-        else:
+        elif "**Active Builds**\n" in content:
             content = content.replace(
-                "**Active FORGE Builds:**\n",
-                "**Active FORGE Builds:**\n" + "\n".join(remote_build_lines) + "\n",
+                "**Active Builds**\n",
+                "**Active Builds**\n" + "\n".join(remote_build_lines) + "\n",
                 1,
             )
 
     if remote_job_lines:
-        if "- *No detached background tasks currently running.*" in content:
+        if "**Active Tasks:** None" in content:
             content = content.replace(
-                "- *No detached background tasks currently running.*",
-                "\n".join(remote_job_lines),
+                "**Active Tasks:** None",
+                "**Active Tasks**\n" + "\n".join(remote_job_lines),
+                1,
             )
-        else:
+        elif "**Active Tasks**\n" in content:
             content = content.replace(
-                "**Active Background Tasks:**\n",
-                "**Active Background Tasks:**\n" + "\n".join(remote_job_lines) + "\n",
+                "**Active Tasks**\n",
+                "**Active Tasks**\n" + "\n".join(remote_job_lines) + "\n",
                 1,
             )
 
@@ -12534,7 +12582,7 @@ def sync_forge_channel_header(
         return False
 
     active_header_id = get_forge_header_message_id(header_message_id)
-    rendered_payload = f"{content}\n\n*Last synced: {_now_pt_str()}*"
+    rendered_payload = f"{content}\n\n*Synced {_short_pt_str()}*"
     msg_payload = {"content": rendered_payload[:1990], "embeds": []}
     try:
         ok_patch, status_code = _patch_forge_channel_message(
