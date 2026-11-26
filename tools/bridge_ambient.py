@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import signal
 import sys
 import time
 import uuid
@@ -30,21 +29,12 @@ from tools.bridge_commands import (
     execute_bridge_reload,
     execute_container_restart,
 )
-from tools.bridge_formatting import (
-    format_steering_prompt,
-)
-from tools.bridge_runner import (
-    channel_active_procs,
-    channel_active_prompts,
-    steering_channels,
-)
 from tools.bridge_state import (
     ATTACHMENTS_DIR,
     IVY_USER_ID,
     OWNER_USER_ID,
     READONLY_NOTIFICATION_CHANNELS,
     clear_channel_session_id,
-    get_in_flight,
     get_runtime_rules,
     is_brock_guild,
     is_container_restart_intent,
@@ -1176,7 +1166,7 @@ async def route_external_message(
     except Exception:  # noqa: BLE001, S110
         pass
 
-    from tools.bridge_handlers import try_coalesce_pending_turn
+    from tools.bridge_handlers import attempt_hybrid_steering, try_coalesce_pending_turn
 
     # First: attempt to coalesce rapid split-delivery from the same author into any pending queued turn
     if try_coalesce_pending_turn(
@@ -1191,88 +1181,24 @@ async def route_external_message(
     ):
         return True
 
-    # Group Chat Mid-Turn Steering Check (Channel-scoped)
-    steering_disabled_channels = [
-        str(c) for c in rules.get("steering_disabled_channels", [])
-    ]
-    target_proc = channel_active_procs.get(msg.channel.id)
-    if (
-        str(msg.channel.id) not in steering_disabled_channels
-        and target_proc is not None
-        and target_proc.returncode is None
+    # Group Chat Mid-Turn Steering Check (Channel-scoped, hybrid hook + SIGINT fallback)
+    if await attempt_hybrid_steering(
+        msg=msg,
+        channel_id=msg.channel.id,
+        turn_queue=ext_turn_queue,
+        new_directive=cleaned,
+        raw_directive=content,
+        author_name=author_name,
+        attachments=saved_attachments,
+        mode="external",
+        is_group=True,
+        is_thread_channel=isinstance(msg.channel, discord.Thread),
+        rules=rules,
+        extra_item_fields={
+            "is_physical_mention": is_physical_mention,
+            "is_ambient_chime_in": is_ambient_chime_in,
+        },
     ):
-        already_steering = msg.channel.id in steering_channels
-        if not already_steering:
-            steering_channels.add(msg.channel.id)
-            try:
-                target_proc.send_signal(signal.SIGINT)
-            except Exception as se:  # noqa: BLE001
-                print(
-                    f"[Bridge] Warning sending SIGINT for external group steering in channel {msg.channel.id}: {se}"
-                )
-
-        orig_prompt = channel_active_prompts.get(msg.channel.id)
-        if not orig_prompt:
-            try:
-                in_flight_data = get_in_flight()
-                if isinstance(in_flight_data, dict):
-                    orig_prompt = in_flight_data.get(str(msg.channel.id), {}).get(
-                        "prompt"
-                    )
-            except Exception:  # noqa: BLE001, S110
-                pass
-
-        try:
-            steer_prompt = format_steering_prompt(
-                new_directive=cleaned,
-                original_task=orig_prompt,
-                author_name=author_name,
-                is_group=True,
-            )
-            print(
-                f"[Bridge] Silently steering in-flight external turn for new message from {author_name}"
-            )
-            await ext_turn_queue.put(
-                {
-                    "prompt": steer_prompt,
-                    "raw_prompt": cleaned,
-                    "original_task": orig_prompt,
-                    "status_msg": None,
-                    "reply_target": msg,
-                    "attachments": saved_attachments,
-                    "is_steer": True,
-                    "mode": "external",
-                    "channel_id": msg.channel.id,
-                    "author_id": msg.author.id,
-                    "author_name": author_name,
-                    "is_physical_mention": is_physical_mention,
-                    "is_ambient_chime_in": is_ambient_chime_in,
-                    "queued_at": time.perf_counter(),
-                }
-            )
-        except Exception as steer_err:  # noqa: BLE001
-            print(
-                f"[Bridge] Error formatting external group steering prompt: {steer_err}"
-            )
-            if not already_steering:
-                steering_channels.discard(msg.channel.id)
-            await ext_turn_queue.put(
-                {
-                    "prompt": cleaned,
-                    "raw_prompt": cleaned,
-                    "status_msg": None,
-                    "reply_target": msg,
-                    "attachments": saved_attachments,
-                    "is_steer": False,
-                    "mode": "external",
-                    "channel_id": msg.channel.id,
-                    "author_id": msg.author.id,
-                    "author_name": author_name,
-                    "is_physical_mention": is_physical_mention,
-                    "is_ambient_chime_in": is_ambient_chime_in,
-                    "queued_at": time.perf_counter(),
-                }
-            )
         return True
 
     is_last_word = False

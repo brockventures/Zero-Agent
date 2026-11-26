@@ -67,6 +67,18 @@ from tools.bridge_runner import (
     steering_channels,
     thread_active_tasks,
 )
+from tools.bridge_engine import get_channel_turn_phase
+from tools.bridge_steering import (
+    cancel_pending_steer,
+    enqueue_soft_steer,
+    get_hook_drain_timeout_seconds,
+    is_hard_abort_directive,
+    is_hybrid_steering_enabled,
+    is_steer_pending,
+    is_steering_disabled,
+    peek_pending_steers,
+    purge_channel_steers,
+)
 import tools.bridge_runner as br
 
 
@@ -85,6 +97,8 @@ channel_active_tasks = {}       # channel_id -> asyncio.Task (active turn proces
 channel_active_status_msgs = {} # channel_id -> discord.Message
 channel_waiting_items: dict[int, dict] = {}
 channel_concurrency_semaphore = None
+channel_soft_steer_tasks: set[asyncio.Task] = set()
+_unconsumed_on_turn_exit: set[str] = set()
 
 FAST_LANE_CHANNEL_IDS = {1561509863018856468, 1562246590943461429, 1544953279664889888}
 
@@ -1100,6 +1114,344 @@ async def handle_on_ready(
 
 
 
+def record_unconsumed_steers_on_turn_exit(channel_id: int | str) -> None:
+    """Record any pending soft-steer IDs still unconsumed when a turn tears down."""
+    try:
+        pending = peek_pending_steers(channel_id)
+    except Exception:
+        return
+    if not pending:
+        return
+    for entry in pending:
+        sid = entry.get("steer_id")
+        if sid:
+            _unconsumed_on_turn_exit.add(str(sid))
+    if len(_unconsumed_on_turn_exit) > 500:
+        keep = list(_unconsumed_on_turn_exit)[-250:]
+        _unconsumed_on_turn_exit.clear()
+        _unconsumed_on_turn_exit.update(keep)
+
+
+def _resolve_active_original_prompt(channel_id: int) -> str | None:
+    """Resolve the active turn's original prompt from memory or in-flight disk state."""
+    orig_prompt = channel_active_prompts.get(channel_id)
+    if not orig_prompt:
+        try:
+            in_flight_data = get_in_flight()
+            if isinstance(in_flight_data, dict):
+                orig_prompt = in_flight_data.get(str(channel_id), {}).get("prompt")
+        except Exception:
+            pass
+    return orig_prompt
+
+
+def _build_queue_item(
+    *,
+    msg: discord.Message,
+    channel_id: int,
+    prompt: str,
+    raw_prompt: str,
+    author_name: str,
+    attachments: list[str],
+    mode: str,
+    is_steer: bool,
+    original_task: str | None = None,
+    extra_item_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a normalized turn queue payload for home or external turn dispatchers."""
+    item: dict[str, Any] = {
+        "prompt": prompt,
+        "raw_prompt": raw_prompt,
+        "status_msg": None,
+        "reply_target": msg,
+        "attachments": attachments,
+        "is_steer": is_steer,
+        "mode": mode,
+        "channel_id": channel_id,
+        "author_id": msg.author.id,
+        "author_name": author_name,
+        "queued_at": time.perf_counter(),
+    }
+    if is_steer:
+        item["original_task"] = original_task
+    if extra_item_fields:
+        item.update(extra_item_fields)
+    return item
+
+
+async def _execute_hard_steer(
+    *,
+    channel_id: int,
+    target_proc: Any,
+    msg: discord.Message,
+    turn_queue: Any,
+    new_directive: str,
+    author_name: str,
+    attachments: list[str],
+    mode: str,
+    is_group: bool,
+    is_thread_channel: bool,
+    orig_prompt: str | None,
+    extra_item_fields: dict[str, Any] | None = None,
+) -> None:
+    """Execute immediate SIGINT + formatted steer-prompt queue respawn."""
+    global active_status_msg
+
+    already_steering = channel_id in steering_channels
+    if not already_steering:
+        steering_channels.add(channel_id)
+        try:
+            target_proc.send_signal(signal.SIGINT)
+        except Exception as se:
+            label = "external group " if is_group else ""
+            print(f"[Bridge] Warning sending SIGINT for {label}steering in {channel_id}: {se}")
+
+    if mode == "home":
+        target_st_msg = channel_active_status_msgs.get(channel_id) or (
+            active_status_msg if channel_id == TARGET_CHANNEL_ID else None
+        )
+        if target_st_msg and not is_thread_channel:
+            try:
+                await target_st_msg.edit(content="~~⏳ [Task paused by new directive below]~~")
+            except Exception as e:
+                print(f"[Bridge] Failed to edit old status message: {e}")
+            if channel_id == TARGET_CHANNEL_ID:
+                active_status_msg = None
+            channel_active_status_msgs.pop(channel_id, None)
+
+    try:
+        await msg.channel.typing()
+    except Exception:
+        pass
+
+    if not orig_prompt:
+        orig_prompt = _resolve_active_original_prompt(channel_id)
+
+    try:
+        steer_prompt = format_steering_prompt(
+            new_directive=new_directive,
+            original_task=orig_prompt,
+            author_name=author_name if is_group else None,
+            is_group=is_group,
+        )
+        if is_group:
+            print(
+                f"[Bridge] Silently steering in-flight external turn for new message from {author_name}"
+            )
+        await turn_queue.put(
+            _build_queue_item(
+                msg=msg,
+                channel_id=channel_id,
+                prompt=steer_prompt,
+                raw_prompt=new_directive,
+                author_name=author_name,
+                attachments=attachments,
+                mode=mode,
+                is_steer=True,
+                original_task=orig_prompt,
+                extra_item_fields=extra_item_fields,
+            )
+        )
+    except Exception as steer_err:
+        label = "external group " if is_group else ""
+        print(f"[Bridge] Error formatting {label}steering prompt: {steer_err}")
+        if not already_steering:
+            steering_channels.discard(channel_id)
+        await turn_queue.put(
+            _build_queue_item(
+                msg=msg,
+                channel_id=channel_id,
+                prompt=new_directive,
+                raw_prompt=new_directive,
+                author_name=author_name,
+                attachments=attachments,
+                mode=mode,
+                is_steer=False,
+                extra_item_fields=extra_item_fields,
+            )
+        )
+
+
+async def _watch_soft_steer_drain(
+    *,
+    channel_id: int,
+    steer_id: str,
+    target_proc: Any,
+    msg: discord.Message,
+    turn_queue: Any,
+    new_directive: str,
+    author_name: str,
+    attachments: list[str],
+    mode: str,
+    is_group: bool,
+    is_thread_channel: bool,
+    orig_prompt: str | None,
+    timeout_seconds: float,
+    extra_item_fields: dict[str, Any] | None = None,
+    poll_interval: float = 0.2,
+) -> None:
+    """Wait up to timeout_seconds for hook consumption; fall back to SIGINT or normal enqueue."""
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        if steer_id in _unconsumed_on_turn_exit:
+            _unconsumed_on_turn_exit.discard(steer_id)
+            cancel_pending_steer(channel_id, steer_id)
+            await turn_queue.put(
+                _build_queue_item(
+                    msg=msg,
+                    channel_id=channel_id,
+                    prompt=new_directive,
+                    raw_prompt=new_directive,
+                    author_name=author_name,
+                    attachments=attachments,
+                    mode=mode,
+                    is_steer=False,
+                    extra_item_fields=extra_item_fields,
+                )
+            )
+            return
+
+        if not is_steer_pending(channel_id, steer_id):
+            return
+
+        if getattr(target_proc, "returncode", None) is not None:
+            if cancel_pending_steer(channel_id, steer_id) or steer_id in _unconsumed_on_turn_exit:
+                _unconsumed_on_turn_exit.discard(steer_id)
+                await turn_queue.put(
+                    _build_queue_item(
+                        msg=msg,
+                        channel_id=channel_id,
+                        prompt=new_directive,
+                        raw_prompt=new_directive,
+                        author_name=author_name,
+                        attachments=attachments,
+                        mode=mode,
+                        is_steer=False,
+                        extra_item_fields=extra_item_fields,
+                    )
+                )
+            return
+
+        current_phase = get_channel_turn_phase(channel_id)
+        now_mono = time.monotonic()
+        if current_phase in ("streaming_text", "finalizing") or now_mono >= deadline:
+            if cancel_pending_steer(channel_id, steer_id):
+                await _execute_hard_steer(
+                    channel_id=channel_id,
+                    target_proc=target_proc,
+                    msg=msg,
+                    turn_queue=turn_queue,
+                    new_directive=new_directive,
+                    author_name=author_name,
+                    attachments=attachments,
+                    mode=mode,
+                    is_group=is_group,
+                    is_thread_channel=is_thread_channel,
+                    orig_prompt=orig_prompt,
+                    extra_item_fields=extra_item_fields,
+                )
+            return
+
+        remaining = deadline - now_mono
+        await asyncio.sleep(min(poll_interval, max(0.01, remaining)))
+
+
+async def attempt_hybrid_steering(
+    *,
+    msg: discord.Message,
+    channel_id: int,
+    turn_queue: Any,
+    new_directive: str,
+    raw_directive: str | None = None,
+    author_name: str = "",
+    attachments: list[str] | None = None,
+    mode: str = "home",
+    is_group: bool = False,
+    is_thread_channel: bool = False,
+    rules: dict[str, Any] | None = None,
+    extra_item_fields: dict[str, Any] | None = None,
+) -> bool:
+    """Attempt soft hook-based steering mid-tool-loop with 2.5s SIGINT fallback.
+
+    Returns True if the incoming message was handled as a mid-turn steer (soft or hard),
+    or False if no active turn is steerable / steering is disabled for this channel.
+    """
+    if is_steering_disabled(channel_id, rules):
+        return False
+
+    target_proc = channel_active_procs.get(channel_id)
+    if target_proc is None or getattr(target_proc, "returncode", None) is not None:
+        return False
+
+    att_list = list(attachments or [])
+    orig_prompt = _resolve_active_original_prompt(channel_id)
+    is_abort = is_hard_abort_directive(new_directive) or (
+        bool(raw_directive) and is_hard_abort_directive(raw_directive)
+    )
+    soft_eligible = (
+        is_hybrid_steering_enabled(rules)
+        and (channel_id not in steering_channels)
+        and not is_abort
+        and get_channel_turn_phase(channel_id) == "tool_loop"
+    )
+
+    if soft_eligible:
+        steer_entry = enqueue_soft_steer(
+            channel_id,
+            new_directive,
+            author_name=author_name or None,
+            is_group=is_group,
+            original_task=orig_prompt,
+        )
+        steer_id = steer_entry["steer_id"]
+        try:
+            await msg.channel.typing()
+        except Exception:
+            pass
+        timeout_seconds = get_hook_drain_timeout_seconds(rules)
+        task = asyncio.create_task(
+            _watch_soft_steer_drain(
+                channel_id=channel_id,
+                steer_id=steer_id,
+                target_proc=target_proc,
+                msg=msg,
+                turn_queue=turn_queue,
+                new_directive=new_directive,
+                author_name=author_name,
+                attachments=att_list,
+                mode=mode,
+                is_group=is_group,
+                is_thread_channel=is_thread_channel,
+                orig_prompt=orig_prompt,
+                timeout_seconds=timeout_seconds,
+                extra_item_fields=extra_item_fields,
+            )
+        )
+        channel_soft_steer_tasks.add(task)
+        task.add_done_callback(channel_soft_steer_tasks.discard)
+        return True
+
+    try:
+        purge_channel_steers(channel_id)
+    except Exception:
+        pass
+    await _execute_hard_steer(
+        channel_id=channel_id,
+        target_proc=target_proc,
+        msg=msg,
+        turn_queue=turn_queue,
+        new_directive=new_directive,
+        author_name=author_name,
+        attachments=att_list,
+        mode=mode,
+        is_group=is_group,
+        is_thread_channel=is_thread_channel,
+        orig_prompt=orig_prompt,
+        extra_item_fields=extra_item_fields,
+    )
+    return True
+
+
 async def handle_message(
     msg: discord.Message,
     bot: discord.Client,
@@ -1431,78 +1783,20 @@ async def handle_message(
         return
 
     # Active Steering Check in THIS channel/thread
-    target_proc = channel_active_procs.get(msg.channel.id)
-    if target_proc is not None and target_proc.returncode is None:
-        already_steering = msg.channel.id in steering_channels
-        if not already_steering:
-            steering_channels.add(msg.channel.id)
-            try:
-                target_proc.send_signal(signal.SIGINT)
-            except Exception as se:
-                print(f"[Bridge] Warning sending SIGINT for steering in {msg.channel.id}: {se}")
-
-        target_st_msg = channel_active_status_msgs.get(msg.channel.id) or (active_status_msg if msg.channel.id == TARGET_CHANNEL_ID else None)
-        if target_st_msg and not is_thread_channel:
-            try:
-                await target_st_msg.edit(content="~~⏳ [Task paused by new directive below]~~")
-            except Exception as e:
-                print(f"[Bridge] Failed to edit old status message: {e}")
-            if msg.channel.id == TARGET_CHANNEL_ID:
-                active_status_msg = None
-            channel_active_status_msgs.pop(msg.channel.id, None)
-
-        try:
-            await msg.channel.typing()
-        except Exception:
-            pass
-        orig_prompt = channel_active_prompts.get(msg.channel.id)
-        if not orig_prompt:
-            try:
-                in_flight_data = get_in_flight()
-                if isinstance(in_flight_data, dict):
-                    orig_prompt = in_flight_data.get(str(msg.channel.id), {}).get("prompt")
-            except Exception:
-                pass
-
-        try:
-            steer_prompt = format_steering_prompt(
-                new_directive=prompt_content,
-                original_task=orig_prompt,
-                is_group=False,
-            )
-            await home_turn_queue.put({
-                "prompt": steer_prompt,
-                "raw_prompt": prompt_content,
-                "original_task": orig_prompt,
-                "status_msg": None,
-                "reply_target": msg,
-                "attachments": saved_attachments,
-                "is_steer": True,
-                "mode": "home",
-                "channel_id": msg.channel.id,
-                "author_id": msg.author.id,
-                "author_name": author_name,
-                "is_thread_task": is_thread_channel,
-                "queued_at": time.perf_counter(),
-            })
-        except Exception as steer_err:
-            print(f"[Bridge] Error formatting steering prompt: {steer_err}")
-            if not already_steering:
-                steering_channels.discard(msg.channel.id)
-            await home_turn_queue.put({
-                "prompt": prompt_content,
-                "raw_prompt": prompt_content,
-                "status_msg": None,
-                "reply_target": msg,
-                "attachments": saved_attachments,
-                "is_steer": False,
-                "mode": "home",
-                "channel_id": msg.channel.id,
-                "author_id": msg.author.id,
-                "author_name": author_name,
-                "is_thread_task": is_thread_channel,
-                "queued_at": time.perf_counter(),
-            })
+    if await attempt_hybrid_steering(
+        msg=msg,
+        channel_id=msg.channel.id,
+        turn_queue=home_turn_queue,
+        new_directive=prompt_content,
+        raw_directive=content,
+        author_name=author_name,
+        attachments=saved_attachments,
+        mode="home",
+        is_group=False,
+        is_thread_channel=is_thread_channel,
+        rules=rules,
+        extra_item_fields={"is_thread_task": is_thread_channel},
+    ):
         return
 
     try:

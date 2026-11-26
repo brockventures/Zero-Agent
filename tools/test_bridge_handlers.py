@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: ASYNC230, EXE001, F401, F811, F841, FURB167, I001, UP017
+# ruff: noqa: ASYNC230, EXE001, F401, F841, FURB167, I001, UP017
 """
 Unit test suite for bridge_handlers.py (Discord Bot Event Handlers, Routing & Dispatch).
 """
@@ -2248,6 +2248,418 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0], "typing")
         self.assertIn("execute_agy_turn", events)
         self.assertLess(events.index("typing"), events.index("execute_agy_turn"))
+
+    def _make_home_steer_msg(self, channel_id: int, content: str, msg_id: int = 12345):
+        msg = MagicMock()
+        msg.id = msg_id
+        msg.channel = MagicMock()
+        msg.channel.id = channel_id
+        msg.channel.name = "zero-chat"
+        msg.channel.parent_id = None
+        msg.channel.typing = AsyncMock()
+        msg.guild = MagicMock()
+        msg.guild.id = 1210466877294518272
+        msg.author = MagicMock()
+        msg.author.id = bs.OWNER_USER_ID
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.author.name = "Ryan"
+        msg.content = content
+        msg.created_at = datetime.now(timezone.utc)
+        msg.mentions = []
+        msg.reference = None
+        msg.attachments = []
+        return msg
+
+    async def test_hybrid_soft_steer_mid_tool_loop_consumed_by_hook_zero_sigint(self):
+        """(a) Soft steer mid-tool-loop consumed by hook completes with zero SIGINT and no respawn."""
+        from tools.bridge_engine import (
+            channel_turn_phases,
+            clear_channel_turn_phase,
+            set_channel_turn_phase,
+        )
+        from tools.bridge_runner import (
+            channel_active_procs,
+            channel_active_prompts,
+            steering_channels,
+        )
+        from tools.bridge_steering import (
+            consume_pending_steers,
+            peek_pending_steers,
+            purge_channel_steers,
+        )
+
+        channel_id = 1542081375287640084
+        qdir = self.temp_path / "steering_queue"
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        channel_active_procs[channel_id] = mock_proc
+        channel_active_prompts[channel_id] = "Inspect the deployment logs"
+        set_channel_turn_phase(channel_id, "tool_loop", tool_name="run_command")
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        msg = self._make_home_steer_msg(channel_id, "Also check nginx error.log")
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        rules = {
+            "hybrid_steering_enabled": True,
+            "hybrid_steering_hook_timeout_seconds": 0.5,
+            "steering_disabled_channels": [],
+        }
+
+        try:
+            with (
+                patch.dict(os.environ, {"ZERO_STEERING_QUEUE_DIR": str(qdir)}),
+                patch("tools.bridge_handlers.get_runtime_rules", return_value=rules),
+            ):
+                await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+
+                # Soft steer queued on disk, zero SIGINT, nothing put on home_turn_queue
+                pending = peek_pending_steers(channel_id)
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["directive"], "Also check nginx error.log")
+                mock_proc.send_signal.assert_not_called()
+                self.assertNotIn(channel_id, steering_channels)
+                home_queue.put.assert_not_awaited()
+
+                # Simulate PreInvocation hook consuming the steer before 2.5s deadline
+                consumed = consume_pending_steers(channel_id, consumer="PreInvocation")
+                self.assertEqual(len(consumed), 1)
+
+                tasks = list(bh.channel_soft_steer_tasks)
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+                mock_proc.send_signal.assert_not_called()
+                self.assertNotIn(channel_id, steering_channels)
+                home_queue.put.assert_not_awaited()
+        finally:
+            for t in list(bh.channel_soft_steer_tasks):
+                t.cancel()
+            channel_active_procs.pop(channel_id, None)
+            channel_active_prompts.pop(channel_id, None)
+            steering_channels.discard(channel_id)
+            clear_channel_turn_phase(channel_id)
+            channel_turn_phases.clear()
+            purge_channel_steers(channel_id, queue_dir=qdir)
+
+    async def test_hybrid_soft_steer_timeout_falls_back_to_sigint_and_queue(self):
+        """(b) Soft steer missing the hook drain deadline falls back to SIGINT + queue."""
+        from tools.bridge_engine import (
+            clear_channel_turn_phase,
+            set_channel_turn_phase,
+        )
+        from tools.bridge_runner import (
+            channel_active_procs,
+            channel_active_prompts,
+            steering_channels,
+        )
+        from tools.bridge_steering import peek_pending_steers, purge_channel_steers
+
+        channel_id = 1542081375287640084
+        qdir = self.temp_path / "steering_queue"
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        channel_active_procs[channel_id] = mock_proc
+        channel_active_prompts[channel_id] = "Check disk usage"
+        set_channel_turn_phase(channel_id, "tool_loop", tool_name="run_command")
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        msg = self._make_home_steer_msg(channel_id, "Also check inode usage")
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        rules = {
+            "hybrid_steering_enabled": True,
+            "hybrid_steering_hook_timeout_seconds": 0.08,
+            "steering_disabled_channels": [],
+        }
+
+        try:
+            with (
+                patch.dict(os.environ, {"ZERO_STEERING_QUEUE_DIR": str(qdir)}),
+                patch("tools.bridge_handlers.get_runtime_rules", return_value=rules),
+            ):
+                await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+                tasks = list(bh.channel_soft_steer_tasks)
+                self.assertEqual(len(tasks), 1)
+                await asyncio.gather(*tasks)
+
+                mock_proc.send_signal.assert_called_once_with(signal.SIGINT)
+                self.assertIn(channel_id, steering_channels)
+                home_queue.put.assert_awaited_once()
+                item = home_queue.put.call_args[0][0]
+                self.assertTrue(item.get("is_steer"))
+                self.assertIn("Also check inode usage", item["prompt"])
+                # Pending steer was cancelled before SIGINT fallback
+                self.assertEqual(peek_pending_steers(channel_id), [])
+        finally:
+            for t in list(bh.channel_soft_steer_tasks):
+                t.cancel()
+            channel_active_procs.pop(channel_id, None)
+            channel_active_prompts.pop(channel_id, None)
+            steering_channels.discard(channel_id)
+            clear_channel_turn_phase(channel_id)
+            purge_channel_steers(channel_id, queue_dir=qdir)
+
+    async def test_hybrid_steering_immediate_sigint_on_streaming_text_and_explicit_abort(self):
+        """(c) Immediate SIGINT on streaming_text phase or explicit stop/cancel abort, plus phase transition."""
+        from tools.bridge_engine import (
+            clear_channel_turn_phase,
+            set_channel_turn_phase,
+        )
+        from tools.bridge_runner import (
+            channel_active_procs,
+            channel_active_prompts,
+            steering_channels,
+        )
+        from tools.bridge_steering import enqueue_soft_steer, peek_pending_steers, purge_channel_steers
+
+        channel_id = 1542081375287640084
+        qdir = self.temp_path / "steering_queue"
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        rules = {
+            "hybrid_steering_enabled": True,
+            "hybrid_steering_hook_timeout_seconds": 2.5,
+            "steering_disabled_channels": [],
+        }
+
+        try:
+            with (
+                patch.dict(os.environ, {"ZERO_STEERING_QUEUE_DIR": str(qdir)}),
+                patch("tools.bridge_handlers.get_runtime_rules", return_value=rules),
+            ):
+                # Case 1: Already in streaming_text phase -> immediate SIGINT & purge stale steers
+                enqueue_soft_steer(channel_id, "stale steer")
+                mock_proc = MagicMock()
+                mock_proc.returncode = None
+                channel_active_procs[channel_id] = mock_proc
+                channel_active_prompts[channel_id] = "Summarize PR"
+                set_channel_turn_phase(channel_id, "streaming_text")
+
+                home_queue = AsyncMock()
+                msg = self._make_home_steer_msg(channel_id, "Make it shorter", msg_id=2001)
+                await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=AsyncMock())
+
+                mock_proc.send_signal.assert_called_once_with(signal.SIGINT)
+                self.assertIn(channel_id, steering_channels)
+                home_queue.put.assert_awaited_once()
+                self.assertTrue(home_queue.put.call_args[0][0]["is_steer"])
+                self.assertEqual(peek_pending_steers(channel_id), [])
+                self.assertEqual(len(bh.channel_soft_steer_tasks), 0)
+
+                # Reset for Case 2: tool_loop phase, but explicit "stop" / "cancel" abort -> immediate SIGINT
+                steering_channels.discard(channel_id)
+                for abort_text in ("stop", "cancel"):
+                    mock_proc2 = MagicMock()
+                    mock_proc2.returncode = None
+                    channel_active_procs[channel_id] = mock_proc2
+                    set_channel_turn_phase(channel_id, "tool_loop", tool_name="run_command")
+                    home_queue2 = AsyncMock()
+                    abort_msg = self._make_home_steer_msg(channel_id, abort_text, msg_id=2002)
+
+                    await bh.handle_message(abort_msg, mock_bot, home_turn_queue=home_queue2, ext_turn_queue=AsyncMock())
+
+                    mock_proc2.send_signal.assert_called_once_with(signal.SIGINT)
+                    self.assertIn(channel_id, steering_channels)
+                    home_queue2.put.assert_awaited_once()
+                    self.assertEqual(len(bh.channel_soft_steer_tasks), 0)
+                    steering_channels.discard(channel_id)
+
+                # Case 3: Starts in tool_loop, then transitions to streaming_text while pending -> fast fallback
+                mock_proc3 = MagicMock()
+                mock_proc3.returncode = None
+                channel_active_procs[channel_id] = mock_proc3
+                set_channel_turn_phase(channel_id, "tool_loop", tool_name="view_file")
+                home_queue3 = AsyncMock()
+                msg3 = self._make_home_steer_msg(channel_id, "Check tests too", msg_id=2003)
+
+                await bh.handle_message(msg3, mock_bot, home_turn_queue=home_queue3, ext_turn_queue=AsyncMock())
+                mock_proc3.send_signal.assert_not_called()
+                set_channel_turn_phase(channel_id, "streaming_text")
+                tasks = list(bh.channel_soft_steer_tasks)
+                self.assertEqual(len(tasks), 1)
+                await asyncio.gather(*tasks)
+
+                mock_proc3.send_signal.assert_called_once_with(signal.SIGINT)
+                self.assertIn(channel_id, steering_channels)
+                home_queue3.put.assert_awaited_once()
+                self.assertTrue(home_queue3.put.call_args[0][0]["is_steer"])
+        finally:
+            for t in list(bh.channel_soft_steer_tasks):
+                t.cancel()
+            channel_active_procs.pop(channel_id, None)
+            channel_active_prompts.pop(channel_id, None)
+            steering_channels.discard(channel_id)
+            clear_channel_turn_phase(channel_id)
+            purge_channel_steers(channel_id, queue_dir=qdir)
+
+    async def test_hybrid_soft_steer_turn_exit_enqueues_normally_without_drop(self):
+        """(d) Turn exit while soft steer is pending enqueues follow-up normally without SIGINT or drop."""
+        from tools.bridge_engine import (
+            clear_channel_turn_phase,
+            set_channel_turn_phase,
+        )
+        from tools.bridge_runner import (
+            channel_active_procs,
+            channel_active_prompts,
+            steering_channels,
+        )
+        from tools.bridge_steering import peek_pending_steers, purge_channel_steers
+
+        channel_id = 1542081375287640084
+        qdir = self.temp_path / "steering_queue"
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        channel_active_procs[channel_id] = mock_proc
+        channel_active_prompts[channel_id] = "Run diagnostics"
+        set_channel_turn_phase(channel_id, "tool_loop", tool_name="run_command")
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        msg = self._make_home_steer_msg(channel_id, "Follow-up after exit", msg_id=3001)
+        home_queue = AsyncMock()
+
+        rules = {
+            "hybrid_steering_enabled": True,
+            "hybrid_steering_hook_timeout_seconds": 2.5,
+            "steering_disabled_channels": [],
+        }
+
+        try:
+            with (
+                patch.dict(os.environ, {"ZERO_STEERING_QUEUE_DIR": str(qdir)}),
+                patch("tools.bridge_handlers.get_runtime_rules", return_value=rules),
+            ):
+                await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=AsyncMock())
+                # Turn exits before hook consumes the soft steer
+                mock_proc.returncode = 0
+
+                tasks = list(bh.channel_soft_steer_tasks)
+                self.assertEqual(len(tasks), 1)
+                await asyncio.gather(*tasks)
+
+                mock_proc.send_signal.assert_not_called()
+                self.assertNotIn(channel_id, steering_channels)
+                home_queue.put.assert_awaited_once()
+                item = home_queue.put.call_args[0][0]
+                self.assertFalse(item.get("is_steer"))
+                self.assertEqual(item["prompt"], "Follow-up after exit")
+                self.assertEqual(peek_pending_steers(channel_id), [])
+        finally:
+            for t in list(bh.channel_soft_steer_tasks):
+                t.cancel()
+            channel_active_procs.pop(channel_id, None)
+            channel_active_prompts.pop(channel_id, None)
+            steering_channels.discard(channel_id)
+            clear_channel_turn_phase(channel_id)
+            purge_channel_steers(channel_id, queue_dir=qdir)
+
+    async def test_hybrid_steering_respects_steering_disabled_channels(self):
+        """(e) steering_disabled_channels skips both soft and hard steering in home and external paths."""
+        from tools.bridge_ambient import route_external_message
+        from tools.bridge_engine import (
+            clear_channel_turn_phase,
+            set_channel_turn_phase,
+        )
+        from tools.bridge_runner import (
+            channel_active_procs,
+            channel_active_prompts,
+            steering_channels,
+        )
+        from tools.bridge_steering import peek_pending_steers, purge_channel_steers
+
+        home_cid = 1544953279664889888  # #zero-ops (home channel)
+        ext_cid = 1534436119888793750   # #the-banana-stand
+        qdir = self.temp_path / "steering_queue"
+
+        mock_home_proc = MagicMock()
+        mock_home_proc.returncode = None
+        mock_ext_proc = MagicMock()
+        mock_ext_proc.returncode = None
+
+        channel_active_procs[home_cid] = mock_home_proc
+        channel_active_procs[ext_cid] = mock_ext_proc
+        channel_active_prompts[home_cid] = "Home op"
+        channel_active_prompts[ext_cid] = "Banana stand op"
+        set_channel_turn_phase(home_cid, "tool_loop")
+        set_channel_turn_phase(ext_cid, "tool_loop")
+
+        rules = {
+            "hybrid_steering_enabled": True,
+            "hybrid_steering_hook_timeout_seconds": 2.5,
+            "steering_disabled_channels": [home_cid, str(ext_cid)],
+            "last_word_protocol_enabled": False,
+        }
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        home_msg = self._make_home_steer_msg(home_cid, "New home message", msg_id=4001)
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        ext_msg = MagicMock()
+        ext_msg.id = 4002
+        ext_msg.guild = MagicMock()
+        ext_msg.guild.id = 1534436119888793748
+        ext_msg.author = MagicMock()
+        ext_msg.author.id = bs.OWNER_USER_ID
+        ext_msg.author.name = "Ryan"
+        ext_msg.author.display_name = "Ryan"
+        ext_msg.author.bot = False
+        ext_msg.channel = MagicMock()
+        ext_msg.channel.id = ext_cid
+        ext_msg.channel.name = "the-banana-stand"
+        ext_msg.channel.typing = AsyncMock()
+        ext_msg.content = "<@1542285964213358633> Check this idea"
+        ext_msg.attachments = []
+        ext_msg.reference = None
+        ext_msg.role_mentions = []
+        ext_msg.mentions = [mock_bot.user]
+
+        try:
+            with (
+                patch.dict(os.environ, {"ZERO_STEERING_QUEUE_DIR": str(qdir)}),
+                patch("tools.bridge_handlers.get_runtime_rules", return_value=rules),
+                patch("tools.bridge_ambient.is_brock_guild", return_value=False),
+            ):
+                # Home disabled channel -> normal queue item, no SIGINT, no soft steer
+                await bh.handle_message(home_msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+                mock_home_proc.send_signal.assert_not_called()
+                self.assertNotIn(home_cid, steering_channels)
+                self.assertEqual(peek_pending_steers(home_cid), [])
+                home_queue.put.assert_awaited_once()
+                self.assertFalse(home_queue.put.call_args[0][0]["is_steer"])
+
+                # External disabled channel -> normal queue item, no SIGINT, no soft steer
+                handled = await route_external_message(
+                    ext_msg,
+                    mock_bot,
+                    ext_msg.content,
+                    "Ryan",
+                    home_queue,
+                    ext_queue,
+                    rules=rules,
+                )
+                self.assertTrue(handled)
+                mock_ext_proc.send_signal.assert_not_called()
+                self.assertNotIn(ext_cid, steering_channels)
+                self.assertEqual(peek_pending_steers(ext_cid), [])
+                ext_queue.put.assert_awaited_once()
+                self.assertFalse(ext_queue.put.call_args[0][0]["is_steer"])
+        finally:
+            for t in list(bh.channel_soft_steer_tasks):
+                t.cancel()
+            for cid in (home_cid, ext_cid):
+                channel_active_procs.pop(cid, None)
+                channel_active_prompts.pop(cid, None)
+                steering_channels.discard(cid)
+                clear_channel_turn_phase(cid)
+                purge_channel_steers(cid, queue_dir=qdir)
 
 
 if __name__ == "__main__":

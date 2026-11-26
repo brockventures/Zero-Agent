@@ -49,10 +49,13 @@ from tools.bridge_engine import (
     channel_active_procs,
     channel_active_prompts,
     channel_active_reply_targets,
+    clear_channel_turn_phase,
     steering_channels,
     resolve_channel_label,
     register_active_presence,
+    set_channel_turn_phase,
 )
+from tools.bridge_steering import purge_channel_steers
 reset_session_keys = PersistentSessionKeySet(get_reset_session_keys())    # session keys (persisted to disk) to reset on next turn
 thread_active_tasks = {}     # thread_id -> asyncio.Task
 
@@ -130,6 +133,13 @@ async def execute_agy_turn(
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
+    if isinstance(reply_target, discord.Thread) and getattr(reply_target, "id", None) is not None:
+        channel_id = int(reply_target.id)
+    elif (
+        isinstance(getattr(reply_target, "channel", None), discord.Thread)
+        and getattr(reply_target.channel, "id", None) is not None
+    ):
+        channel_id = int(reply_target.channel.id)
     channel_active_reply_targets[channel_id] = reply_target
     from_choice_button = bool(
         from_choice_button
@@ -311,6 +321,11 @@ async def execute_agy_turn(
             )
 
         timer.mark_boot_start()
+        coord = None
+        proc = None
+        purge_channel_steers(channel_id)
+        clear_channel_turn_phase(channel_id)
+        set_channel_turn_phase(channel_id, "starting")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -561,7 +576,18 @@ async def execute_agy_turn(
                 return
 
         finally:
-            coord.teardown(proc=proc, br_module=sys.modules[__name__])
+            try:
+                from tools.bridge_handlers import record_unconsumed_steers_on_turn_exit
+                record_unconsumed_steers_on_turn_exit(channel_id)
+            except Exception:
+                pass
+            if coord is not None:
+                coord.teardown(proc=proc, br_module=sys.modules[__name__])
+            clear_channel_turn_phase(channel_id)
+            try:
+                purge_channel_steers(channel_id)
+            except Exception:
+                pass
             channel_active_reply_targets.pop(channel_id, None)
             if mode == "home" and channel_id == TARGET_CHANNEL_ID:
                 active_proc = None

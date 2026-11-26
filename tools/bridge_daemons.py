@@ -41,9 +41,12 @@ from tools.bridge_engine import (
     TurnCoordinator,
     channel_active_procs,
     channel_active_prompts,
+    clear_channel_turn_phase,
     resolve_channel_label,
     register_active_presence,
+    set_channel_turn_phase,
 )
+from tools.bridge_steering import purge_channel_steers
 from tools.process_probe import get_process_children
 from tools.task_settle import get_turn_pending_tasks
 
@@ -796,6 +799,10 @@ class PersistentChannelWorker:
             baseline_step_index=baseline_step_index,
         )
 
+        purge_channel_steers(self.channel_id)
+        clear_channel_turn_phase(self.channel_id)
+        set_channel_turn_phase(self.channel_id, "starting")
+
         try:
             # 5. Send NDJSON user message on stdin immediately before Discord presence update
             payload = {"event": "user", "message": {"content": prepared_prompt}}
@@ -838,7 +845,17 @@ class PersistentChannelWorker:
                 print(f"[BridgeDaemon] Error recycling worker after failure: {rec_err}")
             raise
         finally:
+            try:
+                from tools.bridge_handlers import record_unconsumed_steers_on_turn_exit
+                record_unconsumed_steers_on_turn_exit(self.channel_id)
+            except Exception:
+                pass
             coord.cleanup_process(proc=self.proc, br_module=br)
+            clear_channel_turn_phase(self.channel_id)
+            try:
+                purge_channel_steers(self.channel_id)
+            except Exception:
+                pass
             _fire_presence(apply_presence_fn)
 
         # Clean attachments
