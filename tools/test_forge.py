@@ -2381,10 +2381,11 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     assert embed_pending["color"] == 0xF59E0B
     assert "Automated build for testing native Discord embeds." in embed_pending["description"]
     assert "**Approve Action:** Run `echo 'deployed'`" in embed_pending["description"]
-    assert "FORGE · Expires" in embed_pending["footer"]["text"]
+    assert "footer" not in embed_pending
 
     text_pending = format_decision_card_text(row_pending)
-    assert text_pending.startswith("🛡️ **Deploy Test Pipeline** [FORGE · Expires")
+    assert text_pending.startswith("🛡️ **Deploy Test Pipeline**\n")
+    assert "Expires" not in text_pending
     assert "Automated build for testing native Discord embeds." in text_pending
 
     # 2. Approved & Executed Decision Card Embed and Text
@@ -5109,6 +5110,104 @@ def test_baseball_decision_card_bridge_reload_deferred_to_ivy_outbox(tmp_path, m
     assert dec_row is not None
     assert dec_row["status"] == "pending"
     assert dec_row["message_id"] is None
+    assert dec_row["title"] == "Reload Bridge: Baseball Bridge Update"
+    assert "fg-" not in dec_row["title"]
+    assert "dec-" not in dec_row["title"]
+    assert "fg-" not in dec_row["summary"]
+    assert "dec-" not in dec_row["summary"]
+    assert "**Approve Action:** Reloads the Discord bridge in-place to activate the update." in dec_row["summary"]
+    assert json.loads(dec_row["payload_json"])["build_id"] == build_id
+    assert dec_row["expires_at"] > now
+
+    embed_reload = render_decision_card_embed(dec_row)
+    assert "footer" not in embed_reload
+    assert "fg-" not in embed_reload["title"]
+    assert "fg-" not in embed_reload["description"]
+    assert "dec-" not in embed_reload["title"]
+    assert "dec-" not in embed_reload["description"]
+
+    text_reload = format_decision_card_text(dec_row)
+    assert text_reload.startswith("🛡️ **Reload Bridge: Baseball Bridge Update**\n")
+    assert "Expires" not in text_reload
+    assert "fg-" not in text_reload
+    assert "dec-" not in text_reload
+
+
+def test_decision_card_bridge_reload_omits_ids_and_pending_expiration(tmp_path, monkeypatch):
+    """Ensure bridge_reload Decision Cards omit fg-/dec- IDs in visible text and pending cards omit expiration footnotes while keeping backend IDs and TTLs."""
+    db_path = tmp_path / "forge_reload_clean.db"
+    forge_mod.init_forge_db(db_path)
+
+    build_id = "fg-987654321-clean-test"
+    long_title = "Refactor Discord Bridge Pipeline Event Loop " + ("X" * 90)
+    now = time.time()
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (
+                id, title, repo, origin_channel_id, origin_thread_id,
+                touches_core_bridge, status, plan_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 1, 'completed', '{}', ?, ?)
+            """,
+            (build_id, long_title, str(tmp_path), forge_mod.ZERO_OPS_CHANNEL_ID, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (
+                id, build_id, chunk_index, title, target_files_json, target_symbols_json,
+                prohibited_files_json, instructions, verification_cmd, status
+            ) VALUES (?, ?, 0, 'Chunk 0', '[]', '[]', '[]', 'Do work', 'true', 'completed')
+            """,
+            (f"{build_id}-c0", build_id),
+        )
+
+    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "post_pending_decision_cards", lambda *a, **kw: [])
+    monkeypatch.setattr("tools.outbox.queue_outbox_message", lambda **kw: {"ok": True})
+
+    ok = forge_mod.dispatch_build_completion_to_origin(build_id, db_path=db_path)
+    assert ok is True
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        dec_row = conn.execute(
+            "SELECT * FROM forge_decisions WHERE category = 'bridge_reload' AND channel_id = ?",
+            (forge_mod.ZERO_OPS_CHANNEL_ID,),
+        ).fetchone()
+
+    assert dec_row is not None
+    assert dec_row["id"].startswith("dec-")
+    assert dec_row["expires_at"] >= now + 86000.0
+    assert len(dec_row["title"]) <= 100
+    assert dec_row["title"].startswith("Reload Bridge: Refactor Discord Bridge Pipeline Event Loop")
+    assert build_id not in dec_row["title"]
+    assert "fg-" not in dec_row["title"]
+    assert "dec-" not in dec_row["title"]
+    assert build_id not in dec_row["summary"]
+    assert "fg-" not in dec_row["summary"]
+    assert "dec-" not in dec_row["summary"]
+    assert "**Approve Action:** Reloads the Discord bridge in-place to activate the update." in dec_row["summary"]
+
+    payload = json.loads(dec_row["payload_json"])
+    assert payload["build_id"] == build_id
+    assert build_id in payload["reason"]
+
+    embed = render_decision_card_embed(dec_row)
+    assert embed["title"] == f"🛡️ {dec_row['title']}"
+    assert "footer" not in embed
+    assert "Expires" not in embed["description"]
+    assert "fg-" not in embed["title"] and "fg-" not in embed["description"]
+    assert "dec-" not in embed["title"] and "dec-" not in embed["description"]
+
+    card_text = format_decision_card_text(dec_row)
+    assert card_text.startswith(f"🛡️ **{dec_row['title']}**\n")
+    assert "Expires" not in card_text
+    assert "fg-" not in card_text
+    assert "dec-" not in card_text
+
+    header_line = forge_mod._format_header_decision_line(dict(dec_row))
+    assert "🔄 **Reload Bridge:**" in header_line
+    assert "fg-" not in header_line
+    assert "dec-" not in header_line
 
 
 def test_heartbeat_tracker_incremental_transcript_and_scandir_throttle(tmp_path, monkeypatch):

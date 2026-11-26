@@ -7568,8 +7568,11 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
             )
             stage_decision(
                 category="bridge_reload",
-                title=f"Reload Bridge ({build_id})",
-                summary=f"Build `{build_id}` ({build['title']}) modified bridge infrastructure. Reload bridge in-place.",
+                title=f"Reload Bridge: {build['title']}"[:100],
+                summary=(
+                    f"**{build['title']}** modified bridge infrastructure.\n\n"
+                    "**Approve Action:** Reloads the Discord bridge in-place to activate the update."
+                ),
                 handler_type="bridge_reload",
                 payload={"build_id": build_id, "reason": f"FORGE build {build_id} ({build['title']})"},
                 channel_id=target_cid,
@@ -11225,13 +11228,10 @@ def render_decision_card_embed(decision: sqlite3.Row | dict) -> dict:
             payload_dict = {}
         summary = _ensure_decision_action_clarity(summary, handler, payload_dict)
 
-        exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
-        exp_str = _now_pt_str(exp) if exp else "in 2 hours"
         return {
             "title": f"🛡️ {title}",
             "description": summary,
             "color": 0xF59E0B,
-            "footer": {"text": f"{cat} · Expires {exp_str}"},
         }
     if status == "executing":
         return {
@@ -11308,9 +11308,7 @@ def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
             payload_dict = {}
         summary = _ensure_decision_action_clarity(summary, handler, payload_dict)
 
-        exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
-        exp_str = _now_pt_str(exp) if exp else "in 2 hours"
-        return f"🛡️ **{title}** [{cat} · Expires {exp_str}]\n{summary}"
+        return f"🛡️ **{title}**\n{summary}"
     if status == "executing":
         return f"⏳ **{title}** [{cat} · Executing...]\n{summary}"
     if status in ("approved", "edited_approved"):
