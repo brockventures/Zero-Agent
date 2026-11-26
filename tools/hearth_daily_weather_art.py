@@ -1208,7 +1208,8 @@ def install_schedule_entry(schedule_file: Path = DEFAULT_SCHEDULE_FILE) -> tuple
             "and character consistency, and syncs daily_manifest.json to Host 2. "
             "Silent background sidecar (silent on success, alert only on failure)."
         ),
-        "catchup_if_missed": False,
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 36000,
         "channel_id": 1544953275877556334,
     }
 
