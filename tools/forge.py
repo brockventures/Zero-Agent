@@ -12361,6 +12361,13 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
         sort_key="created_at",
         reverse=False,
     )
+    recent_completed = _query_unified_rows(
+        "SELECT * FROM forge_builds WHERE status = 'completed'",
+        db_path=db_path,
+        sort_key="updated_at",
+        reverse=True,
+        limit=5,
+    )
 
     lines = [
         "### ⚒️ VULCAN (**V**erified **U**nattended **L**abor & **C**ode **A**nvil **N**ode)\n*FORGE Build Floor — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution*",
@@ -12391,6 +12398,16 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
             lines.append(
                 f"- 🛡️ **`{d['id']}` [{d['category'].upper()}] {d['title']}** in <#{d['channel_id']}> — {d['summary'][:100]}"
             )
+
+    lines.append("\n**Recently Completed Builds (Last 5):**")
+    if not recent_completed:
+        lines.append("- *No completed builds recorded yet.*")
+    else:
+        for rb in recent_completed:
+            title_txt = str(rb["title"] or "").strip()
+            if len(title_txt) > 72:
+                title_txt = title_txt[:69] + "..."
+            lines.append(f"- ✅ `{rb['id']}` — {title_txt} ({_now_pt_str(rb['updated_at'])})")
 
     return "\n".join(lines)
 

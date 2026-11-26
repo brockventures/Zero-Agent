@@ -624,6 +624,27 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("Ivy Projection Engine Upgrade", header)
         self.assertIn("**Active Background Tasks:**", header)
         self.assertIn("**Pending Action Approvals (Decisions):**", header)
+        self.assertIn("**Recently Completed Builds (Last 5):**", header)
+        self.assertIn("No completed builds recorded yet.", header)
+
+        # Insert 6 completed builds + 1 failed build; header should list strictly the 5 most recent completed builds
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            for idx in range(1, 7):
+                conn.execute(
+                    "INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at) "
+                    "VALUES (?, ?, 'obj', '/workspace', 2, 123, 'completed', ?, ?)",
+                    (f"fg-done-{idx}", f"Completed Build {idx}", 1700000000.0 + idx * 10, 1700000000.0 + idx * 100),
+                )
+            conn.execute(
+                "INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at) "
+                "VALUES ('fg-failed-9', 'Failed Build 9', 'obj', '/workspace', 2, 123, 'failed', 1700009000.0, 1700009000.0)"
+            )
+        header_with_recent = forge_mod.format_forge_channel_header(db_path=self.db_path)
+        self.assertNotIn("fg-done-1", header_with_recent)
+        self.assertNotIn("fg-failed-9", header_with_recent)
+        for idx in range(2, 7):
+            self.assertIn(f"fg-done-{idx}", header_with_recent)
+        self.assertLess(header_with_recent.index("fg-done-6"), header_with_recent.index("fg-done-2"))
 
         # Verify shared FORGE_DB_PATH resolution prefers /baseball/data/forge.db when /baseball/data exists
         with patch.object(forge_mod, "Path"):
