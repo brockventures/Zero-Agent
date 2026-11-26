@@ -367,6 +367,27 @@ def is_ivy_container() -> bool:
     )
 
 
+def _get_current_agent_key() -> str:
+    """Return the active agent identifier ('vulcan', 'ivy', or 'zero')."""
+    agent_name = os.getenv("AGENT_NAME", "").strip().lower()
+    try:
+        from tools.bridge_state import is_vulcan_agent
+    except ImportError:
+        try:
+            from bridge_state import is_vulcan_agent
+        except ImportError:
+            def is_vulcan_agent() -> bool:
+                return (
+                    os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+                    or os.getenv("DISCORD_CHANNEL_ID", "").strip() == str(FORGE_CHANNEL_ID)
+                )
+    if agent_name == "vulcan" or is_vulcan_agent():
+        return "vulcan"
+    if agent_name == "ivy" or is_ivy_container():
+        return "ivy"
+    return "zero"
+
+
 def _get_ancestor_pids() -> set[int]:
     """Return the set of ancestor PIDs up to PID 1 for the current process."""
     pids = set()
@@ -7616,6 +7637,11 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
     if build["touches_core_bridge"]:
         try:
             target_cid = int(target_ch)
+            target_agent = (
+                "vulcan"
+                if target_cid == FORGE_CHANNEL_ID
+                else ("ivy" if target_cid == BASEBALL_CHANNEL_ID else "zero")
+            )
             defer_baseball_post = (
                 target_cid == BASEBALL_CHANNEL_ID
                 and _get_discord_token(
@@ -7632,7 +7658,11 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
                     "**Approve Action:** Reloads the Discord bridge in-place to activate the update."
                 ),
                 handler_type="bridge_reload",
-                payload={"build_id": build_id, "reason": f"FORGE build {build_id} ({build['title']})"},
+                payload={
+                    "build_id": build_id,
+                    "reason": f"FORGE build {build_id} ({build['title']})",
+                    "target_agent": target_agent,
+                },
                 channel_id=target_cid,
                 ttl_seconds=86400.0,
                 db_path=db_path,
@@ -7871,11 +7901,21 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
                 pass
 
     recovered_decisions = recover_stale_executing_decisions(db_path=db_path)
+    cleared_reload_decisions: list[str] = []
+    try:
+        cleared_reload_decisions = clear_pending_reload_decisions_for_agent(
+            reason="Agent boot/reload",
+            db_path=db_path,
+            update_discord=_is_prod_forge_env(db_path),
+        )
+    except Exception:
+        cleared_reload_decisions = []
     return {
         "cleaned_worktrees": cleaned_wts,
         "reset_chunks": reset_chunks,
         "pruned_jobs": pruned_jobs,
         "recovered_decisions": recovered_decisions,
+        "cleared_reload_decisions": cleared_reload_decisions,
     }
 
 
@@ -11737,6 +11777,17 @@ def execute_approval_card(
             "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
         }
 
+    if ok and handler == "bridge_reload":
+        try:
+            clear_pending_reload_decisions_for_agent(
+                agent_name=_resolve_reload_decision_agent(updated_row or row),
+                reason=f"Superseded by approved reload {decision_id}",
+                exclude_decision_id=decision_id,
+                db_path=db_path,
+            )
+        except Exception:
+            pass
+
     res_dict = {
         "ok": ok,
         "decision_id": decision_id,
@@ -11818,6 +11869,128 @@ def dismiss_decision(
         "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
         "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
     }
+
+
+def _resolve_reload_decision_agent(row_or_dict: sqlite3.Row | dict) -> str:
+    """Resolve the owning agent ('zero', 'vulcan', or 'ivy') for a bridge_reload Decision Card."""
+    row_dict = dict(row_or_dict) if not isinstance(row_or_dict, dict) else row_or_dict
+    payload_raw = row_dict.get("payload_json")
+    payload_dict: dict[str, Any] = {}
+    if isinstance(payload_raw, str) and payload_raw.strip():
+        try:
+            parsed = json.loads(payload_raw)
+            if isinstance(parsed, dict):
+                payload_dict = parsed
+        except Exception:
+            payload_dict = {}
+    elif isinstance(payload_raw, dict):
+        payload_dict = payload_raw
+    elif isinstance(row_dict.get("payload"), dict):
+        payload_dict = row_dict["payload"]
+
+    target_agent = str(payload_dict.get("target_agent") or "").strip().lower()
+    if target_agent in ("zero", "vulcan", "ivy"):
+        return target_agent
+
+    try:
+        cid = int(row_dict.get("channel_id") or 0)
+    except (TypeError, ValueError):
+        cid = 0
+    if cid == FORGE_CHANNEL_ID:
+        return "vulcan"
+    if cid == BASEBALL_CHANNEL_ID:
+        return "ivy"
+    return "zero"
+
+
+def clear_pending_reload_decisions_for_agent(
+    agent_name: Optional[str] = None,
+    reason: str = "Agent reloaded",
+    exclude_decision_id: Optional[str] = None,
+    db_path: Path | str = FORGE_DB_PATH,
+    update_discord: bool = True,
+) -> list[str]:
+    """Auto-dismiss all pending bridge_reload Decision Cards belonging to the specified agent."""
+    if agent_name is not None and str(agent_name).strip():
+        raw_agent = str(agent_name).strip().lower()
+        if raw_agent in ("zero", "vulcan", "ivy"):
+            target_agent = raw_agent
+        elif "vulcan" in raw_agent:
+            target_agent = "vulcan"
+        elif "ivy" in raw_agent:
+            target_agent = "ivy"
+        elif "zero" in raw_agent:
+            target_agent = "zero"
+        else:
+            target_agent = raw_agent
+    else:
+        target_agent = _get_current_agent_key()
+
+    now = time.time()
+    clean_reason = str(reason or "Agent reloaded").strip()[:120]
+    receipt_text = f"Auto-cleared: {target_agent.title()} reloaded ({clean_reason})"
+    cleared_ids: list[str] = []
+    cleared_rows: list[dict] = []
+
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM forge_decisions WHERE handler_type = 'bridge_reload' AND status = 'pending'"
+        ).fetchall()
+        for r in rows:
+            dec_id = r["id"]
+            if exclude_decision_id and dec_id == exclude_decision_id:
+                continue
+            if _resolve_reload_decision_agent(r) != target_agent:
+                continue
+            cur = conn.execute(
+                "UPDATE forge_decisions SET status = 'dismissed', resolved_at = ?, receipt_text = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (now, receipt_text, dec_id),
+            )
+            if cur.rowcount > 0:
+                cleared_ids.append(dec_id)
+                updated_r = dict(r)
+                updated_r["status"] = "dismissed"
+                updated_r["resolved_at"] = now
+                updated_r["receipt_text"] = receipt_text
+                cleared_rows.append(updated_r)
+
+    if update_discord and cleared_rows and not _is_live_discord_blocked(requests.patch):
+        for r in cleared_rows:
+            msg_id = r.get("message_id")
+            ch_id = r.get("channel_id")
+            if not msg_id or not ch_id:
+                continue
+            try:
+                cid_int = int(ch_id)
+            except (TypeError, ValueError):
+                continue
+            token = _get_discord_token(
+                for_forge_channel=(cid_int == FORGE_CHANNEL_ID),
+                for_channel_id=cid_int,
+            )
+            if not token:
+                continue
+            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+            embed_data = render_decision_card_embed(r)
+            url = f"https://discord.com/api/v10/channels/{cid_int}/messages/{msg_id}"
+            try:
+                requests.patch(
+                    url,
+                    headers=headers,
+                    json={"content": "", "embeds": [embed_data], "components": []},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+    if cleared_ids:
+        try:
+            sync_forge_channel_header(db_path=db_path)
+        except Exception:
+            pass
+
+    return cleared_ids
 
 
 def _recover_stale_executing_decisions_in_conn(

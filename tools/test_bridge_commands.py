@@ -688,7 +688,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         flag_file = tmp_dir / "reload_bridge.flag"
         flag_exists_during_edit = []
 
-        def fake_execute_decision(decision_id, user_id):
+        def fake_execute_decision(decision_id, user_id, **_kwargs):
             flag_file.write_text("1", encoding="utf-8")
             return {
                 "ok": True,
@@ -733,6 +733,37 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def test_execute_bridge_reload_auto_clears_pending_reload_decisions_when_enabled(self):
+        """Verify execute_bridge_reload and execute_container_restart call clear_pending_reload_decisions_for_agent with active agent name when FORGE_TEST_AUTOCLEAR_RELOAD is enabled."""
+        import os
+        import tools.bridge_commands as bc
+
+        mock_bot = MagicMock()
+        mock_bot.close = AsyncMock()
+
+        for is_vulc, expected_agent in ((False, "zero"), (True, "vulcan")):
+            with patch.dict(os.environ, {"FORGE_TEST_AUTOCLEAR_RELOAD": "1"}, clear=False), \
+                 patch("tools.bridge_commands.is_vulcan_agent", return_value=is_vulc), \
+                 patch("tools.bridge_commands.record_restart_intent"), \
+                 patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"clean": True, "message": "Clean"}), \
+                 patch("tools.bridge_daemons.daemon_manager.shutdown_all", new_callable=AsyncMock), \
+                 patch("tools.classifier.warm_classifier.shutdown"), \
+                 patch("tools.forge.clear_pending_reload_decisions_for_agent", return_value=["dec-1"]) as mock_clear, \
+                 patch("os.execv"):
+                os.environ.pop("AGENT_NAME", None)
+                await bc.execute_bridge_reload(bot=mock_bot, announce=False, reason="Test auto-clear reload")
+            mock_clear.assert_called_once_with(agent_name=expected_agent, reason="Test auto-clear reload")
+
+        with patch.dict(os.environ, {"FORGE_TEST_AUTOCLEAR_RELOAD": "1"}, clear=False), \
+             patch("tools.bridge_commands.is_vulcan_agent", return_value=False), \
+             patch("tools.bridge_commands.record_restart_intent"), \
+             patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"clean": True, "message": "Clean"}), \
+             patch("tools.forge.clear_pending_reload_decisions_for_agent", return_value=["dec-2"]) as mock_clear_restart, \
+             patch("tools.bridge_commands.subprocess.run"):
+            os.environ.pop("AGENT_NAME", None)
+            await bc.execute_container_restart(reason="Test container restart")
+        mock_clear_restart.assert_called_once_with(agent_name="zero", reason="Test container restart")
 
 
 if __name__ == "__main__":

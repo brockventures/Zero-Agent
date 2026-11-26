@@ -8123,5 +8123,222 @@ def test_merge_remote_active_embeds_without_footer_ids(monkeypatch):
     assert "Completed Remote Build" not in merged
 
 
+def test_clear_pending_reload_decisions_for_agent_scoped_and_patches_discord(tmp_path, monkeypatch):
+    """Verify clear_pending_reload_decisions_for_agent clears only the target agent's pending bridge_reload cards across channels, patches Discord, and syncs header."""
+    db_p = tmp_path / "forge_autoclear.db"
+    forge_mod.init_forge_db(db_p)
+
+    # Zero reload cards across multiple Zero channels + explicit target_agent override
+    z_chat = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (Zero Chat)",
+        summary="Reload Zero after build 1.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-z-1", "target_agent": "zero"},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    z_ops = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (Zero Ops)",
+        summary="Reload Zero after build 2.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-z-2"},  # channel fallback -> zero
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    # Explicit target_agent='zero' posted in #forge must still belong to Zero
+    z_override = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (Zero Override)",
+        summary="Reload Zero from #forge.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-z-3", "target_agent": "zero"},
+        channel_id=forge_mod.FORGE_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+
+    # Sibling agents + non-reload Decision Card that MUST remain pending
+    v_card = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (Vulcan)",
+        summary="Reload Vulcan.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-v-1"},
+        channel_id=forge_mod.FORGE_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    i_card = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (Ivy)",
+        summary="Reload Ivy.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-i-1"},
+        channel_id=forge_mod.BASEBALL_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    non_reload = forge_mod.stage_decision(
+        category="ops",
+        title="Restart Service",
+        summary="Restart service.",
+        handler_type="shell",
+        payload={"command": "true"},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+
+    with forge_mod.get_db_connection(db_p) as conn:
+        conn.execute(
+            "UPDATE forge_decisions SET message_id = 900001 WHERE id = ?",
+            (z_chat,),
+        )
+
+    patch_calls = []
+    sync_calls = []
+
+    def _fake_patch(url, headers=None, json=None, timeout=None):
+        patch_calls.append({"url": url, "headers": headers, "json": json})
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda **kw: "fake-token")
+    monkeypatch.setattr(forge_mod.requests, "patch", _fake_patch)
+    monkeypatch.setattr(
+        forge_mod,
+        "sync_forge_channel_header",
+        lambda db_path=None, **kw: sync_calls.append(db_path) or True,
+    )
+
+    cleared = forge_mod.clear_pending_reload_decisions_for_agent(
+        agent_name="zero",
+        reason="Manual Zero reload",
+        db_path=db_p,
+    )
+    assert set(cleared) == {z_chat, z_ops, z_override}
+    assert sync_calls == [db_p]
+    assert len(patch_calls) == 1
+    assert patch_calls[0]["url"].endswith(f"/channels/{forge_mod.ZERO_CHAT_CHANNEL_ID}/messages/900001")
+    assert patch_calls[0]["json"]["components"] == []
+    assert patch_calls[0]["json"]["embeds"][0]["footer"]["text"].startswith("Dismissed · ")
+
+    with forge_mod.get_db_connection(db_p) as conn:
+        rows = {
+            r["id"]: dict(r)
+            for r in conn.execute("SELECT id, status, resolved_at, receipt_text FROM forge_decisions").fetchall()
+        }
+    for zid in (z_chat, z_ops, z_override):
+        assert rows[zid]["status"] == "dismissed"
+        assert rows[zid]["resolved_at"] is not None
+        assert "Auto-cleared: Zero reloaded (Manual Zero reload)" == rows[zid]["receipt_text"]
+    assert rows[v_card]["status"] == "pending"
+    assert rows[i_card]["status"] == "pending"
+    assert rows[non_reload]["status"] == "pending"
+
+
+def test_execute_decision_bridge_reload_clears_sibling_pending_for_same_agent_only(tmp_path, monkeypatch):
+    """Verify approving one bridge_reload Decision Card auto-clears sibling pending bridge_reload cards for that agent only."""
+    db_p = tmp_path / "forge_reload_siblings.db"
+    forge_mod.init_forge_db(db_p)
+    fake_data_dir = tmp_path / "data"
+    fake_data_dir.mkdir(parents=True)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", fake_data_dir)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda **kw: False)
+
+    z1 = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Zero 1",
+        summary="Reload Zero 1.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-z-a", "target_agent": "zero"},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    z2 = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Zero 2",
+        summary="Reload Zero 2.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-z-b", "target_agent": "zero"},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    v1 = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Vulcan 1",
+        summary="Reload Vulcan 1.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-v-a", "target_agent": "vulcan"},
+        channel_id=forge_mod.FORGE_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+
+    res = forge_mod.execute_decision(z1, user_id=forge_mod.OWNER_USER_ID, db_path=db_p)
+    assert res["ok"] is True
+    assert res["status"] == "approved"
+
+    with forge_mod.get_db_connection(db_p) as conn:
+        statuses = {
+            r["id"]: (r["status"], r["receipt_text"])
+            for r in conn.execute("SELECT id, status, receipt_text FROM forge_decisions").fetchall()
+        }
+    assert statuses[z1][0] == "approved"
+    assert statuses[z2][0] == "dismissed"
+    assert f"Superseded by approved reload {z1}" in (statuses[z2][1] or "")
+    assert statuses[v1][0] == "pending"
+
+
+def test_reconcile_forge_on_boot_auto_clears_pending_reload_decisions_for_booting_agent(tmp_path, monkeypatch):
+    """Verify reconcile_forge_on_boot auto-clears pending bridge_reload decisions for the booting agent only."""
+    db_p = tmp_path / "forge_reconcile_reload.db"
+    forge_mod.init_forge_db(db_p)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(forge_mod, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge_mod, "is_ivy_container", lambda: False)
+    monkeypatch.setenv("AGENT_NAME", "vulcan")
+
+    v_pending = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Vulcan",
+        summary="Reload Vulcan.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-v-boot", "target_agent": "vulcan"},
+        channel_id=forge_mod.FORGE_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    z_pending = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Zero",
+        summary="Reload Zero.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-z-boot", "target_agent": "zero"},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+    i_pending = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Ivy",
+        summary="Reload Ivy.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-i-boot", "target_agent": "ivy"},
+        channel_id=forge_mod.BASEBALL_CHANNEL_ID,
+        db_path=db_p,
+    )["decision_id"]
+
+    res = forge_mod.reconcile_forge_on_boot(db_path=db_p)
+    assert res["cleared_reload_decisions"] == [v_pending]
+
+    with forge_mod.get_db_connection(db_p) as conn:
+        statuses = {
+            r["id"]: r["status"]
+            for r in conn.execute("SELECT id, status FROM forge_decisions").fetchall()
+        }
+    assert statuses[v_pending] == "dismissed"
+    assert statuses[z_pending] == "pending"
+    assert statuses[i_pending] == "pending"
+
+
 if __name__ == "__main__":
     unittest.main()

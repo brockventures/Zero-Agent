@@ -245,6 +245,22 @@ def _docker_container_name() -> str:
     return "discord-vulcan-agent" if is_vulcan_agent() else "discord-antigravity-agent"
 
 
+async def _auto_clear_pending_reload_decisions(reason: str) -> None:
+    """Best-effort dismiss pending bridge_reload Decision Cards for the active agent before reload/restart."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("FORGE_TEST_AUTOCLEAR_RELOAD"):
+        return
+    try:
+        from tools.forge import clear_pending_reload_decisions_for_agent
+
+        await asyncio.to_thread(
+            clear_pending_reload_decisions_for_agent,
+            agent_name=_agent_display_name().lower(),
+            reason=reason,
+        )
+    except Exception as ace:
+        print(f"[Bridge] Warning auto-clearing pending reload decisions: {ace}")
+
+
 async def execute_bridge_reload(
     bot: Optional[discord.Client] = None,
     channel: Optional[discord.abc.Messageable] = None,
@@ -353,6 +369,7 @@ async def execute_bridge_reload(
 
         # Clean pending reload flag so immediate reloads do not re-trigger post-turn
         _clear_reload_flags()
+        await _auto_clear_pending_reload_decisions(reason)
 
         if bot:
             try:
@@ -403,6 +420,8 @@ async def execute_container_restart(
             print(f"[Bridge] 🚀 Pre-restart git sync: {sync_res.get('message')}")
     except Exception as gse:
         print(f"[Bridge] Warning during pre-restart git sync: {gse}")
+
+    await _auto_clear_pending_reload_decisions(reason)
 
     try:
         from tools.nas_docker_mcp import _resolve_nas_config
@@ -570,7 +589,7 @@ async def handle_button_choice(
     if from_choice_button:
         mark_pending_choice_button_turn(interaction.channel_id, choice_text)
         try:
-            setattr(selected_msg, "from_choice_button", True)
+            selected_msg.from_choice_button = True
         except Exception:
             pass
     await turn_queue.put({
