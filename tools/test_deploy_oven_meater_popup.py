@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for tools/deploy_oven_meater_popup.py."""
 
 from __future__ import annotations
@@ -412,7 +411,17 @@ console.log(JSON.stringify({
     hasUpperOven: modalOpenHtml.includes("Upper Oven"),
     hasLowerOven: modalOpenHtml.includes("Lower Oven") && modalOpenHtml.includes("350°F") && modalOpenHtml.includes("Convection Roast"),
     hasPreset: modalOpenHtml.includes("Brisket (203°F)"),
-    hasGaugeSvg: modalOpenHtml.includes("cm-gauge-svg"),
+    hasGaugeSvg: modalOpenHtml.includes("cm-gauge-svg") && modalOpenHtml.includes('viewBox="0 0 172 156"'),
+    hasChartHeader: modalOpenHtml.includes("Temperature History &amp; Projected Trend"),
+    hasChartRatePill: modalOpenHtml.includes("+0.65°F/min"),
+    hasChartSvg: modalOpenHtml.includes("cm-chart-svg") && modalOpenHtml.includes('viewBox="0 0 680 210"'),
+    hasChartFutureZone: modalOpenHtml.includes("cm-chart-future-zone"),
+    hasChartTargetLine: modalOpenHtml.includes("cm-chart-target-line") && modalOpenHtml.includes("Target 165°F"),
+    hasChartPullLine: modalOpenHtml.includes("cm-chart-pull-line") && modalOpenHtml.includes("Pull 160°F"),
+    hasChartHistoryLine: modalOpenHtml.includes("cm-chart-history-line"),
+    hasChartTrendLine: modalOpenHtml.includes("cm-chart-trend-line"),
+    hasChartNowDot: modalOpenHtml.includes("cm-chart-now-dot"),
+    hasLargeModalCss: skeletonHtml.includes("min(92vw, 780px)") && skeletonHtml.includes("backdrop-filter: blur(12px)"),
   },
   serviceCalls,
 }));
@@ -524,3 +533,135 @@ def test_resolve_ha_credentials_uses_env_without_hardcoded_ips(monkeypatch: pyte
     url, tok = mod.resolve_ha_credentials()
     assert url == "http://198.51.100.42:8123"
     assert tok == "test-token"
+
+
+def test_cook_history_fetch_caching_downsampling_and_trend_fallbacks() -> None:
+    patched = mod.patch_card_js(REALISTIC_CARD_FIXTURE)
+    harness = (
+        patched
+        + """
+async function run() {
+  const card = new BrockHouseCyclesCard();
+  const cookBackdrop = {
+    classList: { add: () => {}, remove: () => {} },
+    setAttribute: () => {},
+  };
+  const cookModal = { innerHTML: "" };
+  card.shadowRoot = {
+    getElementById: (id) => (id === "cookBackdrop" ? cookBackdrop : id === "cookModal" ? cookModal : null),
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  // Build 200 history items mixing minimal_response ({s, lu}) and full ({state, last_updated})
+  const rawHistory = [];
+  for (let i = 0; i < 200; i++) {
+    const tSec = nowSec - (200 - i) * 30;
+    const temp = (95 + i * 0.15).toFixed(2);
+    if (i % 2 === 0) {
+      rawHistory.push({ s: temp, lu: tSec });
+    } else {
+      rawHistory.push({ state: temp, last_updated: new Date(tSec * 1000).toISOString() });
+    }
+  }
+  rawHistory.push({ s: "unavailable", lu: nowSec - 5 });
+
+  let apiCalls = 0;
+  let lastApiPath = "";
+  card._hass = {
+    callApi: async (method, path) => {
+      apiCalls += 1;
+      lastApiPath = `${method}:${path}`;
+      return [rawHistory];
+    },
+    states: {
+      "sensor.meater_meater_internal_temperature": { state: "128.5", attributes: {} },
+      "sensor.meater_meater_ambient_temperature": { state: "325.0", attributes: {} },
+      "sensor.meater_meater_battery": { state: "92", attributes: {} },
+      "sensor.meater_meater_eta": { state: "50", attributes: { rate_f_per_min: 0.72 } },
+      "sensor.meater_meater_cook_status": { state: "Cooking", attributes: { target_temp_f: 165 } },
+      "binary_sensor.meater_meater_connected": { state: "on", attributes: {} },
+      "number.meater_meater_target_temperature": { state: "165", attributes: { min: 100, max: 225 } },
+    },
+  };
+
+  card._openCookModal();
+  const pts1 = await card._fetchCookHistory(false);
+  const callsAfterFirst = apiCalls;
+  // Second call within 30s TTL uses cache
+  const pts2 = await card._fetchCookHistory(false);
+  const callsAfterCached = apiCalls;
+  // Forced call bypasses TTL
+  const pts3 = await card._fetchCookHistory(true);
+  const callsAfterForced = apiCalls;
+
+  // Test fallback 1: (target - internal) / etaMin when rate_f_per_min is null
+  card._hass.states["sensor.meater_meater_eta"].attributes = {};
+  const meaterEtaFallback = card._evalMeaterStatus();
+  const projEtaFallback = card._computeCookProjection(meaterEtaFallback, pts1);
+
+  // Test fallback 2: 20-30m linear regression when both rate_f_per_min and etaMin are null
+  card._hass.states["sensor.meater_meater_eta"].state = "unknown";
+  const meaterRegFallback = card._evalMeaterStatus();
+  const projRegFallback = card._computeCookProjection(meaterRegFallback, pts1);
+
+  // Test 180m cap on very slow climb rate
+  card._hass.states["sensor.meater_meater_eta"].attributes = { rate_f_per_min: 0.05 };
+  const meaterSlow = card._evalMeaterStatus();
+  const projSlow = card._computeCookProjection(meaterSlow, pts1);
+
+  // Test empty/idle fallback when no probe data exists
+  card._cookHistoryPoints = [];
+  card._hass.states["sensor.meater_meater_internal_temperature"].state = "unavailable";
+  const meaterEmpty = card._evalMeaterStatus();
+  const emptySvg = card._buildCookChartSvg(meaterEmpty, []);
+
+  console.log(JSON.stringify({
+    callsAfterFirst,
+    callsAfterCached,
+    callsAfterForced,
+    hasHistoryPath: lastApiPath.startsWith("GET:history/period/") && lastApiPath.includes("sensor.meater_meater_internal_temperature"),
+    ptsCount: pts1.length,
+    sameCachedRef: pts1 === pts2,
+    forcedCount: pts3.length,
+    lastPtIsLive: Math.abs(pts1[pts1.length - 1].temp - 128.5) < 0.01,
+    etaFallbackRate: Number(projEtaFallback.effectiveRate.toFixed(3)),
+    regFallbackHasProjection: projRegFallback.hasProjection && projRegFallback.effectiveRate > 0.1,
+    slowCappedAt180: projSlow.projMins === 180,
+    modalHasEtaLabel: cookModal.innerHTML.includes("cm-chart-eta-label"),
+    emptySvgHasFallback: emptySvg.includes("Waiting for MEATER+ temperature telemetry"),
+  }));
+}
+run();
+"""
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".js", encoding="utf-8", delete=False) as tmp:
+        tmp.write(harness)
+        tmp_path = Path(tmp.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        res = json.loads(proc.stdout.strip())
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    assert res["callsAfterFirst"] == 1
+    assert res["callsAfterCached"] == 1
+    assert res["callsAfterForced"] == 2
+    assert res["hasHistoryPath"] is True
+    assert res["ptsCount"] == 160
+    assert res["sameCachedRef"] is True
+    assert res["forcedCount"] == 160
+    assert res["lastPtIsLive"] is True
+    # (165 - 128.5) / 50 = 0.73
+    assert res["etaFallbackRate"] == 0.73
+    assert res["regFallbackHasProjection"] is True
+    assert res["slowCappedAt180"] is True
+    assert res["modalHasEtaLabel"] is True
+    assert res["emptySvgHasFallback"] is True
+

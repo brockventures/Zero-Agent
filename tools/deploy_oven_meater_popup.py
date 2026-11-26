@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Deploy 3D floorplan LG Oven & MEATER+ badges and Cook Monitor popup to Home Assistant.
 
 Steps executed in full deploy mode:
@@ -236,76 +235,84 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
           display: flex;
         }
         .cook-modal {
-          width: min(94vw, 440px);
-          max-height: 90%;
+          width: min(92vw, 780px);
+          max-height: 92%;
           overflow-y: auto;
-          background: rgba(14, 22, 36, 0.98);
-          border: 1px solid rgba(255, 152, 78, 0.36);
-          border-radius: 20px;
-          box-shadow: 0 24px 64px rgba(0, 0, 0, 0.72);
-          padding: 16px 18px 18px;
+          background: rgba(12, 20, 34, 0.96);
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          border: 1.5px solid rgba(255, 152, 78, 0.42);
+          border-radius: 24px;
+          box-shadow: 0 28px 72px rgba(0, 0, 0, 0.78), 0 0 36px rgba(255, 138, 60, 0.14);
+          padding: 22px 26px 24px;
           color: #eef5fc;
           display: flex;
           flex-direction: column;
-          gap: 12px;
+          gap: 16px;
         }
         .cm-head {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 10px;
+          gap: 14px;
         }
         .cm-title-wrap {
           display: flex;
           align-items: center;
-          gap: 9px;
+          gap: 12px;
           min-width: 0;
         }
         .cm-head-icon {
-          width: 32px;
-          height: 32px;
-          border-radius: 10px;
-          background: rgba(255, 146, 72, 0.16);
-          border: 1px solid rgba(255, 146, 72, 0.42);
+          width: 42px;
+          height: 42px;
+          border-radius: 12px;
+          background: rgba(255, 146, 72, 0.18);
+          border: 1px solid rgba(255, 146, 72, 0.48);
           color: #ffb578;
           display: inline-flex;
           align-items: center;
           justify-content: center;
           flex-shrink: 0;
         }
-        .cm-head-icon svg { width: 18px; height: 18px; }
-        .cm-title { font-size: 15.5px; font-weight: 700; color: #f8fafc; }
-        .cm-sub { font-size: 11.5px; color: #9bb0c9; margin-top: 1px; }
+        .cm-head-icon svg { width: 24px; height: 24px; }
+        .cm-title { font-size: 22px; font-weight: 800; color: #f8fafc; letter-spacing: -0.01em; }
+        .cm-sub { font-size: 14px; color: #a3bad4; margin-top: 2px; }
+        .cook-modal .rd-close {
+          width: 38px;
+          height: 38px;
+          font-size: 22px;
+          border-radius: 11px;
+        }
         .cm-section-card {
-          background: rgba(255, 255, 255, 0.04);
-          border: 1px solid rgba(255, 255, 255, 0.09);
-          border-radius: 15px;
-          padding: 12px 13px;
+          background: rgba(255, 255, 255, 0.045);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 18px;
+          padding: 16px 18px;
           display: flex;
           flex-direction: column;
-          gap: 10px;
+          gap: 14px;
         }
         .cm-sec-head {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 8px;
+          gap: 10px;
         }
         .cm-sec-label {
           display: inline-flex;
           align-items: center;
-          gap: 6px;
-          font-size: 11.5px;
+          gap: 8px;
+          font-size: 13.5px;
           font-weight: 700;
           letter-spacing: 0.04em;
           text-transform: uppercase;
-          color: #a9bfd8;
+          color: #b4cae3;
         }
-        .cm-sec-label svg { width: 14px; height: 14px; color: #ffb272; }
+        .cm-sec-label svg { width: 17px; height: 17px; color: #ffb272; }
         .cm-status-pill {
-          font-size: 11px;
+          font-size: 13px;
           font-weight: 700;
-          padding: 3px 9px;
+          padding: 5px 12px;
           border-radius: 999px;
           border: 1px solid rgba(148, 163, 184, 0.35);
           background: rgba(148, 163, 184, 0.14);
@@ -340,12 +347,12 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
         .cm-gauge-row {
           display: flex;
           align-items: center;
-          gap: 14px;
+          gap: 20px;
         }
         .cm-gauge-wrap {
           position: relative;
-          width: 128px;
-          height: 116px;
+          width: 172px;
+          height: 156px;
           flex-shrink: 0;
         }
         .cm-gauge-svg {
@@ -360,73 +367,127 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
           flex-direction: column;
           align-items: center;
           justify-content: center;
-          padding-top: 6px;
+          padding-top: 8px;
           pointer-events: none;
         }
         .cm-gauge-temp {
-          font-size: 24px;
+          font-size: 39px;
           font-weight: 800;
           letter-spacing: -0.03em;
           color: #ffffff;
           line-height: 1.05;
         }
         .cm-gauge-target {
-          font-size: 11px;
-          font-weight: 600;
-          color: #9cb6d4;
-          margin-top: 2px;
+          font-size: 14.5px;
+          font-weight: 700;
+          color: #a7c1df;
+          margin-top: 4px;
         }
         .cm-stats-grid {
           flex: 1 1 0;
           display: grid;
           grid-template-columns: repeat(2, 1fr);
-          gap: 7px;
+          gap: 10px;
         }
         .cm-stat-box {
-          background: rgba(255, 255, 255, 0.04);
-          border: 1px solid rgba(255, 255, 255, 0.07);
-          border-radius: 10px;
-          padding: 6px 8px;
+          background: rgba(255, 255, 255, 0.045);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 13px;
+          padding: 10px 13px;
         }
         .cm-stat-k {
-          font-size: 10px;
+          font-size: 12px;
           font-weight: 700;
           text-transform: uppercase;
           letter-spacing: 0.04em;
-          color: #849ebb;
+          color: #8da8c7;
         }
         .cm-stat-v {
-          font-size: 12.5px;
-          font-weight: 700;
+          font-size: 18.5px;
+          font-weight: 800;
           color: #f1f5f9;
-          margin-top: 2px;
+          margin-top: 4px;
           white-space: nowrap;
+        }
+        .cm-chart-card {
+          background: rgba(7, 13, 24, 0.58);
+          border: 1px solid rgba(255, 255, 255, 0.09);
+          border-radius: 14px;
+          padding: 12px 14px 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .cm-chart-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .cm-chart-title {
+          font-size: 13px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: #b4cae3;
+        }
+        .cm-chart-badges {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .cm-chart-pill {
+          font-size: 12px;
+          font-weight: 700;
+          padding: 3px 10px;
+          border-radius: 999px;
+          background: rgba(255, 146, 72, 0.16);
+          border: 1px solid rgba(255, 146, 72, 0.45);
+          color: #ffd9b8;
+          white-space: nowrap;
+        }
+        .cm-chart-pill.eta {
+          background: rgba(56, 189, 248, 0.16);
+          border-color: rgba(56, 189, 248, 0.48);
+          color: #bae6fd;
+        }
+        .cm-chart-svg-wrap {
+          width: 100%;
+          height: 210px;
+          position: relative;
+        }
+        .cm-chart-svg {
+          width: 100%;
+          height: 210px;
+          display: block;
         }
         .cm-stepper-card {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 8px;
-          background: rgba(255, 255, 255, 0.04);
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          border-radius: 12px;
-          padding: 8px 10px;
+          gap: 12px;
+          background: rgba(255, 255, 255, 0.045);
+          border: 1px solid rgba(255, 255, 255, 0.09);
+          border-radius: 14px;
+          padding: 11px 14px;
         }
         .cm-step-group {
           display: flex;
           align-items: center;
-          gap: 5px;
+          gap: 8px;
         }
         .cm-step-btn {
-          min-width: 34px;
-          height: 30px;
-          padding: 0 7px;
-          border-radius: 9px;
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          background: rgba(255, 255, 255, 0.08);
+          min-width: 52px;
+          height: 42px;
+          padding: 0 11px;
+          border-radius: 11px;
+          border: 1px solid rgba(255, 255, 255, 0.22);
+          background: rgba(255, 255, 255, 0.09);
           color: #ffffff;
-          font-size: 12px;
-          font-weight: 700;
+          font-size: 15px;
+          font-weight: 800;
           cursor: pointer;
         }
         .cm-step-btn:hover {
@@ -435,87 +496,94 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
         }
         .cm-step-readout {
           text-align: center;
-          min-width: 68px;
+          min-width: 96px;
         }
         .cm-step-readout-val {
-          font-size: 16px;
+          font-size: 24px;
           font-weight: 800;
           color: #ffffff;
         }
         .cm-step-readout-lbl {
-          font-size: 9.5px;
-          color: #8ea7c4;
+          font-size: 11.5px;
+          font-weight: 700;
+          color: #96b0ce;
           text-transform: uppercase;
           letter-spacing: 0.04em;
         }
         .cm-presets {
           display: flex;
           flex-wrap: wrap;
-          gap: 5px;
+          gap: 7px;
         }
         .cm-preset-btn {
-          border: 1px solid rgba(255, 255, 255, 0.14);
-          background: rgba(255, 255, 255, 0.05);
-          color: #c8daee;
-          font-size: 10.5px;
+          border: 1px solid rgba(255, 255, 255, 0.16);
+          background: rgba(255, 255, 255, 0.06);
+          color: #d0e2f4;
+          font-size: 13px;
           font-weight: 700;
-          padding: 5px 8.5px;
+          padding: 7px 13px;
           border-radius: 999px;
           cursor: pointer;
           transition: background 0.14s ease, border-color 0.14s ease;
         }
         .cm-preset-btn:hover {
-          background: rgba(255, 255, 255, 0.13);
+          background: rgba(255, 255, 255, 0.14);
         }
         .cm-preset-btn.active {
-          border-color: rgba(255, 146, 72, 0.85);
-          background: rgba(255, 146, 72, 0.24);
+          border-color: rgba(255, 146, 72, 0.88);
+          background: rgba(255, 146, 72, 0.26);
           color: #ffffff;
         }
         .cm-oven-grid {
           display: grid;
           grid-template-columns: repeat(2, 1fr);
-          gap: 8px;
+          gap: 12px;
         }
         .cm-oven-card {
-          background: rgba(255, 255, 255, 0.035);
-          border: 1px solid rgba(255, 255, 255, 0.09);
-          border-radius: 12px;
-          padding: 9px 10px;
+          background: rgba(255, 255, 255, 0.04);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 14px;
+          padding: 13px 15px;
           display: flex;
           flex-direction: column;
-          gap: 4px;
+          gap: 6px;
         }
         .cm-oven-card.active {
-          border-color: rgba(255, 148, 72, 0.72);
-          background: rgba(255, 136, 56, 0.12);
+          border-color: rgba(255, 148, 72, 0.75);
+          background: rgba(255, 136, 56, 0.13);
         }
         .cm-oven-top {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 6px;
+          gap: 8px;
         }
         .cm-oven-name {
-          font-size: 11.5px;
+          font-size: 14.5px;
           font-weight: 700;
           color: #e2ecf7;
         }
         .cm-oven-temp {
-          font-size: 20px;
+          font-size: 28px;
           font-weight: 800;
           color: #ffffff;
           line-height: 1.1;
         }
         .cm-oven-meta {
-          font-size: 11px;
-          color: #9bb2cb;
+          font-size: 13.5px;
+          color: #a3bad4;
         }
         .cm-foot {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          padding-top: 2px;
+          padding-top: 4px;
+        }
+        .cook-modal .cm-foot .rd-mini-btn {
+          font-size: 13.5px;
+          font-weight: 700;
+          padding: 8px 16px;
+          border-radius: 11px;
         }
         /* OVEN_MEATER_CSS_END */"""
 
@@ -764,6 +832,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
   _openCookModal() {
     this._cookModalOpen = true;
     this._renderCookModal();
+    this._fetchCookHistory();
   }
 
   _closeCookModal() {
@@ -773,6 +842,252 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
       backdrop.classList.remove("open");
       backdrop.setAttribute("aria-hidden", "true");
     }
+  }
+
+  _formatClockTime(tsMs) {
+    if (!Number.isFinite(tsMs) || tsMs <= 0) return "--";
+    const d = new Date(tsMs);
+    let h = d.getHours();
+    const m = d.getMinutes();
+    const ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12 || 12;
+    const mm = m < 10 ? `0${m}` : `${m}`;
+    return `${h}:${mm} ${ampm}`;
+  }
+
+  _fetchCookHistory(force = false) {
+    const nowMs = Date.now();
+    const ttlMs = 30 * 1000;
+    if (
+      !force &&
+      Array.isArray(this._cookHistoryPoints) &&
+      this._cookHistoryFetchedAt &&
+      nowMs - this._cookHistoryFetchedAt < ttlMs
+    ) {
+      return Promise.resolve(this._cookHistoryPoints);
+    }
+    if (this._cookHistoryInFlight) {
+      return this._cookHistoryInFlight;
+    }
+    const entityId = OVEN_MEATER_CONFIG.meater.internalEntity;
+    if (!this._hass || typeof this._hass.callApi !== "function") {
+      const liveOnly = this._readNumericState(entityId);
+      this._cookHistoryPoints =
+        liveOnly !== null && liveOnly > 0 ? [{ ts: nowMs, temp: liveOnly }] : this._cookHistoryPoints || [];
+      this._cookHistoryFetchedAt = nowMs;
+      return Promise.resolve(this._cookHistoryPoints);
+    }
+
+    this._cookHistoryLoading = true;
+    const startIso = new Date(nowMs - 4 * 3600 * 1000).toISOString();
+    const apiPath = `history/period/${encodeURIComponent(startIso)}?filter_entity_id=${encodeURIComponent(entityId)}&minimal_response&no_attributes&significant_changes_only=0`;
+
+    this._cookHistoryInFlight = Promise.resolve(this._hass.callApi("GET", apiPath))
+      .then((raw) => {
+        const rows = Array.isArray(raw) ? (Array.isArray(raw[0]) ? raw[0] : raw) : [];
+        let pts = [];
+        for (const item of rows) {
+          if (!item || typeof item !== "object") continue;
+          const sVal = item.s !== undefined ? item.s : item.state;
+          if (sVal === undefined || sVal === null || sVal === "" || sVal === "unavailable" || sVal === "unknown") {
+            continue;
+          }
+          const temp = Number(sVal);
+          if (Number.isNaN(temp) || temp <= 0 || temp > 600) continue;
+
+          let ts = NaN;
+          if (item.lu !== undefined && item.lu !== null) {
+            const luNum = Number(item.lu);
+            if (!Number.isNaN(luNum)) {
+              ts = luNum < 1e11 ? Math.round(luNum * 1000) : Math.round(luNum);
+            } else {
+              ts = Date.parse(String(item.lu));
+            }
+          } else if (item.last_updated || item.last_changed) {
+            ts = Date.parse(String(item.last_updated || item.last_changed));
+          }
+          if (!Number.isFinite(ts) || ts <= 0) continue;
+          pts.push({ ts, temp });
+        }
+
+        pts.sort((a, b) => a.ts - b.ts);
+
+        const liveTemp = this._readNumericState(entityId);
+        const curNow = Date.now();
+        if (liveTemp !== null && liveTemp > 0) {
+          if (
+            pts.length === 0 ||
+            Math.abs(curNow - pts[pts.length - 1].ts) > 1000 ||
+            pts[pts.length - 1].temp !== liveTemp
+          ) {
+            pts.push({ ts: curNow, temp: liveTemp });
+          }
+        }
+
+        if (pts.length > 160) {
+          const maxPts = 160;
+          const sampled = [pts[0]];
+          const step = (pts.length - 1) / (maxPts - 1);
+          for (let i = 1; i < maxPts - 1; i++) {
+            sampled.push(pts[Math.round(i * step)]);
+          }
+          sampled.push(pts[pts.length - 1]);
+          pts = sampled;
+        }
+
+        this._cookHistoryPoints = pts;
+        this._cookHistoryFetchedAt = curNow;
+        this._cookHistoryLoading = false;
+        this._cookHistoryInFlight = null;
+        if (this._cookModalOpen) {
+          this._renderCookModal();
+        }
+        return pts;
+      })
+      .catch(() => {
+        this._cookHistoryLoading = false;
+        this._cookHistoryInFlight = null;
+        if (!Array.isArray(this._cookHistoryPoints)) {
+          this._cookHistoryPoints = [];
+        }
+        if (this._cookModalOpen) {
+          this._renderCookModal();
+        }
+        return this._cookHistoryPoints;
+      });
+
+    return this._cookHistoryInFlight;
+  }
+
+  _computeCookProjection(meater, historyPoints) {
+    const nowMs = Date.now();
+    const rawPts = Array.isArray(historyPoints) ? historyPoints : [];
+    const pts = [];
+    for (const p of rawPts) {
+      if (p && Number.isFinite(p.ts) && Number.isFinite(p.temp) && p.temp > 0) {
+        pts.push({ ts: p.ts, temp: p.temp });
+      }
+    }
+    pts.sort((a, b) => a.ts - b.ts);
+
+    const liveTemp = meater.internalF !== null && Number.isFinite(meater.internalF) ? meater.internalF : null;
+    if (liveTemp !== null && liveTemp > 0) {
+      if (pts.length === 0) {
+        pts.push({ ts: nowMs, temp: liveTemp });
+      } else {
+        const last = pts[pts.length - 1];
+        if (nowMs - last.ts > 2000 || Math.abs(last.temp - liveTemp) > 0.01) {
+          pts.push({ ts: Math.max(nowMs, last.ts + 1000), temp: liveTemp });
+        }
+      }
+    }
+
+    const nowPt = pts.length ? pts[pts.length - 1] : null;
+    const currentTemp = nowPt ? nowPt.temp : liveTemp;
+    const nowTs = nowPt ? nowPt.ts : nowMs;
+    const targetF = meater.targetF !== null ? meater.targetF : 165;
+    const pullOffset = OVEN_MEATER_CONFIG.meater.carryoverPullOffsetF || 5;
+    const pullF = targetF - pullOffset;
+
+    let regRate = null;
+    if (pts.length >= 2) {
+      const windowStart = nowTs - 30 * 60 * 1000;
+      let winPts = pts.filter((p) => p.ts >= windowStart);
+      if (winPts.length < 2) {
+        winPts = pts.slice(-Math.min(pts.length, 10));
+      }
+      const spanMin = (winPts[winPts.length - 1].ts - winPts[0].ts) / 60000;
+      if (winPts.length >= 2 && spanMin >= 0.5) {
+        const t0 = winPts[0].ts;
+        let sumT = 0;
+        let sumY = 0;
+        let sumTY = 0;
+        let sumTT = 0;
+        const n = winPts.length;
+        for (const p of winPts) {
+          const t = (p.ts - t0) / 60000;
+          const y = p.temp;
+          sumT += t;
+          sumY += y;
+          sumTY += t * y;
+          sumTT += t * t;
+        }
+        const denom = n * sumTT - sumT * sumT;
+        if (Math.abs(denom) > 1e-6) {
+          regRate = (n * sumTY - sumT * sumY) / denom;
+        }
+      }
+    }
+
+    const etaFallbackRate =
+      currentTemp !== null &&
+      meater.etaMin !== null &&
+      Number.isFinite(meater.etaMin) &&
+      meater.etaMin > 0 &&
+      targetF > currentTemp
+        ? (targetF - currentTemp) / meater.etaMin
+        : null;
+
+    let effectiveRate = null;
+    if (meater.rateFPerMin !== null && Number.isFinite(meater.rateFPerMin) && meater.rateFPerMin > 0.02) {
+      effectiveRate = meater.rateFPerMin;
+    } else if (etaFallbackRate !== null && etaFallbackRate > 0.02) {
+      effectiveRate = etaFallbackRate;
+    } else if (regRate !== null && regRate > 0.02) {
+      effectiveRate = regRate;
+    }
+
+    const displayRate =
+      meater.rateFPerMin !== null && Number.isFinite(meater.rateFPerMin)
+        ? meater.rateFPerMin
+        : effectiveRate !== null
+          ? effectiveRate
+          : regRate;
+
+    let hasProjection = false;
+    let projMins = 0;
+    let endTemp = currentTemp;
+    let endTs = nowTs;
+    let pullTs = null;
+    let pullClock = null;
+    let targetClock = null;
+    let etaClockLabel = "";
+
+    if (currentTemp !== null && effectiveRate !== null && effectiveRate > 0.02 && currentTemp < targetF) {
+      hasProjection = true;
+      const rawMinsToTarget = (targetF - currentTemp) / effectiveRate;
+      projMins = Math.min(180, Math.max(1, rawMinsToTarget));
+      endTemp = rawMinsToTarget <= 180 ? targetF : currentTemp + effectiveRate * 180;
+      endTs = nowTs + projMins * 60 * 1000;
+      targetClock = this._formatClockTime(endTs);
+
+      if (currentTemp < pullF) {
+        const rawMinsToPull = (pullF - currentTemp) / effectiveRate;
+        if (rawMinsToPull <= 180) {
+          pullTs = nowTs + rawMinsToPull * 60 * 1000;
+          pullClock = this._formatClockTime(pullTs);
+        }
+      }
+      etaClockLabel = pullClock ? `Pull ~${pullClock}` : `ETA ~${targetClock}`;
+    }
+
+    return {
+      pts,
+      nowTs,
+      currentTemp,
+      targetF,
+      pullF,
+      effectiveRate,
+      displayRate,
+      hasProjection,
+      projMins,
+      endTemp,
+      endTs,
+      pullTs,
+      pullClock,
+      targetClock,
+      etaClockLabel,
+    };
   }
 
   _stepMeaterTargetTemp(delta) {
@@ -795,9 +1110,9 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
   }
 
   _buildCookGaugeSvg(meater) {
-    const cx = 64;
-    const cy = 62;
-    const r = 46;
+    const cx = 86;
+    const cy = 84;
+    const r = 64;
     const startDeg = 135;
     const sweepDeg = 270;
     const polar = (deg) => {
@@ -824,10 +1139,10 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     const pullPct = Math.max(0.05, Math.min(0.98, (pullTemp - floorTemp) / span));
     const pullDeg = startDeg + sweepDeg * pullPct;
     const pullRad = (pullDeg * Math.PI) / 180;
-    const px1 = cx + (r - 6) * Math.cos(pullRad);
-    const py1 = cy + (r - 6) * Math.sin(pullRad);
-    const px2 = cx + (r + 6) * Math.cos(pullRad);
-    const py2 = cy + (r + 6) * Math.sin(pullRad);
+    const px1 = cx + (r - 8) * Math.cos(pullRad);
+    const py1 = cy + (r - 8) * Math.sin(pullRad);
+    const px2 = cx + (r + 8) * Math.cos(pullRad);
+    const py2 = cy + (r + 8) * Math.sin(pullRad);
 
     let stroke = "#ff9248";
     if (meater.pillClass === "pull") stroke = "#ff5252";
@@ -839,10 +1154,169 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     const progD = pct > 0.01 ? arcPath(startDeg, progDeg) : "";
 
     return `
-      <svg class="cm-gauge-svg" viewBox="0 0 128 116" aria-hidden="true">
-        <path d="${trackD}" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="9" stroke-linecap="round" />
-        ${progD ? `<path d="${progD}" fill="none" stroke="${stroke}" stroke-width="9" stroke-linecap="round" />` : ""}
-        <line x1="${px1.toFixed(2)}" y1="${py1.toFixed(2)}" x2="${px2.toFixed(2)}" y2="${py2.toFixed(2)}" stroke="#fde047" stroke-width="2.5" stroke-linecap="round" />
+      <svg class="cm-gauge-svg" viewBox="0 0 172 156" aria-hidden="true">
+        <path d="${trackD}" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="12" stroke-linecap="round" />
+        ${progD ? `<path d="${progD}" fill="none" stroke="${stroke}" stroke-width="12" stroke-linecap="round" />` : ""}
+        <line x1="${px1.toFixed(2)}" y1="${py1.toFixed(2)}" x2="${px2.toFixed(2)}" y2="${py2.toFixed(2)}" stroke="#fde047" stroke-width="3" stroke-linecap="round" />
+      </svg>
+    `;
+  }
+
+  _buildCookChartSvg(meater, historyPoints) {
+    const W = 680;
+    const H = 210;
+    const padL = 46;
+    const padR = 24;
+    const padT = 18;
+    const padB = 28;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    const proj = this._computeCookProjection(meater, historyPoints);
+    const pts = proj.pts;
+
+    if (!pts.length && proj.currentTemp === null) {
+      const msg = this._cookHistoryLoading
+        ? "Loading temperature history..."
+        : "Waiting for MEATER+ temperature telemetry...";
+      return `
+        <svg class="cm-chart-svg" viewBox="0 0 680 210" role="img" aria-label="Temperature History and Projected Trend">
+          <rect x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" rx="8" fill="rgba(15, 23, 42, 0.45)" stroke="rgba(148, 163, 184, 0.14)" />
+          <text x="${(padL + plotW / 2).toFixed(1)}" y="${(padT + plotH / 2 + 4).toFixed(1)}" text-anchor="middle" fill="#8ea7c4" font-size="13" font-weight="600">${this._escapeHtml(msg)}</text>
+        </svg>
+      `;
+    }
+
+    const allTemps = pts.map((p) => p.temp);
+    allTemps.push(proj.targetF, proj.pullF);
+    if (proj.hasProjection && Number.isFinite(proj.endTemp)) {
+      allTemps.push(proj.endTemp);
+    }
+    const rawMin = Math.min(...allTemps);
+    const rawMax = Math.max(...allTemps);
+    const minTemp = Math.max(30, Math.floor((rawMin - 8) / 10) * 10);
+    const maxTemp = Math.min(550, Math.ceil((rawMax + 10) / 10) * 10);
+    const tempSpan = Math.max(20, maxTemp - minTemp);
+
+    const yForTemp = (t) => {
+      const clamped = Math.max(minTemp, Math.min(maxTemp, t));
+      return padT + plotH - ((clamped - minTemp) / tempSpan) * plotH;
+    };
+
+    const nowTs = proj.nowTs;
+    const earliestTs = pts.length >= 2 ? pts[0].ts : nowTs - 20 * 60 * 1000;
+    const projSpanMs = proj.hasProjection ? proj.projMins * 60 * 1000 : 20 * 60 * 1000;
+    const histSpanMs = Math.max(20 * 60 * 1000, nowTs - earliestTs, Math.round(projSpanMs * 0.35));
+    const futureSpanMs = proj.hasProjection
+      ? Math.max(Math.round(projSpanMs * 1.12), Math.round(histSpanMs * 0.28))
+      : Math.max(15 * 60 * 1000, Math.round(histSpanMs * 0.22));
+    const startTs = nowTs - histSpanMs;
+    const endTs = nowTs + futureSpanMs;
+    const totalSpanMs = Math.max(60 * 1000, endTs - startTs);
+
+    const xForTs = (ts) => {
+      const clamped = Math.max(startTs, Math.min(endTs, ts));
+      return padL + ((clamped - startTs) / totalSpanMs) * plotW;
+    };
+
+    const gridLines = [];
+    const ySteps = 4;
+    for (let i = 0; i <= ySteps; i++) {
+      const val = Math.round(minTemp + (tempSpan * i) / ySteps);
+      const y = yForTemp(val);
+      gridLines.push(
+        `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${padL + plotW}" y2="${y.toFixed(1)}" stroke="rgba(148, 163, 184, 0.16)" stroke-width="1" />`,
+        `<text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="#94aecb" font-size="12" font-weight="600">${val}°F</text>`
+      );
+    }
+
+    const nowX = xForTs(nowTs);
+    const futureW = Math.max(0, padL + plotW - nowX);
+
+    const tickCandidates = [
+      { ts: startTs, label: this._formatClockTime(startTs) },
+      { ts: startTs + histSpanMs * 0.5, label: this._formatClockTime(startTs + histSpanMs * 0.5) },
+      { ts: nowTs, label: "Now", isNow: true },
+    ];
+    if (proj.hasProjection) {
+      tickCandidates.push({ ts: proj.endTs, label: this._formatClockTime(proj.endTs) });
+    } else {
+      tickCandidates.push({ ts: endTs, label: this._formatClockTime(endTs) });
+    }
+
+    const xTicks = [];
+    const placedXs = [nowX];
+    for (const tc of tickCandidates) {
+      const tx = xForTs(tc.ts);
+      if (!tc.isNow && placedXs.some((px) => Math.abs(px - tx) < 56)) {
+        continue;
+      }
+      if (!tc.isNow) placedXs.push(tx);
+      xTicks.push(
+        `<line x1="${tx.toFixed(1)}" y1="${padT + plotH}" x2="${tx.toFixed(1)}" y2="${padT + plotH + 5}" stroke="rgba(148, 163, 184, 0.4)" stroke-width="1" />`,
+        `<text x="${tx.toFixed(1)}" y="${padT + plotH + 19}" text-anchor="middle" fill="${tc.isNow ? "#f8fafc" : "#94aecb"}" font-size="11.5" font-weight="${tc.isNow ? "700" : "600"}">${this._escapeHtml(tc.label)}</text>`
+      );
+    }
+
+    const targetY = yForTemp(proj.targetF);
+    const pullY = yForTemp(proj.pullF);
+
+    const drawPts =
+      pts.length === 1
+        ? [{ ts: Math.max(startTs, pts[0].ts - Math.round(histSpanMs * 0.12)), temp: pts[0].temp }, pts[0]]
+        : pts;
+    const coords = drawPts.map((p) => [xForTs(p.ts), yForTemp(p.temp)]);
+    const histLineD = coords
+      .map(([x, y], idx) => `${idx === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`)
+      .join(" ");
+    const firstCoord = coords[0];
+    const lastCoord = coords[coords.length - 1];
+    const histAreaD = `${histLineD} L ${lastCoord[0].toFixed(1)} ${(padT + plotH).toFixed(1)} L ${firstCoord[0].toFixed(1)} ${(padT + plotH).toFixed(1)} Z`;
+
+    const nowY = lastCoord[1];
+
+    let trendSvg = "";
+    if (proj.hasProjection) {
+      const projX = xForTs(proj.endTs);
+      const projY = yForTemp(proj.endTemp);
+      let pullDotSvg = "";
+      if (proj.pullTs && proj.pullTs < proj.endTs) {
+        const pullX = xForTs(proj.pullTs);
+        const pullDotY = yForTemp(proj.pullF);
+        pullDotSvg = `<circle class="cm-chart-pull-dot" cx="${pullX.toFixed(1)}" cy="${pullDotY.toFixed(1)}" r="3.8" fill="#fde047" stroke="#0c1422" stroke-width="1.5" />`;
+      }
+      const lblAnchor = projX > padL + plotW - 95 ? "end" : "start";
+      const lblX = lblAnchor === "end" ? projX - 8 : projX + 8;
+      const lblY = Math.max(padT + 13, Math.min(padT + plotH - 8, projY - 8));
+      trendSvg = `
+        <line class="cm-chart-trend-line" x1="${nowX.toFixed(1)}" y1="${nowY.toFixed(1)}" x2="${projX.toFixed(1)}" y2="${projY.toFixed(1)}" stroke="#38bdf8" stroke-width="2.5" stroke-dasharray="7 5" stroke-linecap="round" />
+        ${pullDotSvg}
+        <circle class="cm-chart-trend-end" cx="${projX.toFixed(1)}" cy="${projY.toFixed(1)}" r="4.5" fill="#38bdf8" stroke="#ffffff" stroke-width="1.8" />
+        <text class="cm-chart-eta-label" x="${lblX.toFixed(1)}" y="${lblY.toFixed(1)}" text-anchor="${lblAnchor}" fill="#bae6fd" font-size="12" font-weight="700">${this._escapeHtml(proj.etaClockLabel)}</text>
+      `;
+    }
+
+    return `
+      <svg class="cm-chart-svg" viewBox="0 0 680 210" role="img" aria-label="Temperature History and Projected Trend">
+        <defs>
+          <linearGradient id="cmHistFillGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#ff9248" stop-opacity="0.36" />
+            <stop offset="100%" stop-color="#ff9248" stop-opacity="0.02" />
+          </linearGradient>
+        </defs>
+        <rect class="cm-chart-future-zone" x="${nowX.toFixed(1)}" y="${padT}" width="${futureW.toFixed(1)}" height="${plotH}" fill="rgba(56, 189, 248, 0.065)" />
+        ${gridLines.join("")}
+        <line class="cm-chart-target-line" x1="${padL}" y1="${targetY.toFixed(1)}" x2="${padL + plotW}" y2="${targetY.toFixed(1)}" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="6 4" stroke-opacity="0.88" />
+        <text x="${padL + 6}" y="${Math.max(padT + 11, targetY - 4).toFixed(1)}" fill="#4ade80" font-size="11.5" font-weight="700">Target ${proj.targetF}°F</text>
+        <line class="cm-chart-pull-line" x1="${padL}" y1="${pullY.toFixed(1)}" x2="${padL + plotW}" y2="${pullY.toFixed(1)}" stroke="#fde047" stroke-width="1.5" stroke-dasharray="4 4" stroke-opacity="0.88" />
+        <text x="${padL + 108}" y="${Math.min(padT + plotH - 4, pullY + 13).toFixed(1)}" fill="#fde047" font-size="11.5" font-weight="700">Pull ${proj.pullF}°F</text>
+        <line class="cm-chart-now-line" x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${padT + plotH}" stroke="rgba(226, 232, 240, 0.45)" stroke-width="1.5" stroke-dasharray="4 4" />
+        <path class="cm-chart-history-area" d="${histAreaD}" fill="url(#cmHistFillGrad)" />
+        <path class="cm-chart-history-line" d="${histLineD}" fill="none" stroke="#ff9248" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+        ${trendSvg}
+        <circle cx="${nowX.toFixed(1)}" cy="${nowY.toFixed(1)}" r="8" fill="rgba(255, 146, 72, 0.28)" />
+        <circle class="cm-chart-now-dot" cx="${nowX.toFixed(1)}" cy="${nowY.toFixed(1)}" r="4.5" fill="#ff9248" stroke="#ffffff" stroke-width="2" />
+        ${xTicks.join("")}
       </svg>
     `;
   }
@@ -875,6 +1349,19 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     const batStr = meater.batteryPct !== null ? `${Math.round(meater.batteryPct)}%` : "--";
     const rssiStr = meater.rssi !== null ? `${meater.rssi} dBm` : "--";
     const pullTarget = meater.targetF !== null ? `${meater.targetF - OVEN_MEATER_CONFIG.meater.carryoverPullOffsetF}°F` : "--";
+
+    const proj = this._computeCookProjection(meater, this._cookHistoryPoints);
+    const climbRatePillTxt =
+      proj.displayRate !== null && Number.isFinite(proj.displayRate)
+        ? `${proj.displayRate >= 0 ? "+" : ""}${proj.displayRate.toFixed(2)}°F/min`
+        : "Rate --°F/min";
+    const pullClockPillTxt = proj.pullClock
+      ? `Est. Pull ${proj.pullClock}`
+      : proj.targetClock
+        ? `Est. Done ${proj.targetClock}`
+        : meater.internalF !== null && meater.targetF !== null && meater.internalF >= proj.pullF
+          ? "Pull Reached"
+          : "Est. Pull --";
 
     const presetHtml = meater.presetOptions
       .map((opt) => {
@@ -947,6 +1434,18 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
               <div class="cm-stat-k">BLE Signal</div>
               <div class="cm-stat-v">${rssiStr}</div>
             </div>
+          </div>
+        </div>
+        <div class="cm-chart-card">
+          <div class="cm-chart-head">
+            <span class="cm-chart-title">Temperature History &amp; Projected Trend</span>
+            <div class="cm-chart-badges">
+              <span class="cm-chart-pill rate">${this._escapeHtml(climbRatePillTxt)}</span>
+              <span class="cm-chart-pill eta">${this._escapeHtml(pullClockPillTxt)}</span>
+            </div>
+          </div>
+          <div class="cm-chart-svg-wrap">
+            ${this._buildCookChartSvg(meater, this._cookHistoryPoints)}
           </div>
         </div>
         <div class="cm-stepper-card">
@@ -1081,7 +1580,10 @@ OVEN_MEATER_UPDATE_JS = """      /* OVEN_MEATER_UPDATE_BEGIN */
       /* OVEN_MEATER_UPDATE_END */"""
 
 OVEN_MEATER_MODAL_REFRESH_JS = """    /* OVEN_MEATER_MODAL_REFRESH_BEGIN */
-    if (this._cookModalOpen) this._renderCookModal();
+    if (this._cookModalOpen) {
+      this._fetchCookHistory(false);
+      this._renderCookModal();
+    }
     /* OVEN_MEATER_MODAL_REFRESH_END */"""
 
 
@@ -1188,6 +1690,7 @@ def verify_patched_card_contents(card_js: str) -> None:
         "meater:",
         ".cook-hotspot",
         ".cook-modal",
+        "min(92vw, 780px)",
         "cookBackdrop",
         "cookModal",
         "_evalOvenStatus",
@@ -1195,9 +1698,18 @@ def verify_patched_card_contents(card_js: str) -> None:
         "_collectOvenMeaterSigParts",
         "_openCookModal",
         "_closeCookModal",
+        "_fetchCookHistory",
+        "_computeCookProjection",
+        "_buildCookGaugeSvg",
+        "_buildCookChartSvg",
         "_stepMeaterTargetTemp",
         "_selectMeaterPreset",
         "_renderCookModal",
+        "Temperature History &amp; Projected Trend",
+        "cm-chart-svg",
+        'viewBox="0 0 172 156"',
+        'viewBox="0 0 680 210"',
+        "history/period/",
         "data-oven-meater-badge",
         "select_option",
         "set_value",
