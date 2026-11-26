@@ -475,6 +475,12 @@ def test_log_execution_heartbeat_degraded_recheck_cadence(monkeypatch, tmp_path)
         import tools.scheduler_tool as sched_mod
     except ImportError:
         import scheduler_tool as sched_mod
+    try:
+        import tools.bridge_scheduler as bshed_mod
+    except ImportError:
+        import bridge_scheduler as bshed_mod
+
+    assert sidecars.HEARTBEAT_DEGRADED_RECHECK_SECONDS == 300
 
     log_file = tmp_path / "sidecar_execution_log.json"
     status_file = tmp_path / "sidecar_status.json"
@@ -497,14 +503,29 @@ def test_log_execution_heartbeat_degraded_recheck_cadence(monkeypatch, tmp_path)
     ]
     sched_file.write_text(json.dumps(initial_jobs, indent=2), encoding="utf-8")
 
-    # Degraded run schedules 15m (900s) recheck
-    entry_err = sidecars.log_execution("heartbeat", "Heartbeat Sweep", "error", 1.2, summary="Degraded")
+    # Degraded run (warning/error) schedules 5m (300s) recheck and sets active_recheck_seconds
+    entry_err = sidecars.log_execution("heartbeat", "Heartbeat Sweep", "warning", 1.2, summary="Degraded")
     jobs_after_err = json.loads(sched_file.read_text(encoding="utf-8"))
     assert jobs_after_err[0]["next_run_ts"] == entry_err["timestamp_epoch"] + sidecars.HEARTBEAT_DEGRADED_RECHECK_SECONDS
+    assert jobs_after_err[0]["active_recheck_seconds"] == 300
+    assert bshed_mod.should_run_job(jobs_after_err[0], jobs_after_err[0]["next_run_ts"], status_map={}) == (True, "on_time")
 
-    # Healthy run restores normal 2h (7200s) cadence
+    # Anti-double-run guard still blocks a premature run within min_period (< 300 * 0.7 = 210s)
+    premature_job = dict(jobs_after_err[0], next_run_ts=entry_err["timestamp_epoch"] + 150)
+    should_run_early, early_reason = bshed_mod.should_run_job(premature_job, premature_job["next_run_ts"], status_map={})
+    assert should_run_early is False
+    assert "already ran in current period" in early_reason
+
+    # Bool guard: active_recheck_seconds=True is ignored in favor of base interval_seconds (7200s)
+    bool_recheck_job = dict(jobs_after_err[0], active_recheck_seconds=True)
+    should_run_bool, bool_reason = bshed_mod.should_run_job(bool_recheck_job, bool_recheck_job["next_run_ts"], status_map={})
+    assert should_run_bool is False
+    assert "already ran in current period" in bool_reason
+
+    # Healthy run restores normal 2h (7200s) cadence and removes active_recheck_seconds
     entry_ok = sidecars.log_execution("heartbeat", "Heartbeat Sweep", "ok", 0.8, summary="Healthy")
     jobs_after_ok = json.loads(sched_file.read_text(encoding="utf-8"))
+    assert "active_recheck_seconds" not in jobs_after_ok[0]
     assert jobs_after_ok[0]["next_run_ts"] == entry_ok["timestamp_epoch"] + 7200
 
 

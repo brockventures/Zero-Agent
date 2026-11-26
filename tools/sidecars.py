@@ -75,7 +75,7 @@ EXECUTION_LOG_FILE = DATA_DIR / "sidecar_execution_log.json"
 EXECUTION_STATUS_FILE = DATA_DIR / "sidecar_status.json"
 HEARTBEAT_STATE_FILE = os.path.join(DATA_DIR, "heartbeat_state.json")
 HEARTBEAT_RETRY_DELAY_SECONDS = 5
-HEARTBEAT_DEGRADED_RECHECK_SECONDS = 900
+HEARTBEAT_DEGRADED_RECHECK_SECONDS = 300
 HEARTBEAT_REPEAT_ALERT_SECONDS = 7200
 MAX_LOG_ENTRIES = 200
 
@@ -247,8 +247,10 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
                         j["last_run_at"] = now_pt.strftime("%Y-%m-%d %I:%M %p PT")
                         is_heartbeat = job_id in ("heartbeat", "heartbeat_sweep") or jid in ("heartbeat", "heartbeat_sweep")
                         if is_heartbeat and status != "ok":
+                            j["active_recheck_seconds"] = HEARTBEAT_DEGRADED_RECHECK_SECONDS
                             j["next_run_ts"] = now_epoch + HEARTBEAT_DEGRADED_RECHECK_SECONDS
                         else:
+                            j.pop("active_recheck_seconds", None)
                             j["next_run_ts"] = calculate_next_run(j, from_ts=now_epoch)
                         s_updated = True
                 if s_updated:

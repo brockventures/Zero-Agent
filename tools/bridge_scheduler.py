@@ -379,11 +379,12 @@ async def dispatch_scheduled_prompt(
         channel_id = VAULT_CHANNEL_ID
 
     # Anti-storm guard: prevent any job from dispatching more than once per 5 minutes
+    # (210s threshold aligns with 300s * 0.7 min_period to avoid boundary drops on 5m degraded re-checks)
     now_ts = time.time()
     storm_key = job_id or job_name
     last_disp = LAST_SCHEDULED_DISPATCH.get(storm_key, 0)
-    if (now_ts - last_disp) < 300:
-        print(f"[Scheduler] Anti-storm block: {job_name} attempted re-trigger within 300s (last: {now_ts - last_disp:.1f}s ago). Dropping.")
+    if (now_ts - last_disp) < 210:
+        print(f"[Scheduler] Anti-storm block: {job_name} attempted re-trigger within 210s (last: {now_ts - last_disp:.1f}s ago). Dropping.")
         return
     LAST_SCHEDULED_DISPATCH[storm_key] = now_ts
     LAST_SCHEDULED_DISPATCH[job_name] = now_ts
@@ -1874,7 +1875,12 @@ def should_run_job(job: dict, now_ts: float, status_map: dict | None = None) -> 
         min_period = 21600  # 6h guard: prevents same-slot double runs without blocking scheduled morning runs after prior-day manual tests
         double_run_guard = (last_run >= next_ts - 300)
     elif stype == "interval":
-        interval = job.get("interval_seconds", 3600)
+        recheck = job.get("active_recheck_seconds")
+        interval = (
+            recheck
+            if isinstance(recheck, (int, float)) and not isinstance(recheck, bool) and recheck > 0
+            else job.get("interval_seconds", 3600)
+        )
         min_period = interval * 0.7
         double_run_guard = (last_run >= next_ts)
     else:
