@@ -1849,3 +1849,333 @@ class TestSidecarWrapperAndScheduler:
             )
             assert ok is False
             assert mock_log.call_args.kwargs["status"] == "error"
+
+
+# ===========================================================================
+# 11. Holiday & Birthday Theming + allow_on_holiday Tests
+# ===========================================================================
+class TestHolidayAndBirthdayTheming:
+    """Verifies US holiday and family birthday detection, prompt injection, and manifest flags."""
+
+    def test_resolve_holiday_exact_rules(self) -> None:
+        """Verify resolve_holiday detects all Hearth US holidays and computes dynamic holidays correctly."""
+        # 1. New Year's Day (01-01)
+        res = hdwa.resolve_holiday("2026-01-01")
+        assert res is not None
+        assert res["key"] == "new_years"
+        assert res["name"] == "New Year's Day"
+        assert "shimmering golden ribbons" in res["theming"].lower()
+        assert "dawn light" in res["morning"].lower()
+        assert "afternoon" in res["afternoon"].lower()
+        assert "twilight" in res["evening"].lower()
+
+        # 2. Valentine's Day (02-14)
+        res = hdwa.resolve_holiday("2026-02-14")
+        assert res is not None
+        assert res["key"] == "valentines"
+        assert res["name"] == "Valentine's Day"
+        assert "heart" in res["theming"].lower()
+
+        # 3. Easter (Gregorian Computus)
+        # 2024: March 31, 2025: April 20, 2026: April 5, 2027: March 28
+        easter_dates = [
+            ("2024-03-31", True),
+            ("2024-04-01", False),
+            ("2025-04-20", True),
+            ("2025-04-13", False),
+            ("2026-04-05", True),
+            ("2026-04-12", False),
+            ("2027-03-28", True),
+        ]
+        for dt_str, is_easter in easter_dates:
+            h = hdwa.resolve_holiday(dt_str)
+            if is_easter:
+                assert h is not None, f"Expected Easter on {dt_str}"
+                assert h["key"] == "easter"
+                assert h["name"] == "Easter"
+                assert "egg hunt" in h["theming"].lower()
+            else:
+                assert h is None or h["key"] != "easter", f"Unexpected Easter on {dt_str}"
+
+        # 4. Memorial Day (last Monday of May, day >= 25)
+        # 2024-05-27 (Mon), 2025-05-26 (Mon), 2026-05-25 (Mon)
+        memorial_dates = [
+            ("2024-05-27", True),
+            ("2024-05-20", False),  # 3rd Monday (day 20 < 25)
+            ("2025-05-26", True),
+            ("2026-05-25", True),
+            ("2026-05-18", False),  # 3rd Monday
+            ("2026-05-26", False),  # Tuesday after Memorial Day
+        ]
+        for dt_str, is_mem in memorial_dates:
+            h = hdwa.resolve_holiday(dt_str)
+            if is_mem:
+                assert h is not None, f"Expected Memorial Day on {dt_str}"
+                assert h["key"] == "memorial_day"
+                assert h["name"] == "Memorial Day"
+                assert "bunting" in h["theming"].lower()
+            else:
+                assert h is None or h["key"] != "memorial_day"
+
+        # 5. Fourth of July (07-04)
+        res = hdwa.resolve_holiday("2026-07-04")
+        assert res is not None
+        assert res["key"] == "july_4th"
+        assert res["name"] == "Fourth of July"
+        assert "patriotic" in res["theming"].lower()
+
+        # 6. Labor Day (first Monday of Sep, day <= 7)
+        # 2024-09-02 (Mon), 2025-09-01 (Mon), 2026-09-07 (Mon)
+        labor_dates = [
+            ("2024-09-02", True),
+            ("2025-09-01", True),
+            ("2026-09-07", True),
+            ("2026-09-14", False),  # 2nd Monday (day 14 > 7)
+            ("2026-09-01", False),  # Tuesday
+        ]
+        for dt_str, is_labor in labor_dates:
+            h = hdwa.resolve_holiday(dt_str)
+            if is_labor:
+                assert h is not None, f"Expected Labor Day on {dt_str}"
+                assert h["key"] == "labor_day"
+                assert h["name"] == "Labor Day"
+                assert "late-summer" in h["theming"].lower()
+            else:
+                assert h is None or h["key"] != "labor_day"
+
+        # 7. Halloween (10-31)
+        res = hdwa.resolve_holiday("2026-10-31")
+        assert res is not None
+        assert res["key"] == "halloween"
+        assert res["name"] == "Halloween"
+        assert "jack-o'-lanterns" in res["theming"].lower()
+
+        # 8. Thanksgiving (4th Thursday of Nov, 22 <= day <= 28)
+        # 2024-11-28 (Thu), 2025-11-27 (Thu), 2026-11-26 (Thu)
+        thanksgiving_dates = [
+            ("2024-11-28", True),
+            ("2025-11-27", True),
+            ("2026-11-26", True),
+            ("2026-11-19", False),  # 3rd Thursday (day 19 < 22)
+            ("2026-11-27", False),  # Black Friday
+        ]
+        for dt_str, is_tday in thanksgiving_dates:
+            h = hdwa.resolve_holiday(dt_str)
+            if is_tday:
+                assert h is not None, f"Expected Thanksgiving on {dt_str}"
+                assert h["key"] == "thanksgiving"
+                assert h["name"] == "Thanksgiving"
+                assert "autumn harvest foliage" in h["theming"].lower()
+            else:
+                assert h is None or h["key"] != "thanksgiving"
+
+        # 9. Christmas (12-24 and 12-25)
+        for dt_str in ("2026-12-24", "2026-12-25"):
+            res = hdwa.resolve_holiday(dt_str)
+            assert res is not None, f"Expected Christmas on {dt_str}"
+            assert res["key"] == "christmas"
+            assert "christmas" in res["name"].lower()
+            assert "evergreen pine" in res["theming"].lower()
+
+        # Non-holidays and invalid inputs
+        assert hdwa.resolve_holiday("2026-11-20") is None
+        assert hdwa.resolve_holiday("2026-06-15") is None
+        assert hdwa.resolve_holiday("") is None
+        assert hdwa.resolve_holiday("invalid-date") is None
+
+    def test_resolve_birthday_exact_rules(self) -> None:
+        """Verify resolve_birthday identifies family birthdays for Rosie, Isaac, and Genevieve."""
+        # 1. Rosie (11-07)
+        res = hdwa.resolve_birthday("2026-11-07")
+        assert res is not None
+        assert res["key"] == "rosie"
+        assert res["child"] == "Rosie"
+        assert "Rosie" in res["name"]
+        assert "balloons" in res["theming"].lower()
+        assert "streamers" in res["theming"].lower()
+        assert "birthday cake with glowing candles" in res["theming"].lower()
+        assert "zero-text guardrails" in res["theming"].lower()
+        assert "morning" in res["morning"].lower()
+        assert "afternoon" in res["afternoon"].lower()
+        assert "evening" in res["evening"].lower()
+
+        # 2. Isaac (12-26)
+        res = hdwa.resolve_birthday("2026-12-26")
+        assert res is not None
+        assert res["key"] == "isaac"
+        assert res["child"] == "Isaac"
+        assert "Isaac" in res["name"]
+        assert "toddler" in res["theming"].lower()
+        assert "birthday cake with glowing candles" in res["theming"].lower()
+
+        # 3. Genevieve / Eve (09-03)
+        res = hdwa.resolve_birthday("2026-09-03")
+        assert res is not None
+        assert res["key"] == "eve"
+        assert "Genevieve" in res["name"]
+        assert "Genevieve" in res["child"]
+        assert "milestone" in res["theming"].lower()
+        assert "birthday cake with glowing candles" in res["theming"].lower()
+
+        # Non-birthdays and invalid inputs
+        assert hdwa.resolve_birthday("2026-11-08") is None
+        assert hdwa.resolve_birthday("2026-12-25") is None
+        assert hdwa.resolve_birthday("2026-09-04") is None
+        assert hdwa.resolve_birthday("") is None
+        assert hdwa.resolve_birthday("invalid-date") is None
+
+    def test_build_slot_prompt_holiday_theming_injection(self) -> None:
+        """Verify build_slot_prompt injects rich SPECIAL OCCASION THEMING for holidays."""
+        theme = hdwa.ART_STYLE_VAULT["studio_ghibli_gouache"]
+        weather = {"clothing_state": "morning_mild", "temp_f": 58.0, "condition": "partlycloudy"}
+
+        # Thanksgiving 2026-11-26 across all three slots
+        for slot in ("morning", "afternoon", "evening"):
+            prompt = hdwa.build_slot_prompt(
+                slot=slot,
+                theme=theme,
+                weather_info=weather,
+                target_date="2026-11-26",
+            )
+            # 1. High-signal ordering invariant preserved
+            assert prompt.index(theme["prompt_style"]) < prompt.index(hdwa.SLOT_CHOREOGRAPHY[slot])
+            assert prompt.index(hdwa.SLOT_CHOREOGRAPHY[slot]) < prompt.index("MANDATORY WEATHER-MATCHED ATTIRE")
+            assert prompt.index("MANDATORY WEATHER-MATCHED ATTIRE") < prompt.index("Atmosphere:")
+            assert prompt.index("Atmosphere:") < prompt.index("Setting:")
+            assert prompt.index("Setting:") < prompt.index("Characters:")
+
+            # 2. Holiday occasion clause presence and contents
+            assert "SPECIAL OCCASION THEMING:" in prompt
+            assert "Holiday Celebration (Thanksgiving):" in prompt
+            assert "autumn harvest foliage" in prompt
+            assert "zero-text invariant" in prompt.lower()
+
+            # 3. Slot-specific visual touch in the prompt
+            if slot == "morning":
+                assert "morning" in prompt.lower()
+            elif slot == "afternoon":
+                assert "afternoon" in prompt.lower()
+            elif slot == "evening":
+                assert "evening" in prompt.lower()
+
+            # 4. Mandatory character consistency and attire preserved
+            assert hdwa.BASE_CHARACTER_CONSISTENCY_CLAUSE in prompt
+            assert "RIGHT 42%" in prompt
+            assert "LEFT 58%" in prompt
+            assert "MANDATORY WEATHER-MATCHED ATTIRE (morning_mild)" in prompt
+
+    def test_build_slot_prompt_birthday_theming_injection(self) -> None:
+        """Verify build_slot_prompt injects rich celebratory birthday theming with zero-text guardrails."""
+        theme = hdwa.ART_STYLE_VAULT["zelda_botw_watercolor"]
+        weather = {"clothing_state": "cold_puffer", "temp_f": 40.0, "condition": "clear"}
+
+        # Rosie's birthday: 2026-11-07
+        prompt = hdwa.build_slot_prompt(
+            slot="afternoon",
+            theme=theme,
+            weather_info=weather,
+            target_date="2026-11-07",
+        )
+        assert "SPECIAL OCCASION THEMING:" in prompt
+        assert "Family Birthday (Rosie's Birthday):" in prompt
+        assert "Rosie" in prompt
+        assert "balloons" in prompt.lower()
+        assert "streamers" in prompt.lower()
+        assert "birthday cake with glowing candles" in prompt.lower()
+        assert "no letters, words, numbers, or signs on cake" in prompt.lower()
+
+        # Mandatory character consistency & weather attire intact
+        assert "MANDATORY WEATHER-MATCHED ATTIRE (cold_puffer)" in prompt
+        assert hdwa.BASE_CHARACTER_CONSISTENCY_CLAUSE in prompt
+
+    def test_build_slot_prompt_backwards_compatibility(self) -> None:
+        """Verify omitting target_date or passing non-occasion dates does not inject occasion clause."""
+        theme = hdwa.ART_STYLE_VAULT["studio_ghibli_gouache"]
+        weather = {"clothing_state": "morning_mild", "temp_f": 58.0, "condition": "sunny"}
+
+        # Default target_date=None (omitted)
+        p1 = hdwa.build_slot_prompt(slot="morning", theme=theme, weather_info=weather)
+        assert "SPECIAL OCCASION THEMING" not in p1
+
+        # Explicit target_date=None
+        p2 = hdwa.build_slot_prompt(slot="morning", theme=theme, weather_info=weather, target_date=None)
+        assert p1 == p2
+        assert "SPECIAL OCCASION THEMING" not in p2
+
+        # Regular non-holiday, non-birthday date
+        p3 = hdwa.build_slot_prompt(slot="morning", theme=theme, weather_info=weather, target_date="2026-11-20")
+        assert p1 == p3
+        assert "SPECIAL OCCASION THEMING" not in p3
+
+    def test_pipeline_manifest_allow_on_holiday_flag(self) -> None:
+        """Verify run_nightly_pipeline sets allow_on_holiday=True on holidays and False on regular days."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            # 1. Holiday run: Thanksgiving 2026-11-26
+            res_holiday = hdwa.run_nightly_pipeline(
+                target_date="2026-11-26",
+                theme="studio_ghibli_gouache",
+                output_dir=str(out_dir),
+                dry_run=True,
+                history_file=hist_file,
+            )
+            assert res_holiday["success"] is True
+            manifest_holiday = res_holiday["manifest"]
+            assert manifest_holiday["allow_on_holiday"] is True
+            assert manifest_holiday["holiday"] == "Thanksgiving"
+            assert manifest_holiday["holiday_key"] == "thanksgiving"
+            assert res_holiday["allow_on_holiday"] is True
+            assert res_holiday["holiday"] == "Thanksgiving"
+
+            # Check prompts in manifest slot_details
+            for slot in ("morning", "afternoon", "evening"):
+                prompt = manifest_holiday["slot_details"][slot]["prompt"]
+                assert "SPECIAL OCCASION THEMING" in prompt
+                assert "Thanksgiving" in prompt
+
+            # Verify on-disk daily_manifest.json
+            manifest_file = out_dir / "daily_manifest.json"
+            on_disk_holiday = json.loads(manifest_file.read_text(encoding="utf-8"))
+            assert on_disk_holiday["allow_on_holiday"] is True
+            assert on_disk_holiday["holiday"] == "Thanksgiving"
+
+            # 2. Regular day run: 2026-11-20
+            out_dir_regular = tmp_path / "output_reg"
+            res_regular = hdwa.run_nightly_pipeline(
+                target_date="2026-11-20",
+                theme="studio_ghibli_gouache",
+                output_dir=str(out_dir_regular),
+                dry_run=True,
+                history_file=hist_file,
+            )
+            assert res_regular["success"] is True
+            manifest_reg = res_regular["manifest"]
+            assert manifest_reg["allow_on_holiday"] is False
+            assert "holiday" not in manifest_reg
+            assert res_regular["allow_on_holiday"] is False
+            assert res_regular["holiday"] is None
+
+            # 3. Family birthday run: Rosie 2026-11-07
+            out_dir_bday = tmp_path / "output_bday"
+            res_bday = hdwa.run_nightly_pipeline(
+                target_date="2026-11-07",
+                theme="studio_ghibli_gouache",
+                output_dir=str(out_dir_bday),
+                dry_run=True,
+                history_file=hist_file,
+            )
+            assert res_bday["success"] is True
+            manifest_bday = res_bday["manifest"]
+            assert manifest_bday["allow_on_holiday"] is False
+            assert "holiday" not in manifest_bday
+            assert manifest_bday["birthday"] == "Rosie's Birthday"
+            assert manifest_bday["birthday_child"] == "Rosie"
+            assert res_bday["birthday"] == "Rosie's Birthday"
+
+            for slot in ("morning", "afternoon", "evening"):
+                prompt = manifest_bday["slot_details"][slot]["prompt"]
+                assert "SPECIAL OCCASION THEMING" in prompt
+                assert "Rosie" in prompt

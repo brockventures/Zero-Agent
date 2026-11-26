@@ -1005,6 +1005,381 @@ def select_daily_theme(
 
 
 # ---------------------------------------------------------------------------
+# 5b. Holiday & Birthday Detection and Festive Theming
+# ---------------------------------------------------------------------------
+def calculate_easter(year: int) -> tuple[int, int]:
+    """Calculate the (month, day) of Easter Sunday for a Gregorian year using the Meeus/Jones/Butcher Computus."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return month, day
+
+
+HOLIDAY_THEMING: dict[str, dict[str, str]] = {
+    "new_years": {
+        "name": "New Year's Day",
+        "general": (
+            "New Year's Day celebration: Shimmering golden ribbons and silver star garlands adorn rustic pine fences in the open scenery; "
+            "sparkling festive celebration touches blend with fresh winter optimism; strict zero-text invariant with no numbers, banners, or signs."
+        ),
+        "morning": (
+            "New Year's Day morning celebration: Crisp fresh dawn light illuminating shimmering golden ribbons and delicate silver garlands "
+            "woven through the frost-dusted scenery in the open left background; peaceful celebratory winter morning atmosphere; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "New Year's Day afternoon celebration: Joyous celebratory daytime scene with shimmering festive gold ribbon accents, decorative bells, "
+            "and celebratory evergreen wreaths nestled in the open landscape; bright hopeful holiday cheer; strict zero-text invariant."
+        ),
+        "evening": (
+            "New Year's evening celebration: Cozy twilight dusk with warm glowing paper lanterns, soft sparkler-like bokeh lights blossoming in the far distance, "
+            "and festive golden ribbons glowing against the rich evening sky; peaceful celebration atmosphere; strict zero-text invariant."
+        ),
+    },
+    "valentines": {
+        "name": "Valentine's Day",
+        "general": (
+            "Valentine's Day celebration: Delicate heart-shaped woven grapevine wreaths, soft pastel ribbon garlands, and charming handcrafted wooden gift boxes "
+            "tucked into the open scenery; warm heartwarming holiday cheer with strict zero-text invariant (no words or letters)."
+        ),
+        "morning": (
+            "Valentine's Day morning: Gentle pink-tinted morning dawn light illuminating delicate heart-shaped woven wildflower wreaths and pastel satin ribbons "
+            "draped along the rustic pathway in the open left scenery; sweet, heartwarming morning mood; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Valentine's Day afternoon: Joyful daytime celebration with handcrafted heart-shaped floral wreaths, soft rose petals scattered along the garden path, "
+            "and charming rustic gift parcels tied with pastel bows resting in the open background; strict zero-text invariant."
+        ),
+        "evening": (
+            "Valentine's Day evening: Cozy romantic dusk ambiance with warm glowing heart-motif lanterns, soft rose-tinted twilight glow, and delicate handcrafted ribbons "
+            "fluttering gently in the evening breeze; heartwarming family affection; strict zero-text invariant."
+        ),
+    },
+    "easter": {
+        "name": "Easter",
+        "general": (
+            "Easter spring celebration: A playful outdoor spring egg hunt in the open scenery, pastel dyed eggs nestled among fresh spring wildflowers and mossy stones, "
+            "and cheerful woven wicker baskets; vibrant spring renewal with strict zero-text invariant."
+        ),
+        "morning": (
+            "Easter morning celebration: Fresh spring morning sunbeams illuminating colorful pastel dyed eggs hidden among dewy clover, blooming daffodils, "
+            "and woven wicker baskets resting along the rustic path in the open left background; playful spring egg-hunt discovery; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Easter afternoon celebration: Sun-drenched spring landscape filled with colorful pastel eggs tucked near garden stones, blooming tulips and wildflowers, "
+            "and handcrafted wicker baskets adorned with spring ribbons in the open scenery; lively holiday joy; strict zero-text invariant."
+        ),
+        "evening": (
+            "Easter evening celebration: Peaceful spring twilight with pastel-colored lanterns glowing softly above blooming spring boughs, woven collection baskets "
+            "filled with colorful eggs resting on a rustic bench, and calm golden-hour dusk; strict zero-text invariant."
+        ),
+    },
+    "memorial_day": {
+        "name": "Memorial Day",
+        "general": (
+            "Memorial Day remembrance & celebration: Dignified patriotic red, white, and blue ribbon bunting draped along rustic wooden fences, vibrant blooming red poppies, "
+            "and a relaxed early-summer family outdoor picnic blanket in the open scenery; respectful festive warmth with strict zero-text invariant."
+        ),
+        "morning": (
+            "Memorial Day morning: Crisp early summer morning sunlight illuminating dignified red, white, and blue fabric bunting on rustic fence posts, "
+            "fresh dewy red poppies blooming in the open left meadow; peaceful patriotic morning remembrance; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Memorial Day afternoon: Bright sunlit holiday celebration with patriotic red, white, and blue ribbon garlands, a cozy gingham picnic blanket and woven basket "
+            "set under a shade tree in the open scenery, and festive early-summer spirit; strict zero-text invariant."
+        ),
+        "evening": (
+            "Memorial Day evening: Serene twilight golden hour with gentle lanterns illuminating rustic patriotic bunting, deep amber sunset horizon, "
+            "and peaceful summer evening remembrance across the open landscape; strict zero-text invariant."
+        ),
+    },
+    "july_4th": {
+        "name": "Fourth of July",
+        "general": (
+            "Fourth of July summer celebration: Vibrant red, white, and blue patriotic ribbons, playful pinwheels, chilled watermelon slices on a rustic picnic table in the open scenery, "
+            "and joyous summertime festivities with strict zero-text invariant."
+        ),
+        "morning": (
+            "Fourth of July morning: Sparkling summer morning sunshine with festive red, white, and blue decorative ribbons and wooden pinwheels spinning along the fence path, "
+            "anticipating festive holiday excitement in the open scenery; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Fourth of July afternoon: Sun-drenched summer holiday celebration with patriotic bunting, chilled fresh watermelon slices arranged on a rustic wooden picnic table "
+            "under shady leafy branches in the open scenery, and cheerful summer joy; strict zero-text invariant."
+        ),
+        "evening": (
+            "Fourth of July evening: Spectacular twilight dusk celebration with soft colorful celebration fireworks blossoming gently in the deep twilight sky above the open horizon, "
+            "warm glowing sparkler bokeh, and enchanting summer dusk celebration; strict zero-text invariant."
+        ),
+    },
+    "labor_day": {
+        "name": "Labor Day",
+        "general": (
+            "Labor Day late-summer celebration: Relaxed end-of-summer holiday ambiance with rustic wooden fruit crates filled with ripe harvest apples and peaches, "
+            "gingham picnic blankets, and cheerful outdoor leisure in the open scenery; strict zero-text invariant."
+        ),
+        "morning": (
+            "Labor Day morning: Crisp late-summer morning air with golden sunrise rays filtering through orchard branches, rustic wooden fruit baskets on a grassy knoll "
+            "in the open left scenery, and peaceful holiday morning calm; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Labor Day afternoon: Warm sunlit holiday afternoon with an inviting family picnic setting, colorful gingham blankets, fresh fruit baskets, "
+            "and relaxed late-summer outdoor festivities in the open landscape; strict zero-text invariant."
+        ),
+        "evening": (
+            "Labor Day evening: Cozy late-summer twilight with warm string lanterns glowing gently over a rustic wooden picnic table, golden-violet dusk sky, "
+            "and peaceful end-of-summer warmth; strict zero-text invariant."
+        ),
+    },
+    "halloween": {
+        "name": "Halloween",
+        "general": (
+            "Halloween autumn celebration: Whimsical carved glowing jack-o'-lanterns smiling on rustic stone steps, decorative dried cornstalks and gourds, "
+            "colorful autumn leaves, and playful friendly harvest enchantment in the open scenery; strict zero-text invariant."
+        ),
+        "morning": (
+            "Halloween morning: Crisp autumn morning mist with charming carved pumpkins grinning warmly along the rustic stone path, golden fallen leaves, "
+            "and playful whimsical autumn atmosphere in the open left background; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Halloween afternoon: Lively festive autumn afternoon with smiling carved jack-o'-lanterns, rustic cornstalk sheaves, colorful heirloom gourds, "
+            "and whimsical hanging friendly ghost decorations fluttering in the breeze across the open landscape; strict zero-text invariant."
+        ),
+        "evening": (
+            "Halloween evening: Magical twilight dusk with candlelit carved jack-o'-lanterns casting cozy amber illumination across the stones, "
+            "warm pumpkin glow, whimsical friendly autumn shadows, and enchanting Halloween twilight atmosphere; strict zero-text invariant."
+        ),
+    },
+    "thanksgiving": {
+        "name": "Thanksgiving",
+        "general": (
+            "Thanksgiving harvest celebration: Warm autumn harvest foliage, heirloom pumpkins, decorative gourds, cozy festive Thanksgiving harvest warmth, "
+            "autumn garlands, and rustic harvest feast touches arranged warmly in the open background; strict zero-text invariant."
+        ),
+        "morning": (
+            "Thanksgiving morning: Crisp golden morning light illuminating vibrant warm autumn harvest foliage, heirloom pumpkins and squash resting on rustic timber steps, "
+            "and festive autumn leaf garlands in the open left scenery; cozy Thanksgiving morning warmth; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Thanksgiving afternoon: Bountiful festive Thanksgiving celebration with vibrant warm autumn harvest foliage, ornamental gourds, autumn leaf garlands, "
+            "and rustic harvest feast and pie touches resting warmly on a wooden sideboard in the open scenery; heartwarming holiday cheer; strict zero-text invariant."
+        ),
+        "evening": (
+            "Thanksgiving evening: Cozy evening harvest warmth with glowing amber lanterns, rustic timber settings, steaming spiced cider touches, "
+            "and deep golden-amber harvest dusk atmosphere illuminating pumpkins, ornamental gourds, and warm autumn harvest foliage in the open scenery; strict zero-text invariant."
+        ),
+    },
+    "christmas": {
+        "name": "Christmas",
+        "general": (
+            "Christmas holiday celebration: Lush evergreen pine boughs, festive red ribbon accents, twinkling warm fairy lights, wrapped gift parcels with satin bows "
+            "nestled under fir branches, and enchanting winter festive wonder in the open scenery; strict zero-text invariant."
+        ),
+        "morning": (
+            "Christmas morning: Magical winter morning wonder with snow-dusted evergreen boughs, twinkling fairy lights, bright red holly berries, "
+            "and festive ribbon-wrapped gift parcels resting on a rustic timber bench in the open left scenery; joyful Christmas morning spirit; strict zero-text invariant."
+        ),
+        "afternoon": (
+            "Christmas afternoon: Joyous daytime winter holiday celebration with lush pine wreaths, red and gold ornamental baubles, cozy gingerbread house touches "
+            "on a rustic outdoor table in the open scenery, and merry holiday warmth; strict zero-text invariant."
+        ),
+        "evening": (
+            "Christmas evening: Enchanting winter holiday twilight with warmly glowing evergreen trees adorned with golden lights, rustic lanterns illuminating snow-dusted paths, "
+            "and cozy warm holiday dusk ambiance across the open landscape; strict zero-text invariant."
+        ),
+    },
+}
+
+BIRTHDAY_THEMING: dict[str, dict[str, str]] = {
+    "rosie": {
+        "name": "Rosie's Birthday",
+        "child": "Rosie",
+        "general": (
+            "Special Birthday Celebration for Rosie (7 years old): Festive colorful balloons and bright fluttering streamers decorate the open scenery; "
+            "a celebratory birthday cake with glowing candles rests on a rustic table in the open midground; Rosie is highlighted beaming with special birthday joy "
+            "as the guest of honor, sharing the happy moment with toddler brother Isaac and baby sister Genevieve; all three siblings remain in weather-matched outfits "
+            "with strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "morning": (
+            "Special Birthday Celebration for Rosie (7 years old, Morning): Fresh morning sunlight shining on colorful festive balloons, pastel streamers tied along rustic fences, "
+            "and a celebratory birthday cake with glowing candles; Rosie beams with morning birthday excitement, cradling baby Genevieve with toddler Isaac by her side; "
+            "celebratory morning joy in the open scenery; strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "afternoon": (
+            "Special Birthday Celebration for Rosie (7 years old, Afternoon): Sunlit daytime celebration with festive party balloons, colorful fluttering streamers, "
+            "and a celebratory birthday cake with glowing candles resting on a rustic wooden party table in the open background; Rosie is radiant as the special birthday girl "
+            "celebrating happily with Isaac and baby Genevieve; strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "evening": (
+            "Special Birthday Celebration for Rosie (7 years old, Evening): Cozy twilight birthday celebration with softly glowing fairy lights, colorful party balloons, "
+            "and a celebratory birthday cake with glowing candles illuminating a warm dusk gathering in the open landscape; Rosie, Isaac, and baby Genevieve sharing sweet celebratory evening happiness; "
+            "strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+    },
+    "isaac": {
+        "name": "Isaac's Birthday",
+        "child": "Isaac",
+        "general": (
+            "Special Birthday Celebration for Isaac (3 years old): Festive colorful balloons and playful bright streamers decorate the open scenery; "
+            "a celebratory birthday cake with glowing candles sits on a rustic table in the open midground; toddler Isaac is giggling and beaming with birthday excitement "
+            "as the special birthday boy, celebrated warmly by older sister Rosie and baby sister Genevieve; all three siblings remain in weather-matched outfits "
+            "with strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "morning": (
+            "Special Birthday Celebration for Isaac (3 years old, Morning): Cheerful morning sunlight illuminating bright colorful balloons, festive party streamers, "
+            "and a celebratory birthday cake with glowing candles along the path; toddler Isaac bounces with birthday excitement alongside older sister Rosie holding baby Genevieve; "
+            "happy birthday morning in the open scenery; strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "afternoon": (
+            "Special Birthday Celebration for Isaac (3 years old, Afternoon): Joyful sunlit birthday celebration with playful colorful balloons, bright streamers, "
+            "and a celebratory birthday cake with glowing candles resting on a rustic table in the open background; toddler Isaac is the smiling birthday boy "
+            "with Rosie and baby Genevieve celebrating together; strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "evening": (
+            "Special Birthday Celebration for Isaac (3 years old, Evening): Warm twilight dusk birthday celebration with glowing party lanterns, colorful festive balloons, "
+            "and a celebratory birthday cake with glowing candles casting gentle amber light in the open scenery; toddler Isaac, older sister Rosie, and baby Genevieve enjoying sweet evening birthday warmth; "
+            "strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+    },
+    "eve": {
+        "name": "Genevieve's Birthday",
+        "child": "Genevieve (Eve)",
+        "general": (
+            "Special Birthday Celebration for baby Genevieve (Eve): Sweet pastel celebratory balloons and delicate ribbons decorate the open scenery; "
+            "a sweet celebratory milestone birthday cake with glowing candles rests on a rustic table in the open midground; baby Genevieve is cradled lovingly as the celebrated birthday baby "
+            "surrounded affectionately by older sister Rosie and toddler brother Isaac; all three siblings remain in weather-matched outfits "
+            "with strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "morning": (
+            "Special Birthday Celebration for baby Genevieve (Eve, Morning): Gentle morning dawn light illuminating soft pastel celebratory balloons, delicate ribbons, "
+            "and a celebratory birthday cake with glowing candles in the open scenery; baby Genevieve is swaddled and cradled lovingly by Rosie with toddler Isaac smiling close by; "
+            "sweet birthday morning celebration; strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "afternoon": (
+            "Special Birthday Celebration for baby Genevieve (Eve, Afternoon): Sunlit daytime milestone celebration with gentle pastel balloons, festive ribbons, "
+            "and a celebratory birthday cake with glowing candles on a rustic garden table in the open background; baby Genevieve cradled at the center of sibling love with Rosie and Isaac; "
+            "strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+        "evening": (
+            "Special Birthday Celebration for baby Genevieve (Eve, Evening): Cozy twilight celebration with soft warm glowing lanterns, delicate pastel balloons, "
+            "and a celebratory birthday cake with glowing candles casting gentle warmth in the evening landscape; baby Genevieve resting contentedly in loving arms with Rosie and Isaac; "
+            "strict zero-text guardrails (no letters, words, numbers, or signs on cake or decorations)."
+        ),
+    },
+}
+
+
+def resolve_holiday(target_date: str) -> dict[str, str] | None:
+    """Resolve whether target_date (YYYY-MM-DD) matches a US holiday recognized by Hearth.
+
+    Matches Hearth schoolDayPack.ts holiday rules:
+    - new_years (01-01)
+    - valentines (02-14)
+    - easter (Gregorian Computus)
+    - memorial_day (last Mon of May: month 5, Mon, day>=25)
+    - july_4th (07-04)
+    - labor_day (first Mon of Sep: month 9, Mon, day<=7)
+    - halloween (10-31)
+    - thanksgiving (4th Thu of Nov: month 11, Thu, 22<=day<=28)
+    - christmas (12-24 and 12-25)
+
+    Returns dict with keys ('key', 'name', 'theming', 'description', 'morning', 'afternoon', 'evening') or None.
+    """
+    if not target_date or not isinstance(target_date, str):
+        return None
+    try:
+        dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+    month, day, weekday = dt.month, dt.day, dt.weekday()
+
+    holiday_key: str | None = None
+    if month == 1 and day == 1:
+        holiday_key = "new_years"
+    elif month == 2 and day == 14:
+        holiday_key = "valentines"
+    elif (month, day) == calculate_easter(dt.year):
+        holiday_key = "easter"
+    elif month == 5 and weekday == 0 and day >= 25:
+        holiday_key = "memorial_day"
+    elif month == 7 and day == 4:
+        holiday_key = "july_4th"
+    elif month == 9 and weekday == 0 and day <= 7:
+        holiday_key = "labor_day"
+    elif month == 10 and day == 31:
+        holiday_key = "halloween"
+    elif month == 11 and weekday == 3 and 22 <= day <= 28:
+        holiday_key = "thanksgiving"
+    elif month == 12 and day in (24, 25):
+        holiday_key = "christmas"
+
+    if holiday_key and holiday_key in HOLIDAY_THEMING:
+        entry = HOLIDAY_THEMING[holiday_key]
+        return {
+            "key": holiday_key,
+            "name": entry["name"],
+            "theming": entry["general"],
+            "description": entry["general"],
+            "morning": entry["morning"],
+            "afternoon": entry["afternoon"],
+            "evening": entry["evening"],
+        }
+    return None
+
+
+def resolve_birthday(target_date: str) -> dict[str, str] | None:
+    """Resolve whether target_date (YYYY-MM-DD) matches a family birthday.
+
+    Hearth family birthdays:
+    - Rosie: Nov 7 (11-07)
+    - Isaac: Dec 26 (12-26)
+    - Genevieve/Eve: Sep 3 (09-03)
+
+    Returns dict with keys ('key', 'name', 'child', 'theming', 'description', 'morning', 'afternoon', 'evening') or None.
+    """
+    if not target_date or not isinstance(target_date, str):
+        return None
+    try:
+        dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+    month, day = dt.month, dt.day
+    bday_key: str | None = None
+    if month == 11 and day == 7:
+        bday_key = "rosie"
+    elif month == 12 and day == 26:
+        bday_key = "isaac"
+    elif month == 9 and day == 3:
+        bday_key = "eve"
+
+    if bday_key and bday_key in BIRTHDAY_THEMING:
+        entry = BIRTHDAY_THEMING[bday_key]
+        return {
+            "key": bday_key,
+            "name": entry["name"],
+            "child": entry["child"],
+            "theming": entry["general"],
+            "description": entry["general"],
+            "morning": entry["morning"],
+            "afternoon": entry["afternoon"],
+            "evening": entry["evening"],
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 6. Prompt Construction
 # ---------------------------------------------------------------------------
 def build_slot_prompt(
@@ -1012,12 +1387,13 @@ def build_slot_prompt(
     theme: dict[str, Any],
     weather_info: dict[str, Any],
     family_context: dict[str, Any] | None = None,
+    target_date: str | None = None,
 ) -> str:
     """Build a complete, surgical 16:9 prompt for a specific weather card slot.
 
     Includes style medium, slot lighting, explicit forecast weather atmosphere,
-    weather-matched attire override mandate, scene flavor, character consistency clause,
-    right-weighted 42% composition invariant, and negative guardrails.
+    weather-matched attire override mandate, scene flavor, holiday/birthday special occasion theming,
+    character consistency clause, right-weighted 42% composition invariant, and negative guardrails.
     """
     temp_f = float(weather_info.get("temp_f", 60.0))
     condition = str(weather_info.get("condition", "partlycloudy") or "partlycloudy").strip()
@@ -1098,12 +1474,28 @@ def build_slot_prompt(
             "wooden boardwalk footbridges, and a glowing friendly winged fairy (Navi) hovering warmly near the children."
         )
 
+    # Check for holiday / birthday special occasion theming
+    occasion_clause = ""
+    if target_date:
+        holiday_info = resolve_holiday(target_date)
+        birthday_info = resolve_birthday(target_date)
+        occasion_parts: list[str] = []
+        if holiday_info:
+            holiday_desc = holiday_info.get(slot) or holiday_info.get("theming") or holiday_info.get("description", "")
+            occasion_parts.append(f"Holiday Celebration ({holiday_info['name']}): {holiday_desc}")
+        if birthday_info:
+            bday_desc = birthday_info.get(slot) or birthday_info.get("theming") or birthday_info.get("description", "")
+            occasion_parts.append(f"Family Birthday ({birthday_info['name']}): {bday_desc}")
+        if occasion_parts:
+            joined = " ".join(occasion_parts)
+            occasion_clause = f" SPECIAL OCCASION THEMING: {joined}"
+
     full_prompt = (
         f"{prompt_style}. "
         f"{choreography_desc} "
         f"{attire_mandate_clause} "
         f"Atmosphere: {lighting_desc}. {weather_atmosphere_clause} "
-        f"Setting: {scene_flavor}.{easter_egg_clause}{special_flavor} "
+        f"Setting: {scene_flavor}.{easter_egg_clause}{special_flavor}{occasion_clause} "
         f"Characters: {BASE_CHARACTER_CONSISTENCY_CLAUSE} "
         f"Composed in cinematic horizontal 16:9 widescreen with rich artistic storytelling depth."
     )
@@ -1268,6 +1660,13 @@ def run_nightly_pipeline(
     slots_info = forecast_data["slots"]
     log.info("Resolved target date: %s", resolved_date)
 
+    holiday_info = resolve_holiday(resolved_date)
+    birthday_info = resolve_birthday(resolved_date)
+    if holiday_info:
+        log.info("Detected holiday for %s: %s (%s)", resolved_date, holiday_info["name"], holiday_info["key"])
+    if birthday_info:
+        log.info("Detected birthday for %s: %s (%s)", resolved_date, birthday_info["name"], birthday_info["key"])
+
     # 2. Family Context Collection
     family_context = collect_family_context()
     log.info(
@@ -1347,6 +1746,7 @@ def run_nightly_pipeline(
             theme=selected_theme,
             weather_info=slot_weather,
             family_context=family_context,
+            target_date=resolved_date,
         )
         card_filename = f"daily_{resolved_date}_{slot_name}.jpg"
         target_card_path = out_dir / card_filename
@@ -1490,6 +1890,7 @@ def run_nightly_pipeline(
         "selection_reason": selection_reason,
         "reference_image": ref_img_path,
         "dry_run": dry_run,
+        "allow_on_holiday": bool(holiday_info),
         "context_used": {
             "switch_titles": family_context["switch"][:5],
             "matched_themes": family_context["matched_themes"],
@@ -1501,6 +1902,13 @@ def run_nightly_pipeline(
         },
         "slot_details": manifest_slots,
     }
+    if holiday_info:
+        manifest["holiday"] = holiday_info["name"]
+        manifest["holiday_key"] = holiday_info["key"]
+    if birthday_info:
+        manifest["birthday"] = birthday_info["name"]
+        manifest["birthday_child"] = birthday_info["child"]
+        manifest["birthday_key"] = birthday_info["key"]
 
     manifest_path = out_dir / "daily_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1534,6 +1942,9 @@ def run_nightly_pipeline(
         "manifest_path": str(manifest_path),
         "manifest": manifest,
         "deploy": deploy_status,
+        "allow_on_holiday": bool(holiday_info),
+        "holiday": holiday_info["name"] if holiday_info else None,
+        "birthday": birthday_info["name"] if birthday_info else None,
     }
 
 
