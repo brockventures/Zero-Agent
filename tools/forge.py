@@ -4659,7 +4659,7 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
         "description": desc[:4000],
         "color": color,
         "footer": {
-            "text": f"{build['id']} · Updated {_now_pt_str(build['updated_at'])}{footer_suffix}"
+            "text": f"Updated {_now_pt_str(build['updated_at'])}{footer_suffix}"
         },
     }
 
@@ -4822,7 +4822,7 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
         "description": desc[:4000],
         "color": color,
         "footer": {
-            "text": f"{task_id} · {_now_pt_str(footer_time)}{footer_suffix}"
+            "text": f"{_now_pt_str(footer_time)}{footer_suffix}"
         },
     }
 
@@ -5036,6 +5036,7 @@ def _sweep_stale_forge_channel_embeds(
             emb = embeds[0]
             title = str(emb.get("title") or "")
             desc = str(emb.get("description") or "")
+            first_line = desc.splitlines()[0] if desc else ""
             footer_text = str((emb.get("footer") or {}).get("text") or "")
             id_match = re.search(r"(?:Build\s+ID:\s*|Job\s+ID:\s*|\b)((?:fg|dt)-[A-Za-z0-9_-]+)", footer_text)
             entity_id = id_match.group(1) if id_match else f"msg-{msg_id_raw}"
@@ -5043,35 +5044,13 @@ def _sweep_stale_forge_channel_embeds(
             ts_str = msg.get("edited_timestamp") or msg.get("timestamp")
             msg_ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() if ts_str else 0.0
 
-            is_duplicate_entity = False
-            if id_match:
-                if entity_id in seen_entity_ids:
-                    is_duplicate_entity = True
-                else:
-                    seen_entity_ids.add(entity_id)
-
-            is_cancelled = title.startswith("🛑") or desc.startswith("**CANCELLED**")
-            is_failed_dt = (
-                entity_id.startswith("dt-")
-                and (
-                    title.startswith(("❌", "⏱️", "⚠️"))
-                    or desc.startswith(("**FAILED**", "**TIMED OUT**", "**INTERRUPTED**", "**UNKNOWN EXIT**"))
-                )
-            )
-            is_terminal = (
-                is_cancelled
-                or is_failed_dt
-                or title.startswith(("✅", "❌", "⏱️"))
-                or desc.startswith(("**COMPLETED**", "**FAILED**", "**TIMED OUT**", "**INTERRUPTED**", "**UNKNOWN EXIT**"))
-            )
-
+            found_in_db = False
+            db_status = ""
             db_ts = 0.0
-            if id_match:
-                found_in_db = False
-                db_status = ""
-                for target_db in db_paths:
-                    try:
-                        with get_db_connection(target_db) as conn:
+            for target_db in db_paths:
+                try:
+                    with get_db_connection(target_db) as conn:
+                        if id_match:
                             if entity_id.startswith("fg-"):
                                 row = conn.execute(
                                     "SELECT status, updated_at, created_at FROM forge_builds WHERE id = ?",
@@ -5092,21 +5071,100 @@ def _sweep_stale_forge_channel_embeds(
                                     db_status = str(row["status"] or "").strip().lower()
                                     db_ts = float(row["end_time"] or row["start_time"] or 0.0)
                                     break
-                    except Exception:
-                        continue
+                        else:
+                            row = conn.execute(
+                                "SELECT id, status, updated_at, created_at FROM forge_builds WHERE forge_message_id = ?",
+                                (int(msg_id_raw),),
+                            ).fetchone()
+                            if row:
+                                entity_id = str(row["id"])
+                                found_in_db = True
+                                db_status = str(row["status"] or "").strip().lower()
+                                db_ts = float(row["updated_at"] or row["created_at"] or 0.0)
+                                break
+                            row = conn.execute(
+                                "SELECT id, status, end_time, start_time FROM forge_jobs WHERE forge_message_id = ?",
+                                (int(msg_id_raw),),
+                            ).fetchone()
+                            if row:
+                                entity_id = str(row["id"])
+                                found_in_db = True
+                                db_status = str(row["status"] or "").strip().lower()
+                                db_ts = float(row["end_time"] or row["start_time"] or 0.0)
+                                break
+                except Exception:
+                    continue
 
-                if found_in_db:
-                    if db_status == "cancelled":
-                        is_cancelled = True
-                    if entity_id.startswith("dt-") and db_status in ("failed", "timed_out", "unknown_exit"):
-                        is_failed_dt = True
-                    if db_status in ("completed", "failed", "cancelled", "timed_out", "unknown_exit"):
-                        is_terminal = True
-                elif msg_ts > 0 and (now - msg_ts) >= 7200.0:
+            is_duplicate_entity = False
+            if id_match or found_in_db:
+                if entity_id in seen_entity_ids:
+                    is_duplicate_entity = True
+                else:
+                    seen_entity_ids.add(entity_id)
+
+            is_notice_card = desc.lstrip().startswith("**NOTICE**")
+            is_decision_card = (
+                title.startswith("🛡️")
+                or footer_text == "Expired without action"
+                or footer_text.endswith("· Executing...")
+                or footer_text.startswith(("Approved & Executed", "Dismissed · ", "Failed · "))
+            )
+            if is_notice_card and not found_in_db and not id_match:
+                continue
+
+            is_build_card = entity_id.startswith("fg-") or (
+                not is_notice_card
+                and not is_decision_card
+                and bool(re.search(r"\*\*\d+/\d+\*\*\s+chunks\b", first_line))
+            )
+            is_job_card = entity_id.startswith("dt-") or (
+                not is_notice_card
+                and not is_decision_card
+                and not is_build_card
+                and (
+                    "**Command:**" in desc
+                    or ("· ⏱️ " in first_line and "chunks" not in first_line)
+                )
+            )
+
+            is_cancelled = title.startswith("🛑") or desc.startswith("**CANCELLED**")
+            is_failed_dt = (
+                is_job_card
+                and (
+                    title.startswith(("❌", "⏱️", "⚠️"))
+                    or desc.startswith(("**FAILED**", "**TIMED OUT**", "**INTERRUPTED**", "**UNKNOWN EXIT**"))
+                )
+            )
+            is_terminal = (
+                is_cancelled
+                or is_failed_dt
+                or title.startswith(("✅", "❌", "⏱️"))
+                or desc.startswith(("**COMPLETED**", "**FAILED**", "**TIMED OUT**", "**INTERRUPTED**", "**UNKNOWN EXIT**"))
+            )
+
+            if found_in_db:
+                if db_status == "cancelled":
+                    is_cancelled = True
+                if entity_id.startswith("dt-") and db_status in ("failed", "timed_out", "unknown_exit"):
+                    is_failed_dt = True
+                if db_status in ("completed", "failed", "cancelled", "timed_out", "unknown_exit"):
+                    is_terminal = True
+            elif msg_ts > 0 and (now - msg_ts) >= 7200.0:
+                is_active_build = (
+                    is_build_card
+                    and desc.startswith(("**RUNNING**", "**QUEUED**", "**AWAITING APPROVAL**"))
+                )
+                is_active_job = (
+                    is_job_card
+                    and desc.startswith(("**RUNNING**", "**STARTING**"))
+                )
+                if id_match or is_active_build or is_active_job:
                     is_terminal = True
 
             is_stuck_starting = (
-                (title.startswith("⏳") or desc.startswith("**STARTING**"))
+                not is_notice_card
+                and not is_decision_card
+                and (title.startswith("⏳") or desc.startswith("**STARTING**"))
                 and msg_ts > 0
                 and (now - msg_ts) >= 120.0
             )
@@ -12483,12 +12541,14 @@ def _merge_remote_active_embeds_into_header(
     remote_build_lines: list[str] = []
     remote_job_lines: list[str] = []
     seen_ids: set[str] = set()
+    seen_titles: set[str] = set()
     content_lower = content.lower()
 
     for msg in messages:
         try:
             active_hdr_id = get_forge_header_message_id()
-            if int(msg.get("id", 0)) in (FORGE_HEADER_MESSAGE_ID, active_hdr_id):
+            msg_id_raw = msg.get("id", 0)
+            if int(msg_id_raw) in (FORGE_HEADER_MESSAGE_ID, active_hdr_id):
                 continue
             embeds = msg.get("embeds") or []
             if not embeds:
@@ -12496,27 +12556,60 @@ def _merge_remote_active_embeds_into_header(
             emb = embeds[0]
             title = str(emb.get("title") or "").strip()
             desc = str(emb.get("description") or "").strip()
+            first_line = desc.splitlines()[0] if desc else ""
             footer_text = str((emb.get("footer") or {}).get("text") or "")
             id_match = re.search(r"(?:Build\s+ID:\s*|Job\s+ID:\s*|\b)((?:fg|dt)-[A-Za-z0-9_-]+)", footer_text)
-            if not id_match:
+            entity_id = id_match.group(1) if id_match else f"msg-{msg_id_raw}"
+
+            is_notice = desc.lstrip().startswith("**NOTICE**")
+            is_build_status = desc.startswith(("**RUNNING**", "**QUEUED**", "**AWAITING APPROVAL**"))
+            is_job_status = desc.startswith(("**RUNNING**", "**STARTING**"))
+            is_active_build = is_build_status and (
+                (id_match is not None and entity_id.startswith("fg-"))
+                or (
+                    id_match is None
+                    and not is_notice
+                    and bool(re.search(r"\*\*\d+/\d+\*\*\s+chunks\b", first_line))
+                )
+            )
+            is_active_job = is_job_status and (
+                (id_match is not None and entity_id.startswith("dt-"))
+                or (
+                    id_match is None
+                    and not is_active_build
+                    and not is_notice
+                    and "chunks" not in first_line
+                    and ("**Command:**" in desc or "· ⏱️ " in first_line)
+                )
+            )
+            if not is_active_build and not is_active_job:
                 continue
-            entity_id = id_match.group(1)
+
             clean_title = re.sub(r"^[^\w\s]+\s*", "", title).strip()
             short_title = _truncate_label(clean_title, 56)
-            if entity_id in seen_ids or f"`{entity_id}`" in content or (short_title and short_title.lower() in content_lower):
+            title_key = short_title.lower() if short_title else ""
+            if (
+                entity_id in seen_ids
+                or (id_match and f"`{entity_id}`" in content)
+                or (title_key and (title_key in seen_titles or title_key in content_lower))
+            ):
                 seen_ids.add(entity_id)
+                if title_key:
+                    seen_titles.add(title_key)
                 continue
             seen_ids.add(entity_id)
+            if title_key:
+                seen_titles.add(title_key)
 
-            first_line = desc.splitlines()[0] if desc else ""
             ch_match = re.search(r"(<#\d+>)", first_line)
             ch_ref = ch_match.group(1) if ch_match else f"<#{FORGE_CHANNEL_ID}>"
 
-            if entity_id.startswith("fg-") and desc.startswith(("**RUNNING**", "**QUEUED**", "**AWAITING APPROVAL**")):
-                st_label = (first_line.split("**")[1] if "**" in first_line else "RUNNING").title()
+            m_st = re.match(r"^\*\*([^*]+)\*\*", first_line)
+            st_label = (m_st.group(1) if m_st else "RUNNING").title()
+            if is_active_build:
                 remote_build_lines.append(f"- 🔨 **{short_title}** · {st_label} ({ch_ref})")
-            elif entity_id.startswith("dt-") and desc.startswith("**RUNNING**"):
-                remote_job_lines.append(f"- ⚙️ **{short_title}** · Running ({ch_ref})")
+            elif is_active_job:
+                remote_job_lines.append(f"- ⚙️ **{short_title}** · {st_label} ({ch_ref})")
         except Exception:
             continue
 

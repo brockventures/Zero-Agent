@@ -7801,5 +7801,327 @@ def test_approval_gate_excludes_test_doc_prompt_files_from_blast_radius(tmp_path
     assert reasons == []
 
 
+def test_widget_embed_footers_omit_alphanumeric_ids(tmp_path):
+    """Verify build and job embed footers omit fg-/dt- IDs while keeping timestamps and Auto-clears in 1h."""
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    now = time.time()
+
+    build_id = "fg-1795700001-footer-test"
+    job_id = "dt-1795700001-footer-test"
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at)
+            VALUES (?, 'Clean Footer Build', 'obj', '/workspace', 2, 123, 'running', ?, ?)
+            """,
+            (build_id, now - 30.0, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (build_id, chunk_index, title, status, target_files_json, instructions, started_at)
+            VALUES (?, 0, 'Chunk One', 'running', '["tools/forge.py"]', 'Do work', ?)
+            """,
+            (build_id, now - 20.0),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time)
+            VALUES (?, 'Clean Footer Job', 'pytest tools/test_forge.py', 'zero-chat', '/workspace', 60, 'running', ?, NULL)
+            """,
+            (job_id, now - 15.0),
+        )
+
+    active_build_embed = forge.render_build_widget_embed(build_id, db_path=db_p)
+    b_footer = active_build_embed["footer"]["text"]
+    assert build_id not in b_footer
+    assert b_footer.startswith("Updated ")
+    assert "Auto-clears in 1h" not in b_footer
+
+    active_job_embed = forge.render_job_widget_embed(job_id, db_path=db_p)
+    j_footer = active_job_embed["footer"]["text"]
+    assert job_id not in j_footer
+    assert "PT" in j_footer
+    assert "Auto-clears in 1h" not in j_footer
+
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+            (now, build_id),
+        )
+        conn.execute(
+            "UPDATE forge_chunks SET status = 'merged', completed_at = ? WHERE build_id = ?",
+            (now, build_id),
+        )
+        conn.execute(
+            "UPDATE forge_jobs SET status = 'completed', end_time = ? WHERE id = ?",
+            (now, job_id),
+        )
+
+    done_build_embed = forge.render_build_widget_embed(build_id, db_path=db_p)
+    done_b_footer = done_build_embed["footer"]["text"]
+    assert build_id not in done_b_footer
+    assert done_b_footer.startswith("Updated ")
+    assert done_b_footer.endswith("· Auto-clears in 1h")
+
+    done_job_embed = forge.render_job_widget_embed(job_id, db_path=db_p)
+    done_j_footer = done_job_embed["footer"]["text"]
+    assert job_id not in done_j_footer
+    assert "PT" in done_j_footer
+    assert done_j_footer.endswith("· Auto-clears in 1h")
+
+
+def test_sweep_stale_forge_channel_embeds_without_footer_ids(tmp_path, monkeypatch):
+    """Verify _sweep_stale_forge_channel_embeds resolves DB rows via forge_message_id and handles ID-less cards safely."""
+    from datetime import datetime, timezone
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    now = time.time()
+    old_build_ts = now - 3700.0
+    failed_job_ts = now - 700.0  # > 10m FAILED_JOB_WIDGET_TTL_SECONDS, < 1h cutoff
+
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at, forge_message_id)
+            VALUES ('fg-db-msg-1', 'DB Completed Build', 'obj', '/workspace', 2, 123, 'completed', ?, ?, 2000000001)
+            """,
+            (old_build_ts - 60.0, old_build_ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES ('dt-db-msg-1', 'DB Failed Job', 'python3 job.py', 'zero-chat', '/workspace', 60, 'failed', ?, ?, 2000000002)
+            """,
+            (failed_job_ts - 60.0, failed_job_ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at, forge_message_id)
+            VALUES ('fg-db-active-1', 'DB Active Build', 'obj', '/workspace', 2, 123, 'running', ?, ?, 2000000003)
+            """,
+            (now - 120.0, now - 60.0),
+        )
+
+    old_iso = datetime.fromtimestamp(now - 8000.0, tz=timezone.utc).isoformat()
+    recent_iso = datetime.fromtimestamp(now - 30.0, tz=timezone.utc).isoformat()
+    failed_iso = datetime.fromtimestamp(now - 700.0, tz=timezone.utc).isoformat()
+
+    fake_messages = [
+        # 1. Terminal build resolved via forge_message_id (no footer ID, card stuck showing RUNNING)
+        {
+            "id": "2000000001",
+            "timestamp": recent_iso,
+            "embeds": [
+                {
+                    "title": "🔨 DB Completed Build",
+                    "description": "**RUNNING** · `Zero-Agent` · <#123> · **0/1** chunks",
+                    "footer": {"text": "Updated 2026-11-26 08:00:00 AM PT"},
+                }
+            ],
+        },
+        # 2. Failed job resolved via forge_message_id (no footer ID, >10m old)
+        {
+            "id": "2000000002",
+            "timestamp": recent_iso,
+            "embeds": [
+                {
+                    "title": "⚙️ DB Failed Job",
+                    "description": "**RUNNING** · `Zero-Agent` · <#123> · ⏱️ 1m 0s",
+                    "footer": {"text": "2026-11-26 08:40:00 AM PT"},
+                }
+            ],
+        },
+        # 3. Active build in DB (must NOT be swept)
+        {
+            "id": "2000000003",
+            "timestamp": recent_iso,
+            "embeds": [
+                {
+                    "title": "🔨 DB Active Build",
+                    "description": "**RUNNING** · `Zero-Agent` · <#123> · **0/1** chunks",
+                    "footer": {"text": "Updated 2026-11-26 08:50:00 AM PT"},
+                }
+            ],
+        },
+        # 4. Orphaned active job missing from DB and >2h old (must be swept)
+        {
+            "id": "2000000004",
+            "timestamp": old_iso,
+            "embeds": [
+                {
+                    "title": "⚙️ Orphaned Remote Job",
+                    "description": "**RUNNING** · `Zero-Agent` · <#123> · ⏱️ 5s\n\n**Command:** `python3 long.py`",
+                    "footer": {"text": "2026-11-26 06:00:00 AM PT"},
+                }
+            ],
+        },
+        # 5. Orphaned failed job missing from DB and >10m old (must honor 10m TTL)
+        {
+            "id": "2000000005",
+            "timestamp": failed_iso,
+            "embeds": [
+                {
+                    "title": "❌ Orphaned Failed Job",
+                    "description": "**FAILED** · `Zero-Agent` · <#123> · ⏱️ 12s\n\n**Command:** `python3 fail.py`",
+                    "footer": {"text": "2026-11-26 08:40:00 AM PT · Auto-clears in 1h"},
+                }
+            ],
+        },
+        # 6. Non-job NOTICE card >2h old (must NOT be swept)
+        {
+            "id": "2000000006",
+            "timestamp": old_iso,
+            "embeds": [
+                {
+                    "title": "⚠️ System Warning",
+                    "description": "**NOTICE** · Non-job warning · ⏱️ 10s",
+                    "footer": {"text": "Notice"},
+                }
+            ],
+        },
+        # 7. Pending Decision Card >2h old (must NOT be swept)
+        {
+            "id": "2000000007",
+            "timestamp": old_iso,
+            "embeds": [
+                {
+                    "title": "🛡️ Pending Approval",
+                    "description": "**Action:** Approve deployment",
+                }
+            ],
+        },
+    ]
+
+    deleted_ids: list[str] = []
+
+    class FakeResp:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    monkeypatch.setattr(forge.requests, "get", lambda url, **kw: FakeResp(200, fake_messages))
+    monkeypatch.setattr(
+        forge.requests,
+        "delete",
+        lambda url, **kw: (deleted_ids.append(url.rsplit("/", 1)[-1]), FakeResp(204))[1],
+    )
+
+    swept = forge._sweep_stale_forge_channel_embeds(
+        cutoff=now - 3600.0,
+        forge_channel_id=forge.FORGE_CHANNEL_ID,
+        token="fake-token",
+        db_paths=[db_p],
+    )
+    assert "fg-db-msg-1" in swept
+    assert "dt-db-msg-1" in swept
+    assert "msg-2000000004" in swept
+    assert "msg-2000000005" in swept
+    assert set(deleted_ids) == {"2000000001", "2000000002", "2000000004", "2000000005"}
+
+
+def test_merge_remote_active_embeds_without_footer_ids(monkeypatch):
+    """Verify _merge_remote_active_embeds_into_header merges active builds/jobs without footer IDs and deduplicates cleanly."""
+    import tools.forge as forge
+
+    monkeypatch.setattr(forge, "get_forge_header_message_id", lambda: 999999999)
+
+    fake_messages = [
+        {
+            "id": "3000000001",
+            "embeds": [
+                {
+                    "title": "🔨 Remote Peer Build",
+                    "description": "**RUNNING** · `Zero-Agent` · <#1542081375287640084> · **1/2** chunks",
+                    "footer": {"text": "Updated 2026-11-26 08:50:00 AM PT"},
+                }
+            ],
+        },
+        {
+            "id": "3000000002",
+            "embeds": [
+                {
+                    "title": "🔨 Remote Peer Build",
+                    "description": "**RUNNING** · `Zero-Agent` · <#1542081375287640084> · **1/2** chunks",
+                    "footer": {"text": "Updated 2026-11-26 08:49:00 AM PT"},
+                }
+            ],
+        },
+        {
+            "id": "3000000003",
+            "embeds": [
+                {
+                    "title": "⚙️ Remote Peer Task",
+                    "description": "**RUNNING** · `Ivy-Agent` · <#1548196929308065893> · ⏱️ 25s\n\n**Command:** `pytest tools/`",
+                    "footer": {"text": "2026-11-26 08:50:00 AM PT"},
+                }
+            ],
+        },
+        {
+            "id": "3000000004",
+            "embeds": [
+                {
+                    "title": "⏳ Queued Startup Task",
+                    "description": "**STARTING** · `Zero-Agent` · <#1542081375287640084> · ⏱️ 2s",
+                    "footer": {"text": "2026-11-26 08:50:10 AM PT"},
+                }
+            ],
+        },
+        {
+            "id": "3000000005",
+            "embeds": [
+                {
+                    "title": "⚠️ System Warning",
+                    "description": "**RUNNING** · **NOTICE** · Ignored notice",
+                    "footer": {"text": "Notice"},
+                }
+            ],
+        },
+        {
+            "id": "3000000006",
+            "embeds": [
+                {
+                    "title": "✅ Completed Remote Build",
+                    "description": "**COMPLETED** · `Zero-Agent` · <#1542081375287640084> · **2/2** chunks · ⏱️ 1m 0s",
+                    "footer": {"text": "Updated 2026-11-26 08:40:00 AM PT · Auto-clears in 1h"},
+                }
+            ],
+        },
+    ]
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return fake_messages
+
+    monkeypatch.setattr(forge.requests, "get", lambda url, **kw: FakeResp())
+
+    base_header = (
+        "## ⚒️ VULCAN · FORGE Board\n"
+        "**Active Builds:** None\n\n"
+        "**Active Tasks:** None\n\n"
+        "**Pending Approvals:** None"
+    )
+    merged = forge._merge_remote_active_embeds_into_header(
+        base_header,
+        forge.FORGE_CHANNEL_ID,
+        "fake-token",
+    )
+    assert merged.count("- 🔨 **Remote Peer Build**") == 1
+    assert "- 🔨 **Remote Peer Build** · Running (<#1542081375287640084>)" in merged
+    assert "- ⚙️ **Remote Peer Task** · Running (<#1548196929308065893>)" in merged
+    assert "- ⚙️ **Queued Startup Task** · Starting (<#1542081375287640084>)" in merged
+    assert "System Warning" not in merged
+    assert "Completed Remote Build" not in merged
+
+
 if __name__ == "__main__":
     unittest.main()
