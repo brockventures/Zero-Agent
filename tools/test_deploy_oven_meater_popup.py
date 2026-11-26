@@ -471,6 +471,9 @@ console.log(JSON.stringify({
     hasChartTrendLine: modalOpenHtml.includes("cm-chart-trend-line"),
     hasChartNowDot: modalOpenHtml.includes("cm-chart-now-dot"),
     hasLargeModalCss: skeletonHtml.includes("min(92vw, 780px)") && skeletonHtml.includes("backdrop-filter: blur(12px)"),
+    hasKioskModalCss: skeletonHtml.includes("@media (min-width: 641px)") && skeletonHtml.includes(".cook-modal.kiosk-mode") && skeletonHtml.includes("min(94vw, 860px)"),
+    nonKioskDefaultMode: !cookBackdrop.classList.contains("kiosk-mode") && !cookModal.classList.contains("kiosk-mode"),
+    nonKioskChartSizes: modalOpenHtml.includes('font-size="12"') && modalOpenHtml.includes('font-size="11.5"'),
     hasLighterBackdropCss: skeletonHtml.includes("rgba(4, 8, 15, 0.44)"),
     hasTetherSvgInSkeleton: skeletonHtml.includes('id="cookTetherSvg"') && skeletonHtml.includes('class="cook-tether-svg"'),
     hasModalPositionedLeftOfOven: modalPosWhenOpen === "absolute" && parseFloat(modalLeftWhenOpen) === 106 && parseFloat(modalTopWhenOpen) === 122,
@@ -946,6 +949,155 @@ console.log(JSON.stringify({
         "expiredTarget": 160,
         "optAfterExpiry": None,
     }
+
+
+def test_apollo_kiosk_mode_large_typography_and_chart_scaling() -> None:
+    patched = mod.patch_card_js(REALISTIC_CARD_FIXTURE)
+    mod.verify_patched_card_contents(patched)
+    harness = (
+        patched
+        + """
+function makeMockEl(id = "") {
+  const classes = new Set();
+  const attrs = {};
+  return {
+    id,
+    style: {},
+    innerHTML: "",
+    classList: {
+      add: (...cs) => cs.forEach((c) => classes.add(c)),
+      remove: (...cs) => cs.forEach((c) => classes.delete(c)),
+      contains: (c) => classes.has(c),
+      toggle: (c, force) => (force ? classes.add(c) : classes.delete(c)),
+    },
+    setAttribute: (k, v) => { attrs[k] = String(v); },
+    getAttribute: (k) => (k in attrs ? attrs[k] : null),
+  };
+}
+
+const card = new BrockHouseCyclesCard();
+const cookBackdrop = makeMockEl("cookBackdrop");
+cookBackdrop.getBoundingClientRect = () => ({ left: 0, top: 0, width: 1920, height: 1080, right: 1920, bottom: 1080 });
+const cookTetherSvg = makeMockEl("cookTetherSvg");
+const cookModal = makeMockEl("cookModal");
+cookModal.getBoundingClientRect = () => {
+  const cap = cookModal.classList.contains("kiosk-mode") ? 860 : 780;
+  const w = cookModal.style.maxWidth ? Math.min(cap, parseFloat(cookModal.style.maxWidth)) : cap;
+  const l = cookModal.style.left ? parseFloat(cookModal.style.left) : 200;
+  const t = cookModal.style.top ? parseFloat(cookModal.style.top) : 120;
+  return { left: l, top: t, width: w, height: 680, right: l + w, bottom: t + 680 };
+};
+const hotspotEl = makeMockEl("hotspot");
+hotspotEl.getBoundingClientRect = () => ({ left: 1178, top: 480, width: 44, height: 44, right: 1222, bottom: 524 });
+card.shadowRoot = {
+  getElementById: (id) => {
+    if (id === "cookBackdrop") return cookBackdrop;
+    if (id === "cookTetherSvg") return cookTetherSvg;
+    if (id === "cookModal") return cookModal;
+    return null;
+  },
+  querySelector: (sel) => (sel === ".cook-hotspot" ? hotspotEl : null),
+};
+
+const now = Date.now();
+card._cookHistoryPoints = [
+  { ts: now - 30 * 60 * 1000, temp: 105 },
+  { ts: now - 15 * 60 * 1000, temp: 115 },
+  { ts: now, temp: 125 },
+];
+card._hass = {
+  callService: () => {},
+  states: {
+    "sensor.meater_meater_internal_temperature": { state: "125.0", attributes: {} },
+    "sensor.meater_meater_ambient_temperature": { state: "325.0", attributes: {} },
+    "sensor.meater_meater_battery": { state: "95", attributes: {} },
+    "sensor.meater_meater_eta": { state: "45", attributes: { rate_f_per_min: 0.75 } },
+    "sensor.meater_meater_cook_status": { state: "Cooking", attributes: { target_temp_f: 165.0 } },
+    "binary_sensor.meater_meater_connected": { state: "on", attributes: {} },
+    "number.meater_meater_target_temperature": { state: "165.0", attributes: { min: 100, max: 225, step: 1 } },
+  },
+};
+
+const skeletonHtml = card._renderSkeleton();
+
+// 1. ApolloSign kiosk mode ON
+card._isKioskMode = () => true;
+card._cookModalOpen = true;
+card._renderCookModal();
+const kioskBackdropHasCls = cookBackdrop.classList.contains("kiosk-mode");
+const kioskModalHasCls = cookModal.classList.contains("kiosk-mode");
+const kioskModalHtml = cookModal.innerHTML;
+const kioskLeft = parseFloat(cookModal.style.left);
+const kioskEmptyChart = card._buildCookChartSvg({ internalF: null, targetF: 165, rateFPerMin: null, etaMin: null }, [], true);
+
+// 2. Kiosk mode toggled OFF -> classes removed and width cap returns to 780
+card._isKioskMode = () => false;
+card._renderCookModal();
+const desktopBackdropHasCls = cookBackdrop.classList.contains("kiosk-mode");
+const desktopModalHasCls = cookModal.classList.contains("kiosk-mode");
+const desktopModalHtml = cookModal.innerHTML;
+const desktopLeft = parseFloat(cookModal.style.left);
+const desktopEmptyChart = card._buildCookChartSvg({ internalF: null, targetF: 165, rateFPerMin: null, etaMin: null }, [], false);
+
+console.log(JSON.stringify({
+  skeletonCssChecks: {
+    hasMinWidthMedia: skeletonHtml.includes("@media (min-width: 641px)"),
+    hasKioskWidth: skeletonHtml.includes("width: min(94vw, 860px);"),
+    hasTitleSize: skeletonHtml.includes(".cook-modal.kiosk-mode .cm-title") && skeletonHtml.includes("font-size: 26px;"),
+    hasGaugeTempSize: skeletonHtml.includes(".cook-modal.kiosk-mode .cm-gauge-temp") && skeletonHtml.includes("font-size: 48px;"),
+    hasEtaValSize: skeletonHtml.includes(".cook-modal.kiosk-mode .cm-stat-eta-val") && skeletonHtml.includes("font-size: 36px;"),
+    hasStepperSizes: skeletonHtml.includes("font-size: 30px;") && skeletonHtml.includes("font-size: 18.5px;"),
+    hasOvenTempSize: skeletonHtml.includes(".cook-modal.kiosk-mode .cm-oven-temp") && skeletonHtml.includes("font-size: 34px;"),
+    hasFootBtnSize: skeletonHtml.includes(".cook-modal.kiosk-mode .cm-foot .rd-mini-btn") && skeletonHtml.includes("padding: 10px 20px;"),
+  },
+  kioskBackdropHasCls,
+  kioskModalHasCls,
+  kioskLeft,
+  kioskChartChecks: {
+    hasPadL52: kioskModalHtml.includes('x1="52"') && kioskModalHtml.includes('x="58"'),
+    hasTickFont14: kioskModalHtml.includes('font-size="14"'),
+    hasRefFont135: kioskModalHtml.includes('font-size="13.5"'),
+    hasEtaFont145: kioskModalHtml.includes('font-size="14.5"'),
+    hasEmptyFont15: kioskEmptyChart.includes('font-size="15"') && kioskEmptyChart.includes('x="52"'),
+  },
+  desktopBackdropHasCls,
+  desktopModalHasCls,
+  desktopLeft,
+  desktopChartChecks: {
+    hasPadL46: desktopModalHtml.includes('x1="46"') && desktopModalHtml.includes('x="52"'),
+    hasYTick12: desktopModalHtml.includes('font-size="12"'),
+    hasRef115: desktopModalHtml.includes('font-size="11.5"'),
+    hasEmptyFont13: desktopEmptyChart.includes('font-size="13"') && desktopEmptyChart.includes('x="46"'),
+  },
+}));
+"""
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".js", encoding="utf-8", delete=False) as tmp:
+        tmp.write(harness)
+        tmp_path = Path(tmp.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        res = json.loads(proc.stdout.strip())
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    assert all(res["skeletonCssChecks"].values()), res["skeletonCssChecks"]
+    assert res["kioskBackdropHasCls"] is True
+    assert res["kioskModalHasCls"] is True
+    assert res["kioskLeft"] == 306  # 1200 - 34 - 860
+    assert all(res["kioskChartChecks"].values()), res["kioskChartChecks"]
+    assert res["desktopBackdropHasCls"] is False
+    assert res["desktopModalHasCls"] is False
+    assert res["desktopLeft"] == 386  # 1200 - 34 - 780
+    assert all(res["desktopChartChecks"].values()), res["desktopChartChecks"]
+
 
 
 

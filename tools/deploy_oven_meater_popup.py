@@ -1085,6 +1085,110 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
             border-radius: 9px;
           }
         }
+        @media (min-width: 641px) {
+          .cook-modal.kiosk-mode {
+            width: min(94vw, 860px);
+            padding: 24px 26px 26px;
+          }
+          .cook-modal.kiosk-mode .cm-title {
+            font-size: 26px;
+          }
+          .cook-modal.kiosk-mode .cm-sub {
+            font-size: 16px;
+          }
+          .cook-modal.kiosk-mode .cm-sec-label {
+            font-size: 16px;
+          }
+          .cook-modal.kiosk-mode .cm-status-pill {
+            font-size: 15.5px;
+            padding: 6px 14px;
+          }
+          .cook-modal.kiosk-mode .cm-gauge-wrap {
+            width: 204px;
+            height: 184px;
+          }
+          .cook-modal.kiosk-mode .cm-gauge-temp {
+            font-size: 48px;
+          }
+          .cook-modal.kiosk-mode .cm-gauge-target {
+            font-size: 18px;
+          }
+          .cook-modal.kiosk-mode .cm-stat-k {
+            font-size: 15px;
+          }
+          .cook-modal.kiosk-mode .cm-stat-v {
+            font-size: 24px;
+          }
+          .cook-modal.kiosk-mode .cm-stat-eta-val {
+            font-size: 36px;
+          }
+          .cook-modal.kiosk-mode .cm-stat-pull-badge {
+            font-size: 14.5px;
+          }
+          .cook-modal.kiosk-mode .cm-stat-rate-sub {
+            font-size: 13.5px;
+          }
+          .cook-modal.kiosk-mode .cm-chart-title {
+            font-size: 15.5px;
+          }
+          .cook-modal.kiosk-mode .cm-chart-pill {
+            font-size: 14.5px;
+          }
+          .cook-modal.kiosk-mode .cm-step-readout-val {
+            font-size: 30px;
+          }
+          .cook-modal.kiosk-mode .cm-step-readout-lbl {
+            font-size: 14px;
+          }
+          .cook-modal.kiosk-mode .cm-step-btn {
+            min-width: 62px;
+            height: 48px;
+            font-size: 18.5px;
+          }
+          .cook-modal.kiosk-mode .cm-protein-tab {
+            font-size: 15.5px;
+            padding: 11px 8px;
+          }
+          .cook-modal.kiosk-mode .cm-protein-icon {
+            width: 26px;
+            height: 26px;
+          }
+          .cook-modal.kiosk-mode .cm-protein-icon svg {
+            width: 24px;
+            height: 24px;
+          }
+          .cook-modal.kiosk-mode .cm-cut-name {
+            font-size: 16.5px;
+          }
+          .cook-modal.kiosk-mode .cm-cut-doneness {
+            font-size: 13.5px;
+          }
+          .cook-modal.kiosk-mode .cm-cut-temp {
+            font-size: 17.5px;
+          }
+          .cook-modal.kiosk-mode .cm-cut-rest {
+            font-size: 14.5px;
+          }
+          .cook-modal.kiosk-mode .cm-custom-note-title {
+            font-size: 16px;
+          }
+          .cook-modal.kiosk-mode .cm-custom-note-sub {
+            font-size: 14.5px;
+          }
+          .cook-modal.kiosk-mode .cm-oven-name {
+            font-size: 18px;
+          }
+          .cook-modal.kiosk-mode .cm-oven-temp {
+            font-size: 34px;
+          }
+          .cook-modal.kiosk-mode .cm-oven-meta {
+            font-size: 16px;
+          }
+          .cook-modal.kiosk-mode .cm-foot .rd-mini-btn {
+            font-size: 16px;
+            padding: 10px 20px;
+          }
+        }
         @media (max-width: 400px) {
           .cook-backdrop {
             padding: 4px;
@@ -1804,15 +1908,21 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     `;
   }
 
-  _buildCookChartSvg(meater, historyPoints) {
+  _buildCookChartSvg(meater, historyPoints, isApollo = false) {
     const W = 680;
     const H = 210;
-    const padL = 46;
+    const padL = isApollo ? 52 : 46;
     const padR = 24;
     const padT = 18;
     const padB = 28;
     const plotW = W - padL - padR;
     const plotH = H - padT - padB;
+    const emptyFs = isApollo ? "15" : "13";
+    const yTickFs = isApollo ? "14" : "12";
+    const xTickFs = isApollo ? "14" : "11.5";
+    const refLblFs = isApollo ? "13.5" : "11.5";
+    const etaLblFs = isApollo ? "14.5" : "12";
+    const pullLblOffset = isApollo ? 124 : 108;
 
     const proj = this._computeCookProjection(meater, historyPoints);
     const pts = proj.pts;
@@ -1824,7 +1934,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
       return `
         <svg class="cm-chart-svg" viewBox="0 0 680 210" role="img" aria-label="Temperature History and Projected Trend">
           <rect x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" rx="8" fill="rgba(15, 23, 42, 0.45)" stroke="rgba(148, 163, 184, 0.14)" />
-          <text x="${(padL + plotW / 2).toFixed(1)}" y="${(padT + plotH / 2 + 4).toFixed(1)}" text-anchor="middle" fill="#8ea7c4" font-size="13" font-weight="600">${this._escapeHtml(msg)}</text>
+          <text x="${(padL + plotW / 2).toFixed(1)}" y="${(padT + plotH / 2 + 4).toFixed(1)}" text-anchor="middle" fill="#8ea7c4" font-size="${emptyFs}" font-weight="600">${this._escapeHtml(msg)}</text>
         </svg>
       `;
     }
@@ -1868,7 +1978,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
       const y = yForTemp(val);
       gridLines.push(
         `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${padL + plotW}" y2="${y.toFixed(1)}" stroke="rgba(148, 163, 184, 0.16)" stroke-width="1" />`,
-        `<text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="#94aecb" font-size="12" font-weight="600">${val}°F</text>`
+        `<text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="#94aecb" font-size="${yTickFs}" font-weight="600">${val}°F</text>`
       );
     }
 
@@ -1896,7 +2006,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
       if (!tc.isNow) placedXs.push(tx);
       xTicks.push(
         `<line x1="${tx.toFixed(1)}" y1="${padT + plotH}" x2="${tx.toFixed(1)}" y2="${padT + plotH + 5}" stroke="rgba(148, 163, 184, 0.4)" stroke-width="1" />`,
-        `<text x="${tx.toFixed(1)}" y="${padT + plotH + 19}" text-anchor="middle" fill="${tc.isNow ? "#f8fafc" : "#94aecb"}" font-size="11.5" font-weight="${tc.isNow ? "700" : "600"}">${this._escapeHtml(tc.label)}</text>`
+        `<text x="${tx.toFixed(1)}" y="${padT + plotH + 19}" text-anchor="middle" fill="${tc.isNow ? "#f8fafc" : "#94aecb"}" font-size="${xTickFs}" font-weight="${tc.isNow ? "700" : "600"}">${this._escapeHtml(tc.label)}</text>`
       );
     }
 
@@ -1927,14 +2037,14 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
         const pullDotY = yForTemp(proj.pullF);
         pullDotSvg = `<circle class="cm-chart-pull-dot" cx="${pullX.toFixed(1)}" cy="${pullDotY.toFixed(1)}" r="3.8" fill="#fde047" stroke="#0c1422" stroke-width="1.5" />`;
       }
-      const lblAnchor = projX > padL + plotW - 95 ? "end" : "start";
+      const lblAnchor = projX > padL + plotW - (isApollo ? 115 : 95) ? "end" : "start";
       const lblX = lblAnchor === "end" ? projX - 8 : projX + 8;
-      const lblY = Math.max(padT + 13, Math.min(padT + plotH - 8, projY - 8));
+      const lblY = Math.max(padT + (isApollo ? 15 : 13), Math.min(padT + plotH - 8, projY - 8));
       trendSvg = `
         <line class="cm-chart-trend-line" x1="${nowX.toFixed(1)}" y1="${nowY.toFixed(1)}" x2="${projX.toFixed(1)}" y2="${projY.toFixed(1)}" stroke="#38bdf8" stroke-width="2.5" stroke-dasharray="7 5" stroke-linecap="round" />
         ${pullDotSvg}
         <circle class="cm-chart-trend-end" cx="${projX.toFixed(1)}" cy="${projY.toFixed(1)}" r="4.5" fill="#38bdf8" stroke="#ffffff" stroke-width="1.8" />
-        <text class="cm-chart-eta-label" x="${lblX.toFixed(1)}" y="${lblY.toFixed(1)}" text-anchor="${lblAnchor}" fill="#bae6fd" font-size="12" font-weight="700">${this._escapeHtml(proj.etaClockLabel)}</text>
+        <text class="cm-chart-eta-label" x="${lblX.toFixed(1)}" y="${lblY.toFixed(1)}" text-anchor="${lblAnchor}" fill="#bae6fd" font-size="${etaLblFs}" font-weight="700">${this._escapeHtml(proj.etaClockLabel)}</text>
       `;
     }
 
@@ -1949,9 +2059,9 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
         <rect class="cm-chart-future-zone" x="${nowX.toFixed(1)}" y="${padT}" width="${futureW.toFixed(1)}" height="${plotH}" fill="rgba(56, 189, 248, 0.065)" />
         ${gridLines.join("")}
         <line class="cm-chart-target-line" x1="${padL}" y1="${targetY.toFixed(1)}" x2="${padL + plotW}" y2="${targetY.toFixed(1)}" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="6 4" stroke-opacity="0.88" />
-        <text x="${padL + 6}" y="${Math.max(padT + 11, targetY - 4).toFixed(1)}" fill="#4ade80" font-size="11.5" font-weight="700">Target ${proj.targetF}°F</text>
+        <text x="${padL + 6}" y="${Math.max(padT + 11, targetY - 4).toFixed(1)}" fill="#4ade80" font-size="${refLblFs}" font-weight="700">Target ${proj.targetF}°F</text>
         <line class="cm-chart-pull-line" x1="${padL}" y1="${pullY.toFixed(1)}" x2="${padL + plotW}" y2="${pullY.toFixed(1)}" stroke="#fde047" stroke-width="1.5" stroke-dasharray="4 4" stroke-opacity="0.88" />
-        <text x="${padL + 108}" y="${Math.min(padT + plotH - 4, pullY + 13).toFixed(1)}" fill="#fde047" font-size="11.5" font-weight="700">Pull ${proj.pullF}°F</text>
+        <text x="${padL + pullLblOffset}" y="${Math.min(padT + plotH - 4, pullY + 13).toFixed(1)}" fill="#fde047" font-size="${refLblFs}" font-weight="700">Pull ${proj.pullF}°F</text>
         <line class="cm-chart-now-line" x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${padT + plotH}" stroke="rgba(226, 232, 240, 0.45)" stroke-width="1.5" stroke-dasharray="4 4" />
         <path class="cm-chart-history-area" d="${histAreaD}" fill="url(#cmHistFillGrad)" />
         <path class="cm-chart-history-line" d="${histLineD}" fill="none" stroke="#ff9248" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
@@ -1976,6 +2086,15 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     }
     backdrop.classList.add("open");
     backdrop.setAttribute("aria-hidden", "false");
+    const isApollo = typeof this._isKioskMode === "function" && this._isKioskMode();
+    const toggleKiosk = (el) => {
+      if (!el || !el.classList) return;
+      if (typeof el.classList.toggle === "function") el.classList.toggle("kiosk-mode", isApollo);
+      else if (isApollo && typeof el.classList.add === "function") el.classList.add("kiosk-mode");
+      else if (!isApollo && typeof el.classList.remove === "function") el.classList.remove("kiosk-mode");
+    };
+    toggleKiosk(backdrop);
+    toggleKiosk(modal);
 
     const oven = this._evalOvenStatus();
     const meater = this._evalMeaterStatus();
@@ -2160,7 +2279,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
             </div>
           </div>
           <div class="cm-chart-svg-wrap">
-            ${this._buildCookChartSvg(meater, this._cookHistoryPoints)}
+            ${this._buildCookChartSvg(meater, this._cookHistoryPoints, isApollo)}
           </div>
         </div>
         <div class="cm-stepper-card">
@@ -2259,6 +2378,8 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     const best = candidates[0];
 
     const mStyle = modal.style || (modal.style = {});
+    const isKiosk = Boolean(modal.classList && modal.classList.contains("kiosk-mode"));
+    const baseCapW = isKiosk ? 860 : 780;
     const isNarrow = bw < 680 || bh < 420 || best.room < 260;
     if (isNarrow) {
       mStyle.position = "relative";
@@ -2267,7 +2388,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
       mStyle.maxWidth = "";
     } else if (best.side === "left" || best.side === "right") {
       const availW = best.room - gap;
-      mStyle.maxWidth = availW >= 460 && availW < 780 ? `${Math.floor(availW)}px` : "";
+      mStyle.maxWidth = availW >= 460 && availW < baseCapW ? `${Math.floor(availW)}px` : "";
     } else {
       mStyle.maxWidth = "";
     }
@@ -2276,7 +2397,7 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
       typeof modal.getBoundingClientRect === "function"
         ? modal.getBoundingClientRect()
         : null;
-    const capW = mStyle.maxWidth ? parseFloat(mStyle.maxWidth) : 780;
+    const capW = mStyle.maxWidth ? parseFloat(mStyle.maxWidth) : baseCapW;
     const mw =
       mRectInit && Number(mRectInit.width) > 0
         ? Math.min(Number(mRectInit.width), capW)
@@ -2630,9 +2751,15 @@ def verify_patched_card_contents(card_js: str) -> None:
         ".cm-protein-tabs",
         ".cm-cut-grid",
         ".cm-stat-eta",
+        ".cook-modal.kiosk-mode",
+        "@media (min-width: 641px)",
         "@media (max-width: 640px)",
+        "_isKioskMode",
+        "kiosk-mode",
         "_optimisticTargetF",
         "min(92vw, 780px)",
+        "min(94vw, 860px)",
+        "baseCapW",
         "rgba(4, 8, 15, 0.44)",
         "cookBackdrop",
         "cookTetherSvg",
