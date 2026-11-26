@@ -225,7 +225,7 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
           position: absolute;
           inset: 0;
           z-index: 52;
-          background: rgba(5, 9, 16, 0.66);
+          background: rgba(4, 8, 15, 0.44);
           display: none;
           align-items: center;
           justify-content: center;
@@ -234,7 +234,27 @@ OVEN_MEATER_CSS = """        /* OVEN_MEATER_CSS_BEGIN */
         .cook-backdrop.open {
           display: flex;
         }
+        .cook-tether-svg {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          pointer-events: none;
+          z-index: 1;
+          overflow: visible;
+        }
+        .cook-tether-halo {
+          transform-box: fill-box;
+          transform-origin: center;
+          animation: cookHaloPulse 2.2s ease-in-out infinite;
+        }
+        @keyframes cookHaloPulse {
+          0%, 100% { transform: scale(0.92); opacity: 0.72; }
+          50% { transform: scale(1.18); opacity: 1; }
+        }
         .cook-modal {
+          position: relative;
+          z-index: 2;
           width: min(92vw, 780px);
           max-height: 92%;
           overflow-y: auto;
@@ -841,6 +861,10 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
     if (backdrop) {
       backdrop.classList.remove("open");
       backdrop.setAttribute("aria-hidden", "true");
+    }
+    const tetherSvg = this.shadowRoot?.getElementById("cookTetherSvg");
+    if (tetherSvg) {
+      tetherSvg.innerHTML = "";
     }
   }
 
@@ -1481,6 +1505,208 @@ OVEN_MEATER_HELPER_JS = """  /* OVEN_MEATER_HELPER_BEGIN */
         <button class="rd-mini-btn" data-cm-action="close">Done</button>
       </div>
     `;
+
+    this._positionCookModalAndCone();
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => {
+        if (this._cookModalOpen) this._positionCookModalAndCone();
+      });
+    }
+  }
+
+  _positionCookModalAndCone() {
+    const sr = this.shadowRoot;
+    if (!sr || !this._cookModalOpen) return;
+    const backdrop = sr.getElementById("cookBackdrop");
+    const modal = sr.getElementById("cookModal");
+    const tetherSvg = sr.getElementById("cookTetherSvg");
+    if (!backdrop || !modal) return;
+
+    const bRect =
+      typeof backdrop.getBoundingClientRect === "function"
+        ? backdrop.getBoundingClientRect()
+        : null;
+    const bw = Number(bRect?.width) > 0 ? Number(bRect.width) : 1280;
+    const bh = Number(bRect?.height) > 0 ? Number(bRect.height) : 800;
+    const bLeft = Number(bRect?.left) || 0;
+    const bTop = Number(bRect?.top) || 0;
+
+    const hotspotEl =
+      typeof sr.querySelector === "function"
+        ? sr.querySelector(".cook-hotspot") ||
+          sr.querySelector("[data-oven-meater-badge='lg_oven']") ||
+          sr.querySelector('[data-oven-meater-badge="lg_oven"]')
+        : null;
+    const hRect =
+      hotspotEl && typeof hotspotEl.getBoundingClientRect === "function"
+        ? hotspotEl.getBoundingClientRect()
+        : null;
+
+    let ax = (OVEN_MEATER_CONFIG.hotspot.x / 100) * bw;
+    let ay = (OVEN_MEATER_CONFIG.hotspot.y / 100) * bh;
+    if (hRect && (Number(hRect.width) > 0 || Number(hRect.height) > 0)) {
+      ax = Number(hRect.left) + Number(hRect.width) / 2 - bLeft;
+      ay = Number(hRect.top) + Number(hRect.height) / 2 - bTop;
+    }
+    ax = Math.max(14, Math.min(bw - 14, ax));
+    ay = Math.max(14, Math.min(bh - 14, ay));
+
+    const margin = 14;
+    const gap = 34;
+    const roomLeft = ax - margin;
+    const roomRight = bw - ax - margin;
+    const roomAbove = ay - margin;
+    const roomBelow = bh - ay - margin;
+
+    const candidates = [
+      { side: "left", room: roomLeft },
+      { side: "right", room: roomRight },
+      { side: "below", room: roomBelow },
+      { side: "above", room: roomAbove },
+    ];
+    candidates.sort((a, b) => b.room - a.room);
+    const best = candidates[0];
+
+    const mStyle = modal.style || (modal.style = {});
+    const isNarrow = bw < 680 || bh < 420 || best.room < 260;
+    if (isNarrow) {
+      mStyle.position = "relative";
+      mStyle.left = "";
+      mStyle.top = "";
+      mStyle.maxWidth = "";
+    } else if (best.side === "left" || best.side === "right") {
+      const availW = best.room - gap;
+      mStyle.maxWidth = availW >= 460 && availW < 780 ? `${Math.floor(availW)}px` : "";
+    } else {
+      mStyle.maxWidth = "";
+    }
+
+    const mRectInit =
+      typeof modal.getBoundingClientRect === "function"
+        ? modal.getBoundingClientRect()
+        : null;
+    const capW = mStyle.maxWidth ? parseFloat(mStyle.maxWidth) : 780;
+    const mw =
+      mRectInit && Number(mRectInit.width) > 0
+        ? Math.min(Number(mRectInit.width), capW)
+        : Math.min(bw - margin * 2, capW);
+    const mh =
+      mRectInit && Number(mRectInit.height) > 0
+        ? Number(mRectInit.height)
+        : Math.min(bh - margin * 2, 600);
+
+    let placedLeft = Math.round((bw - mw) / 2);
+    let placedTop = Math.round((bh - mh) / 2);
+
+    if (!isNarrow) {
+      let targetLeft = placedLeft;
+      let targetTop = placedTop;
+      if (best.side === "left") {
+        targetLeft = ax - gap - mw;
+        targetTop = ay - mh / 2;
+      } else if (best.side === "right") {
+        targetLeft = ax + gap;
+        targetTop = ay - mh / 2;
+      } else if (best.side === "above") {
+        targetLeft = ax - mw / 2;
+        targetTop = ay - gap - mh;
+      } else {
+        targetLeft = ax - mw / 2;
+        targetTop = ay + gap;
+      }
+      const maxLeft = Math.max(margin, bw - margin - mw);
+      const maxTop = Math.max(margin, bh - margin - mh);
+      placedLeft = Math.round(Math.max(margin, Math.min(maxLeft, targetLeft)));
+      placedTop = Math.round(Math.max(margin, Math.min(maxTop, targetTop)));
+      mStyle.position = "absolute";
+      mStyle.left = `${placedLeft}px`;
+      mStyle.top = `${placedTop}px`;
+    }
+
+    const mRectFinal =
+      typeof modal.getBoundingClientRect === "function"
+        ? modal.getBoundingClientRect()
+        : null;
+    let ml = placedLeft;
+    let mt = placedTop;
+    let mr = placedLeft + mw;
+    let mb = placedTop + mh;
+    if (mRectFinal && Number(mRectFinal.width) > 0 && Number(mRectFinal.height) > 0) {
+      const fLeft = Number(mRectFinal.left) - bLeft;
+      const fTop = Number(mRectFinal.top) - bTop;
+      const initLeft = mRectInit ? Number(mRectInit.left) - bLeft : fLeft;
+      const initTop = mRectInit ? Number(mRectInit.top) - bTop : fTop;
+      const layoutMoved =
+        isNarrow ||
+        Math.abs(fLeft - initLeft) > 0.5 ||
+        Math.abs(fTop - initTop) > 0.5 ||
+        (Math.abs(fLeft - placedLeft) < 2 && Math.abs(fTop - placedTop) < 2);
+      if (layoutMoved) {
+        ml = fLeft;
+        mt = fTop;
+        mr = ml + Math.min(Number(mRectFinal.width), capW);
+        mb = mt + Number(mRectFinal.height);
+      }
+    }
+
+    if (!tetherSvg) return;
+
+    const mcx = (ml + mr) / 2;
+    const mcy = (mt + mb) / 2;
+    const inset = Math.min(24, Math.max(8, Math.floor(Math.min(mr - ml, mb - mt) * 0.18)));
+
+    const horizSep = ax >= mr ? ax - mr : ax <= ml ? ml - ax : 0;
+    const vertSep = ay >= mb ? ay - mb : ay <= mt ? mt - ay : 0;
+    const useHorizontalEdge =
+      horizSep > 0 || vertSep > 0
+        ? horizSep >= vertSep
+        : Math.abs(ax - mcx) / Math.max(1, mr - ml) >= Math.abs(ay - mcy) / Math.max(1, mb - mt);
+
+    let c1x = 0;
+    let c1y = 0;
+    let c2x = 0;
+    let c2y = 0;
+    if (useHorizontalEdge) {
+      const edgeX = ax >= mcx ? mr : ml;
+      c1x = edgeX;
+      c1y = mt + inset;
+      c2x = edgeX;
+      c2y = mb - inset;
+    } else {
+      const edgeY = ay >= mcy ? mb : mt;
+      c1x = ml + inset;
+      c1y = edgeY;
+      c2x = mr - inset;
+      c2y = edgeY;
+    }
+
+    const midX = (c1x + c2x) / 2;
+    const midY = (c1y + c2y) / 2;
+    const r1aX = ax + (c1x - ax) * 0.36;
+    const r1aY = ay + (c1y - ay) * 0.36;
+    const r1bX = ax + (c2x - ax) * 0.36;
+    const r1bY = ay + (c2y - ay) * 0.36;
+    const r2aX = ax + (c1x - ax) * 0.68;
+    const r2aY = ay + (c1y - ay) * 0.68;
+    const r2bX = ax + (c2x - ax) * 0.68;
+    const r2bY = ay + (c2y - ay) * 0.68;
+
+    tetherSvg.setAttribute("viewBox", `0 0 ${Math.round(bw)} ${Math.round(bh)}`);
+    tetherSvg.innerHTML = `
+      <defs>
+        <linearGradient id="cookTetherGrad" gradientUnits="userSpaceOnUse" x1="${ax.toFixed(1)}" y1="${ay.toFixed(1)}" x2="${midX.toFixed(1)}" y2="${midY.toFixed(1)}">
+          <stop offset="0%" stop-color="rgba(255, 148, 72, 0.34)" />
+          <stop offset="100%" stop-color="rgba(255, 148, 72, 0.08)" />
+        </linearGradient>
+      </defs>
+      <polygon class="cook-tether-cone" points="${ax.toFixed(1)},${ay.toFixed(1)} ${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)}" fill="url(#cookTetherGrad)" />
+      <line class="cook-tether-rung" x1="${r1aX.toFixed(1)}" y1="${r1aY.toFixed(1)}" x2="${r1bX.toFixed(1)}" y2="${r1bY.toFixed(1)}" stroke="rgba(255, 184, 118, 0.24)" stroke-width="1" stroke-dasharray="4 4" />
+      <line class="cook-tether-rung" x1="${r2aX.toFixed(1)}" y1="${r2aY.toFixed(1)}" x2="${r2bX.toFixed(1)}" y2="${r2bY.toFixed(1)}" stroke="rgba(255, 184, 118, 0.24)" stroke-width="1" stroke-dasharray="5 4" />
+      <line class="cook-tether-ray" x1="${ax.toFixed(1)}" y1="${ay.toFixed(1)}" x2="${c1x.toFixed(1)}" y2="${c1y.toFixed(1)}" stroke="rgba(255, 178, 106, 0.58)" stroke-width="1.5" stroke-linecap="round" />
+      <line class="cook-tether-ray" x1="${ax.toFixed(1)}" y1="${ay.toFixed(1)}" x2="${c2x.toFixed(1)}" y2="${c2y.toFixed(1)}" stroke="rgba(255, 178, 106, 0.58)" stroke-width="1.5" stroke-linecap="round" />
+      <circle class="cook-tether-halo" cx="${ax.toFixed(1)}" cy="${ay.toFixed(1)}" r="15" fill="rgba(255, 148, 72, 0.16)" stroke="rgba(255, 184, 118, 0.62)" stroke-width="1.5" />
+      <circle class="cook-tether-dot" cx="${ax.toFixed(1)}" cy="${ay.toFixed(1)}" r="5.5" fill="#ff9448" stroke="#fff3e6" stroke-width="1.8" />
+    `;
   }
   /* OVEN_MEATER_HELPER_END */"""
 
@@ -1506,6 +1732,7 @@ OVEN_MEATER_HTML = """                /* OVEN_MEATER_HTML_BEGIN */
 
 OVEN_MEATER_MODAL_HTML = """        /* OVEN_MEATER_MODAL_HTML_BEGIN */
         <div class="cook-backdrop" id="cookBackdrop" aria-hidden="true">
+          <svg class="cook-tether-svg" id="cookTetherSvg" aria-hidden="true"></svg>
           <div class="cook-modal" id="cookModal"></div>
         </div>
         /* OVEN_MEATER_MODAL_HTML_END */"""
@@ -1519,7 +1746,7 @@ OVEN_MEATER_LISTENERS_JS = """    /* OVEN_MEATER_LISTENERS_BEGIN */
     });
 
     sr.getElementById("cookBackdrop")?.addEventListener("click", (e) => {
-      if (e.target.id === "cookBackdrop") this._closeCookModal();
+      if (e.target.id === "cookBackdrop" || e.target.id === "cookTetherSvg") this._closeCookModal();
     });
 
     sr.getElementById("cookModal")?.addEventListener("click", (e) => {
@@ -1547,6 +1774,15 @@ OVEN_MEATER_LISTENERS_JS = """    /* OVEN_MEATER_LISTENERS_BEGIN */
         }
       };
       document.addEventListener("keydown", this._boundCookEsc);
+    }
+
+    if (!this._boundCookResize && typeof window !== "undefined") {
+      this._boundCookResize = () => {
+        if (this._cookModalOpen) {
+          this._positionCookModalAndCone();
+        }
+      };
+      window.addEventListener("resize", this._boundCookResize);
     }
     /* OVEN_MEATER_LISTENERS_END */"""
 
@@ -1691,7 +1927,10 @@ def verify_patched_card_contents(card_js: str) -> None:
         ".cook-hotspot",
         ".cook-modal",
         "min(92vw, 780px)",
+        "rgba(4, 8, 15, 0.44)",
         "cookBackdrop",
+        "cookTetherSvg",
+        "cook-tether-svg",
         "cookModal",
         "_evalOvenStatus",
         "_evalMeaterStatus",
@@ -1705,6 +1944,7 @@ def verify_patched_card_contents(card_js: str) -> None:
         "_stepMeaterTargetTemp",
         "_selectMeaterPreset",
         "_renderCookModal",
+        "_positionCookModalAndCone",
         "Temperature History &amp; Projected Trend",
         "cm-chart-svg",
         'viewBox="0 0 172 156"',
@@ -1815,18 +2055,11 @@ def patch_card_js(source_js: str) -> str:
             label="OVEN_MEATER_HTML",
         )
 
-    modal_html_block = (
-        '        <!-- OVEN_MEATER_MODAL_HTML_BEGIN -->\n'
-        '        <!-- /* OVEN_MEATER_MODAL_HTML_BEGIN */ -->\n'
-        '        <div class="cook-backdrop" id="cookBackdrop" aria-hidden="true">\n'
-        '          <div class="cook-modal" id="cookModal"></div>\n'
-        "        </div>\n"
-        '        <!-- /* OVEN_MEATER_MODAL_HTML_END */ -->'
-    )
     # Clean single marker form inside template literal:
     modal_html_block = (
         '        ${/* OVEN_MEATER_MODAL_HTML_BEGIN */ ""}\n'
         '        <div class="cook-backdrop" id="cookBackdrop" aria-hidden="true">\n'
+        '          <svg class="cook-tether-svg" id="cookTetherSvg" aria-hidden="true"></svg>\n'
         '          <div class="cook-modal" id="cookModal"></div>\n'
         "        </div>\n"
         '        ${/* OVEN_MEATER_MODAL_HTML_END */ ""}'

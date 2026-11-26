@@ -269,18 +269,30 @@ function makeFloorMock() {
 
 const card = new BrockHouseCyclesCard();
 const cookBackdrop = makeMockEl("cookBackdrop");
+cookBackdrop.getBoundingClientRect = () => ({ left: 0, top: 0, width: 1600, height: 960, right: 1600, bottom: 960 });
+const cookTetherSvg = makeMockEl("cookTetherSvg");
 const cookModal = makeMockEl("cookModal");
+cookModal.getBoundingClientRect = () => {
+  const l = cookModal.style.left ? parseFloat(cookModal.style.left) : 410;
+  const t = cookModal.style.top ? parseFloat(cookModal.style.top) : 180;
+  const w = cookModal.style.maxWidth ? Math.min(780, parseFloat(cookModal.style.maxWidth)) : 780;
+  const h = 620;
+  return { left: l, top: t, width: w, height: h, right: l + w, bottom: t + h };
+};
 const thermoModal = makeMockEl("thermoModal");
 const presenceModal = makeMockEl("presenceModal");
 const hotspotEl = makeMockEl("hotspot");
+hotspotEl.getBoundingClientRect = () => ({ left: 898, top: 410, width: 44, height: 44, right: 942, bottom: 454 });
 const sr = {
   getElementById: (id) => {
     if (id === "cookBackdrop") return cookBackdrop;
+    if (id === "cookTetherSvg") return cookTetherSvg;
     if (id === "cookModal") return cookModal;
     if (id === "thermoModal") return thermoModal;
     if (id === "presenceModal") return presenceModal;
     return null;
   },
+  querySelector: (sel) => (sel === ".cook-hotspot" ? hotspotEl : null),
   querySelectorAll: (sel) => (sel === "[data-cook-open]" ? [hotspotEl] : []),
 };
 card.shadowRoot = sr;
@@ -380,9 +392,13 @@ const climateHidden = {
 card._activeLens = "lights";
 card._updateState();
 
-// 6. Open Cook Monitor modal & verify live HTML, stepper clamping, presets, and close
+// 6. Open Cook Monitor modal & verify live HTML, tether cone, stepper clamping, presets, and close
 card._openCookModal();
 const modalOpenHtml = cookModal.innerHTML;
+const tetherOpenHtml = cookTetherSvg.innerHTML;
+const modalLeftWhenOpen = cookModal.style.left;
+const modalTopWhenOpen = cookModal.style.top;
+const modalPosWhenOpen = cookModal.style.position;
 const backdropOpen = cookBackdrop.classList.contains("open");
 card._stepMeaterTargetTemp(-5);
 card._stepMeaterTargetTemp(500); // clamped to maxTarget (225)
@@ -390,6 +406,7 @@ card._stepMeaterTargetTemp(-500); // clamped to minTarget (100)
 card._selectMeaterPreset("Brisket (203°F)");
 card._closeCookModal();
 const backdropAfterClose = cookBackdrop.classList.contains("open");
+const tetherAfterClose = cookTetherSvg.innerHTML;
 
 console.log(JSON.stringify({
   idleSnap,
@@ -422,6 +439,15 @@ console.log(JSON.stringify({
     hasChartTrendLine: modalOpenHtml.includes("cm-chart-trend-line"),
     hasChartNowDot: modalOpenHtml.includes("cm-chart-now-dot"),
     hasLargeModalCss: skeletonHtml.includes("min(92vw, 780px)") && skeletonHtml.includes("backdrop-filter: blur(12px)"),
+    hasLighterBackdropCss: skeletonHtml.includes("rgba(4, 8, 15, 0.44)"),
+    hasTetherSvgInSkeleton: skeletonHtml.includes('id="cookTetherSvg"') && skeletonHtml.includes('class="cook-tether-svg"'),
+    hasModalPositionedLeftOfOven: modalPosWhenOpen === "absolute" && parseFloat(modalLeftWhenOpen) === 106 && parseFloat(modalTopWhenOpen) === 122,
+    hasTetherConePolygon: tetherOpenHtml.includes("cook-tether-cone") && tetherOpenHtml.includes("920.0,432.0 886.0,146.0 886.0,718.0"),
+    hasTetherGradient: tetherOpenHtml.includes("rgba(255, 148, 72, 0.34)") && tetherOpenHtml.includes("rgba(255, 148, 72, 0.08)"),
+    hasTetherRays: tetherOpenHtml.includes("cook-tether-ray") && tetherOpenHtml.includes("rgba(255, 178, 106, 0.58)"),
+    hasTetherRungs: tetherOpenHtml.includes("cook-tether-rung") && tetherOpenHtml.includes("rgba(255, 184, 118, 0.24)"),
+    hasTetherReticle: tetherOpenHtml.includes("cook-tether-halo") && tetherOpenHtml.includes("cook-tether-dot"),
+    tetherClearedOnClose: tetherAfterClose === "",
   },
   serviceCalls,
 }));
@@ -664,4 +690,100 @@ run();
     assert res["slowCappedAt180"] is True
     assert res["modalHasEtaLabel"] is True
     assert res["emptySvgHasFallback"] is True
+
+
+def test_position_cook_modal_and_cone_all_sides_and_narrow_fallback() -> None:
+    patched = mod.patch_card_js(REALISTIC_CARD_FIXTURE)
+    harness = (
+        patched
+        + """
+function runScenario(bw, bh, hx, hy, mw = 700, mh = 520) {
+  const card = new BrockHouseCyclesCard();
+  card._cookModalOpen = true;
+  const backdrop = {
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: bw, height: bh }),
+  };
+  const modal = {
+    style: {},
+    getBoundingClientRect: () => {
+      const l = modal.style.left ? parseFloat(modal.style.left) : (bw - mw) / 2;
+      const t = modal.style.top ? parseFloat(modal.style.top) : (bh - mh) / 2;
+      const w = modal.style.maxWidth ? Math.min(mw, parseFloat(modal.style.maxWidth)) : mw;
+      return { left: l, top: t, width: w, height: mh };
+    },
+  };
+  const tetherSvg = {
+    innerHTML: "",
+    viewBox: "",
+    setAttribute: (k, v) => {
+      if (k === "viewBox") tetherSvg.viewBox = v;
+    },
+  };
+  const hotspot = {
+    getBoundingClientRect: () => ({ left: hx - 20, top: hy - 20, width: 40, height: 40 }),
+  };
+  card.shadowRoot = {
+    getElementById: (id) => (id === "cookBackdrop" ? backdrop : id === "cookModal" ? modal : id === "cookTetherSvg" ? tetherSvg : null),
+    querySelector: (sel) => (sel === ".cook-hotspot" ? hotspot : null),
+  };
+  card._positionCookModalAndCone();
+  return {
+    pos: modal.style.position,
+    left: modal.style.left ? parseFloat(modal.style.left) : null,
+    top: modal.style.top ? parseFloat(modal.style.top) : null,
+    viewBox: tetherSvg.viewBox,
+    svg: tetherSvg.innerHTML,
+  };
+}
+
+const leftRes = runScenario(1600, 960, 1100, 480);
+const rightRes = runScenario(1600, 960, 260, 480);
+const belowRes = runScenario(900, 1200, 450, 200);
+const aboveRes = runScenario(900, 1200, 450, 980);
+const narrowRes = runScenario(520, 800, 300, 360);
+
+console.log(JSON.stringify({ leftRes, rightRes, belowRes, aboveRes, narrowRes }));
+"""
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".js", encoding="utf-8", delete=False) as tmp:
+        tmp.write(harness)
+        tmp_path = Path(tmp.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        res = json.loads(proc.stdout.strip())
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    # Left of oven (hx=1100, mw=700, gap=34 -> left = 1100 - 34 - 700 = 366, mr = 1066)
+    assert res["leftRes"]["pos"] == "absolute"
+    assert res["leftRes"]["left"] == 366
+    assert "1100.0,480.0 1066.0," in res["leftRes"]["svg"]
+
+    # Right of oven (hx=260, gap=34 -> left = 294)
+    assert res["rightRes"]["pos"] == "absolute"
+    assert res["rightRes"]["left"] == 294
+    assert "260.0,480.0 294.0," in res["rightRes"]["svg"]
+
+    # Below oven (hy=200, gap=34 -> top = 234)
+    assert res["belowRes"]["pos"] == "absolute"
+    assert res["belowRes"]["top"] == 234
+    assert ",234.0" in res["belowRes"]["svg"]
+
+    # Above oven (hy=980, mh=520, gap=34 -> top = 980 - 34 - 520 = 426, mb = 946)
+    assert res["aboveRes"]["pos"] == "absolute"
+    assert res["aboveRes"]["top"] == 426
+    assert ",946.0" in res["aboveRes"]["svg"]
+
+    # Narrow screen fallback -> relative centered
+    assert res["narrowRes"]["pos"] == "relative"
+    assert res["narrowRes"]["left"] is None
+    assert "cook-tether-cone" in res["narrowRes"]["svg"]
+
 
