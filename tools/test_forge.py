@@ -8340,5 +8340,354 @@ def test_reconcile_forge_on_boot_auto_clears_pending_reload_decisions_for_bootin
     assert statuses[i_pending] == "pending"
 
 
+def test_single_chunk_build_widget_card_layout(tmp_path):
+    """Verify 1-chunk build cards fold PR/diff into header, drop redundant chunk line, keep live/error sub-lines, and leave 2-chunk cards unchanged."""
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge_1chunk_widget.db"
+    forge.init_forge_db(db_p)
+    now = time.time()
+
+    # 1. Single-chunk lifecycle: queued -> running -> verifying -> failed -> completed
+    b1 = "fg-1795714808-single-chunk"
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at)
+            VALUES (?, 'Tighten Build Cards', 'Remove duplicate title text', '/workspace', 2, 12345, 'queued', ?, ?)
+            """,
+            (b1, now - 60.0, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (
+                build_id, chunk_index, title, status, target_files_json, instructions, verification_cmd, worker_model
+            ) VALUES (?, 0, 'Tighten Build Cards', 'pending', '["tools/forge.py"]', 'Do work', 'pytest tools/test_forge.py', 'gemini-3.8-flash-high')
+            """,
+            (b1,),
+        )
+
+    embed_q = forge.render_build_widget_embed(b1, db_path=db_p)
+    assert embed_q["description"] == "**QUEUED** · `Zero-Agent` · <#12345> · **0/1** chunks"
+    assert "**1.**" not in embed_q["description"]
+
+    text_q = forge.render_build_widget_text(b1, db_path=db_p)
+    assert "- **Objective:** Remove duplicate title text\n\n*Updated " in text_q
+    assert "\n\n\n" not in text_q
+
+    # Running with live_status
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute("UPDATE forge_builds SET status = 'running' WHERE id = ?", (b1,))
+        conn.execute(
+            "UPDATE forge_chunks SET status = 'running', started_at = ?, live_status = 'Step 2 · Editing forge.py' WHERE build_id = ?",
+            (now - 15.0, b1),
+        )
+    embed_r = forge.render_build_widget_embed(b1, db_path=db_p)
+    assert "**1.**" not in embed_r["description"]
+    assert "↳ ⚡" in embed_r["description"]
+    assert "Step 2 · Editing forge.py" in embed_r["description"]
+    text_r = forge.render_build_widget_text(b1, db_path=db_p)
+    assert "↳ ⚡" in text_r
+
+    # Verifying
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            "UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE build_id = ?",
+            (b1,),
+        )
+    embed_v = forge.render_build_widget_embed(b1, db_path=db_p)
+    assert "**1.**" not in embed_v["description"]
+    assert "↳ 🧪" in embed_v["description"]
+    assert "Running Maker-Checker gate" in embed_v["description"]
+
+    # Failed with last_error
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute("UPDATE forge_builds SET status = 'failed' WHERE id = ?", (b1,))
+        conn.execute(
+            "UPDATE forge_chunks SET status = 'failed', completed_at = ?, last_error = 'AssertionError: mismatch' WHERE build_id = ?",
+            (now - 5.0, b1),
+        )
+    embed_f = forge.render_build_widget_embed(b1, db_path=db_p)
+    assert "**1.**" not in embed_f["description"]
+    assert "⚠️ `AssertionError: mismatch`" in embed_f["description"]
+
+    # Completed/merged with PR and diff_stat folded onto header line, single duration only
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+            (now, b1),
+        )
+        conn.execute(
+            """
+            UPDATE forge_chunks
+            SET status = 'merged', pr_number = 77, diff_stat = '2 files changed, 15 insertions(+), 3 deletions(-)',
+                started_at = ?, completed_at = ?, last_error = ''
+            WHERE build_id = ?
+            """,
+            (now - 45.0, now, b1),
+        )
+    embed_c = forge.render_build_widget_embed(b1, db_path=db_p)
+    assert embed_c["description"] == "**COMPLETED** · `Zero-Agent` · <#12345> · **1/1** chunks · PR #77 · `+15/-3` · ⏱️ 45s"
+    assert embed_c["description"].count("⏱️") == 1
+    assert "**1.**" not in embed_c["description"]
+
+    text_c = forge.render_build_widget_text(b1, db_path=db_p)
+    assert "PR #77 · `+15/-3` · ⏱️ 45s" in text_c
+    assert "- **Objective:** Remove duplicate title text\n\n*Updated " in text_c
+
+    # 2. Multi-chunk build retains numbered chunk list and per-chunk PR/diff/duration
+    b2 = "fg-1795714808-multi-chunk"
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at)
+            VALUES (?, 'Two Chunk Build', 'Keep multi chunk detail', '/workspace', 2, 12345, 'completed', ?, ?)
+            """,
+            (b2, now - 100.0, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (
+                build_id, chunk_index, title, status, target_files_json, instructions, pr_number, diff_stat, started_at, completed_at
+            ) VALUES (?, 0, 'First Chunk', 'merged', '["tools/a.py"]', 'Do 1', 10, '1 file changed, 5 insertions(+)', ?, ?)
+            """,
+            (b2, now - 80.0, now - 50.0),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (
+                build_id, chunk_index, title, status, target_files_json, instructions, pr_number, diff_stat, started_at, completed_at
+            ) VALUES (?, 1, 'Second Chunk', 'merged', '["tools/b.py"]', 'Do 2', 11, '1 file changed, 8 insertions(+)', ?, ?)
+            """,
+            (b2, now - 50.0, now),
+        )
+    embed_2 = forge.render_build_widget_embed(b2, db_path=db_p)
+    lines_2 = embed_2["description"].splitlines()
+    assert lines_2[0] == "**COMPLETED** · `Zero-Agent` · <#12345> · **2/2** chunks · ⏱️ 1m 20s"
+    assert "✅ **1.** First Chunk (PR #10) (`+5/-0`) · ⏱️ 30s" in lines_2
+    assert "✅ **2.** Second Chunk (PR #11) (`+8/-0`) · ⏱️ 50s" in lines_2
+
+
+def test_bridge_reload_card_layout_omits_duplicate_title(tmp_path, monkeypatch):
+    """Verify bridge_reload Decision Card summary is a single Approve Action line without repeating build title."""
+    db_p = tmp_path / "forge_reload_layout.db"
+    forge_mod.init_forge_db(db_p)
+    build_id = "fg-1795714808-reload-layout"
+    now = time.time()
+
+    with forge_mod.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (
+                id, title, repo, origin_channel_id, origin_thread_id,
+                touches_core_bridge, status, plan_json, created_at, updated_at
+            ) VALUES (?, 'Unique Reload Build Title', ?, ?, NULL, 1, 'completed', '{}', ?, ?)
+            """,
+            (build_id, str(tmp_path), forge_mod.ZERO_OPS_CHANNEL_ID, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (
+                id, build_id, chunk_index, title, target_files_json, target_symbols_json,
+                prohibited_files_json, instructions, verification_cmd, status
+            ) VALUES (?, ?, 0, 'Chunk 0', '[]', '[]', '[]', 'Do work', 'true', 'completed')
+            """,
+            (f"{build_id}-c0", build_id),
+        )
+
+    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "post_pending_decision_cards", lambda *a, **kw: [])
+    monkeypatch.setattr("tools.outbox.queue_outbox_message", lambda **kw: {"ok": True})
+
+    assert forge_mod.dispatch_build_completion_to_origin(build_id, db_path=db_p) is True
+
+    with forge_mod.get_db_connection(db_p) as conn:
+        dec_row = conn.execute(
+            "SELECT * FROM forge_decisions WHERE category = 'bridge_reload' AND channel_id = ?",
+            (forge_mod.ZERO_OPS_CHANNEL_ID,),
+        ).fetchone()
+
+    assert dec_row["title"] == "Reload Bridge: Unique Reload Build Title"
+    assert dec_row["summary"] == "**Approve Action:** Reloads the Discord bridge in-place to activate the update."
+    assert "Unique Reload Build Title" not in dec_row["summary"]
+    payload = json.loads(dec_row["payload_json"])
+    assert payload["reason"] == f"FORGE build {build_id} (Unique Reload Build Title)"
+
+
+def test_plan_approval_card_layout_single_and_multi_chunk(tmp_path):
+    """Verify stage_plan_approval_decision deduplicates 1-chunk title/objective and retains multi-chunk bullets."""
+    db_p = tmp_path / "forge_plan_approval_layout.db"
+    forge_mod.init_forge_db(db_p)
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+    (repo_dir / "tools").mkdir(parents=True)
+    for fname in ("a.py", "b.py", "c.py", "d.py", "e.py", "f.py", "only.py", "p1.py", "p2.py"):
+        (repo_dir / "tools" / fname).write_text("# stub\n", encoding="utf-8")
+
+    # 1-chunk plan with matching objective (differing only in case and trailing period) and 6 files
+    single_plan = {
+        "title": "Tighten Approval Card Layout",
+        "objective": "tighten approval card layout.",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.ZERO_CHAT_CHANNEL_ID,
+        "allow_large_chunk": True,
+        "context_fact_sheet": ["Fact 1"],
+        "chunks": [
+            {
+                "title": "Tighten Approval Card Layout",
+                "target_files": [
+                    "tools/a.py",
+                    "tools/b.py",
+                    "tools/c.py",
+                    "tools/d.py",
+                    "tools/e.py",
+                    "tools/f.py",
+                ],
+                "instructions": "Update approval card layout and verify regression tests.",
+            }
+        ],
+    }
+    res_single = stage_plan_approval_decision(
+        single_plan,
+        reasons=["Needs review"],
+        db_path=db_p,
+        post_to_discord=False,
+    )
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_single = conn.execute(
+            "SELECT * FROM forge_decisions WHERE id = ?",
+            (res_single["decision_id"],),
+        ).fetchone()
+    assert row_single["title"] == "Tighten Approval Card Layout"
+    assert row_single["summary"] == (
+        "**Files:** `a.py`, `b.py`, `c.py`, `d.py`, `e.py` (+1 more)\n\n"
+        "**Approve Action:** Queues this 1-chunk build in #forge."
+    )
+    assert "Chunk 1:" not in row_single["summary"]
+    assert "tighten approval card layout" not in row_single["summary"].lower()
+
+    # 1-chunk plan with distinct objective
+    distinct_plan = {
+        "title": "Short Card Title",
+        "objective": "Explain why this card exists.",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.ZERO_CHAT_CHANNEL_ID,
+        "context_fact_sheet": ["Fact 1"],
+        "chunks": [
+            {
+                "title": "Do the work",
+                "target_files": ["tools/only.py"],
+                "instructions": "Update only.py with detailed test coverage.",
+            }
+        ],
+    }
+    res_distinct = stage_plan_approval_decision(
+        distinct_plan,
+        reasons=["Needs review"],
+        db_path=db_p,
+        post_to_discord=False,
+    )
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_distinct = conn.execute(
+            "SELECT * FROM forge_decisions WHERE id = ?",
+            (res_distinct["decision_id"],),
+        ).fetchone()
+    assert row_distinct["summary"] == (
+        "Explain why this card exists.\n"
+        "**Files:** `only.py`\n\n"
+        "**Approve Action:** Queues this 1-chunk build in #forge."
+    )
+
+    # 2-chunk plan retains chunk bullets
+    multi_plan = {
+        "title": "Multi Chunk Layout",
+        "objective": "Ship multi-chunk feature.",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.ZERO_CHAT_CHANNEL_ID,
+        "context_fact_sheet": ["Fact 1"],
+        "chunks": [
+            {"title": "Part One", "target_files": ["tools/p1.py"], "instructions": "Implement part one module and unit tests."},
+            {"title": "Part Two", "target_files": ["tools/p2.py"], "instructions": "Implement part two module and unit tests."},
+        ],
+    }
+    res_multi = stage_plan_approval_decision(
+        multi_plan,
+        reasons=["Multi-chunk"],
+        db_path=db_p,
+        post_to_discord=False,
+    )
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_multi = conn.execute(
+            "SELECT * FROM forge_decisions WHERE id = ?",
+            (res_multi["decision_id"],),
+        ).fetchone()
+    assert "Ship multi-chunk feature." in row_multi["summary"]
+    assert "  - **Chunk 1:** Part One (`p1.py`)" in row_multi["summary"]
+    assert "  - **Chunk 2:** Part Two (`p2.py`)" in row_multi["summary"]
+    assert row_multi["summary"].endswith("**Approve Action:** Queues this 2-chunk build in #forge.")
+
+
+def test_ensure_decision_action_clarity_forge_enqueue_card_title_dedup():
+    """Verify _ensure_decision_action_clarity deduplicates matching forge_enqueue titles while preserving legacy behavior."""
+    # Omitted card_title preserves legacy output
+    legacy = forge_mod._ensure_decision_action_clarity(
+        "Plan ready.",
+        "forge_enqueue",
+        {"title": "Build Sensor Hub", "chunk_count": 2},
+    )
+    assert legacy == "Plan ready.\n\n**Approve Action:** Enqueue FORGE build `Build Sensor Hub`"
+
+    # Exact / case-insensitive match with chunk_count
+    dedup_multi = forge_mod._ensure_decision_action_clarity(
+        "Plan ready.",
+        "forge_enqueue",
+        {"title": "build sensor hub.", "chunk_count": 3},
+        card_title="Build Sensor Hub",
+    )
+    assert dedup_multi == "Plan ready.\n\n**Approve Action:** Queue this 3-chunk build in #forge"
+
+    # Truncated 100-char card_title vs full payload title (bidirectional containment)
+    full_title = "Very Long Build Title " + ("X" * 100)
+    dedup_trunc = forge_mod._ensure_decision_action_clarity(
+        "Plan ready.",
+        "forge_enqueue",
+        {"title": full_title, "chunk_count": 1},
+        card_title=full_title[:100],
+    )
+    assert dedup_trunc == "Plan ready.\n\n**Approve Action:** Queue this 1-chunk build in #forge"
+
+    # Bool chunk_count guard & missing chunk_count fallback
+    dedup_bool = forge_mod._ensure_decision_action_clarity(
+        "Plan ready.",
+        "forge_enqueue",
+        {"title": "Build Sensor Hub", "chunk_count": True},
+        card_title="Build Sensor Hub",
+    )
+    assert dedup_bool == "Plan ready.\n\n**Approve Action:** Queue this build in #forge"
+
+    # Non-matching card_title keeps explicit build name
+    non_match = forge_mod._ensure_decision_action_clarity(
+        "Plan ready.",
+        "forge_enqueue",
+        {"title": "Build Sensor Hub", "chunk_count": 1},
+        card_title="Unrelated Approval Card",
+    )
+    assert non_match == "Plan ready.\n\n**Approve Action:** Enqueue FORGE build `Build Sensor Hub`"
+
+    # Renderers pass card_title for pending forge_enqueue cards
+    pending_dec = {
+        "status": "pending",
+        "category": "forge",
+        "title": "Build Sensor Hub",
+        "summary": "**Files:** `sensor.py`",
+        "handler_type": "forge_enqueue",
+        "payload_json": json.dumps({"title": "Build Sensor Hub", "chunk_count": 1}),
+    }
+    embed = render_decision_card_embed(pending_dec)
+    assert "**Approve Action:** Queue this 1-chunk build in #forge" in embed["description"]
+    text = format_decision_card_text(pending_dec)
+    assert "**Approve Action:** Queue this 1-chunk build in #forge" in text
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4634,7 +4634,21 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
             build_dur_s = None
         if build_dur_s is not None:
             build_dur_suffix = f" · ⏱️ {_format_duration(build_dur_s)}"
-    header_line = f"**{b_label}** · `{repo_name}` · {origin_ref} · **{merged_count}/{total}** chunks{build_dur_suffix}"
+
+    single_chunk_pr_suffix = ""
+    single_chunk_diff_suffix = ""
+    if total == 1:
+        c0 = chunks[0]
+        if c0["pr_number"]:
+            single_chunk_pr_suffix = f" · PR #{c0['pr_number']}"
+        c0_diff = _compact_diff_stat(c0["diff_stat"])
+        if c0_diff:
+            single_chunk_diff_suffix = f" · `{c0_diff}`"
+
+    header_line = (
+        f"**{b_label}** · `{repo_name}` · {origin_ref} · **{merged_count}/{total}** chunks"
+        f"{single_chunk_pr_suffix}{single_chunk_diff_suffix}{build_dur_suffix}"
+    )
 
     display_chunks = list(chunks)
     chunk_lines: list[str] = []
@@ -4657,7 +4671,8 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
         if c_status in ("merged", "completed", "failed") and c["started_at"] is not None and c["completed_at"] is not None:
             c_dur_s = max(0.0, float(c["completed_at"]) - float(c["started_at"]))
             chunk_dur_suffix = f" · ⏱️ {_format_duration(c_dur_s)}"
-        chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}{chunk_dur_suffix}")
+        if total > 1:
+            chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}{chunk_dur_suffix}")
         if c_status in ("running", "verifying"):
             live_st = (c["live_status"] if "live_status" in c.keys() and c["live_status"] else "").strip()
             elapsed_prefix = ""
@@ -4701,12 +4716,15 @@ def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH)
     merged_count = sum(1 for c in chunks if str(c["status"] or "").strip().lower() == "merged")
     models = sorted({c["worker_model"] for c in chunks if c["worker_model"]})
     obj_line = f"\n- **Objective:** {build['objective'].strip()}" if build["objective"] else ""
+    desc_lines = embed["description"].splitlines()
+    extra_lines = desc_lines[2:]
+    body_block = ("\n\n" + "\n".join(extra_lines)) if extra_lines else ""
     return (
         f"### {embed['title']} (`{build['id']}`)\n"
-        f"- {embed['description'].splitlines()[0]} | `{', '.join(models)}`\n"
-        f"- **Progress:** {merged_count}/{total} chunk(s) merged{obj_line}\n\n"
-        + "\n".join(embed["description"].splitlines()[2:])
-        + f"\n\n*{embed['footer']['text']}*"
+        f"- {desc_lines[0]} | `{', '.join(models)}`\n"
+        f"- **Progress:** {merged_count}/{total} chunk(s) merged{obj_line}"
+        f"{body_block}"
+        f"\n\n*{embed['footer']['text']}*"
     )
 
 
@@ -5665,11 +5683,25 @@ def stage_plan_approval_decision(
             files_str += f" (+{len(t_files) - 3} more)"
         chunk_bullets.append(f"  - **Chunk {idx + 1}:** {ch['title'].strip()} ({files_str})")
 
-    objective = str(plan.get("objective") or plan["title"]).strip()
-    summary_lines = [objective]
-    if chunk_bullets:
+    raw_title = str(plan["title"] or "").strip()
+    raw_objective = str(plan.get("objective") or "").strip()
+    norm_title = raw_title.rstrip(".").strip().casefold()
+    norm_objective = raw_objective.rstrip(".").strip().casefold()
+    summary_lines: list[str] = []
+    if raw_objective and norm_objective != norm_title:
+        summary_lines.append(raw_objective)
+    if len(chunks) == 1:
+        if all_files:
+            files_str = ", ".join(f"`{Path(f).name}`" for f in all_files[:5])
+            if len(all_files) > 5:
+                files_str += f" (+{len(all_files) - 5} more)"
+            summary_lines.append(f"**Files:** {files_str}")
+    elif chunk_bullets:
         summary_lines.extend(chunk_bullets[:6])
-    summary_text = "\n".join(summary_lines)
+
+    action_line = f"**Approve Action:** Queues this {len(chunks)}-chunk build in #forge."
+    body_text = "\n".join(summary_lines).strip()
+    summary_text = f"{body_text}\n\n{action_line}" if body_text else action_line
     target_ch = int(plan.get("origin_thread_id") or plan["origin_channel_id"])
 
     dec = stage_decision(
@@ -7653,10 +7685,7 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
             stage_decision(
                 category="bridge_reload",
                 title=f"Reload Bridge: {build['title']}"[:100],
-                summary=(
-                    f"**{build['title']}** modified bridge infrastructure.\n\n"
-                    "**Approve Action:** Reloads the Discord bridge in-place to activate the update."
-                ),
+                summary="**Approve Action:** Reloads the Discord bridge in-place to activate the update.",
                 handler_type="bridge_reload",
                 payload={
                     "build_id": build_id,
@@ -11049,6 +11078,7 @@ def _ensure_decision_action_clarity(
     summary: str,
     handler_type: str,
     payload: Optional[dict] = None,
+    card_title: str = "",
 ) -> str:
     """Ensure that every pending Decision Card explicitly states an '**Approve Action:**' line.
 
@@ -11094,8 +11124,20 @@ def _ensure_decision_action_clarity(
         else:
             action_text = "Delete target files"
     elif handler == "forge_enqueue":
-        title = p.get("title") or p.get("plan_file") or "build"
-        action_text = f"Enqueue FORGE build `{title}`"
+        p_title = str(p.get("title") or "").strip()
+        c_title = str(card_title or "").strip()
+        p_norm = p_title.rstrip(".").strip().casefold()
+        c_norm = c_title.rstrip(".").strip().casefold()
+        is_redundant = bool(c_norm) and (not p_norm or p_norm in c_norm or c_norm in p_norm)
+        if is_redundant:
+            cnt = p.get("chunk_count")
+            if isinstance(cnt, int) and not isinstance(cnt, bool) and cnt > 0:
+                action_text = f"Queue this {cnt}-chunk build in #forge"
+            else:
+                action_text = "Queue this build in #forge"
+        else:
+            title = p_title or p.get("plan_file") or "build"
+            action_text = f"Enqueue FORGE build `{title}`"
     elif handler == "brief_proposal":
         cal_action = str(p.get("action") or "").strip()
         cal_args = p.get("args") if isinstance(p.get("args"), dict) else {}
@@ -11204,7 +11246,7 @@ def stage_decision(
     ok_val, val_err = _validate_decision_shell_payload(handler_type.strip(), payload)
     if not ok_val:
         raise ValueError(val_err)
-    summary = _ensure_decision_action_clarity(summary, handler_type, payload)
+    summary = _ensure_decision_action_clarity(summary, handler_type, payload, card_title=title)
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "", category.lower())[:8] or "act"
     decision_id = f"dec-{secrets.token_hex(6)}-{slug}"
@@ -11324,7 +11366,7 @@ def render_decision_card_embed(decision: sqlite3.Row | dict) -> dict:
             payload_dict = decision["payload"]
         else:
             payload_dict = {}
-        summary = _ensure_decision_action_clarity(summary, handler, payload_dict)
+        summary = _ensure_decision_action_clarity(summary, handler, payload_dict, card_title=title)
 
         return {
             "title": f"🛡️ {title}",
@@ -11404,7 +11446,7 @@ def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
             payload_dict = decision["payload"]
         else:
             payload_dict = {}
-        summary = _ensure_decision_action_clarity(summary, handler, payload_dict)
+        summary = _ensure_decision_action_clarity(summary, handler, payload_dict, card_title=title)
 
         return f"🛡️ **{title}**\n{summary}"
     if status == "executing":
