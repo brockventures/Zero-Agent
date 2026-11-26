@@ -29,6 +29,7 @@ from tools.bridge_state import (
 ZERO_OPS_CHANNEL_ID = 1544953279664889888
 SHOPPING_CHANNEL_ID = 1544955538033348618
 HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
+BANANA_STAND_CHANNEL_ID = 1534436119888793750
 from tools.bridge_formatting import (
     chunk_text,
     parse_interactive_choices,
@@ -180,21 +181,72 @@ async def _run_sidecar_job_async(job_id: str, job_name: str, func, *args, **kwar
     return await asyncio.to_thread(run_sidecar_job, job_id, job_name, func, *args, **kwargs)
 
 
+def _is_banana_stand_channel(channel) -> bool:
+    """Return True when the Discord channel object targets #the-banana-stand / agent-chat."""
+    ch_id = getattr(channel, "id", None)
+    ch_name = getattr(channel, "name", None)
+    return ch_id == BANANA_STAND_CHANNEL_ID or (
+        isinstance(ch_name, str) and ch_name in ("the-banana-stand", "agent-chat")
+    )
+
+
+async def _send_with_push_preview(
+    channel,
+    content: str,
+    view=None,
+    file=None,
+    is_banana_stand: bool | None = None,
+):
+    """Send a plain-text push preview first, then edit rich Markdown in place."""
+    try:
+        from tools.bridge_formatting import strip_markdown_for_push_preview
+    except Exception:
+        def strip_markdown_for_push_preview(t: str, preview_chars: int = 280) -> str:
+            return t
+
+    if is_banana_stand is None:
+        is_banana_stand = _is_banana_stand_channel(channel)
+
+    initial_payload = strip_markdown_for_push_preview(content) if not is_banana_stand else content
+    if not initial_payload or not initial_payload.strip():
+        initial_payload = content
+
+    send_kwargs = {}
+    if view is not None:
+        send_kwargs["view"] = view
+    if file is not None:
+        send_kwargs["file"] = file
+
+    sent_msg = await channel.send(initial_payload, **send_kwargs)
+    if sent_msg is not None and initial_payload != content:
+        try:
+            edit_kwargs = {"content": content}
+            if view is not None:
+                edit_kwargs["view"] = view
+            edited_msg = await sent_msg.edit(**edit_kwargs)
+            return edited_msg or sent_msg
+        except Exception as edit_err:
+            print(f"[Scheduler] Warning restoring markdown after plain push preview: {edit_err}")
+    return sent_msg
+
+
 async def _send_chunked_content(channel, content: str, choice_view=None, max_len: int = 1900, file_path: str | None = None):
     """Defensively chunk text and send each piece, attaching choice_view and optional file_path to the final chunk."""
     chunks = chunk_text(content, max_len=max_len)
+    is_banana = _is_banana_stand_channel(channel)
     for idx, chunk in enumerate(chunks):
         is_last = (idx == len(chunks) - 1)
         view = choice_view if is_last else None
         discord_file = None
         if is_last and file_path and Path(file_path).exists():
             discord_file = discord.File(str(file_path), filename=Path(file_path).name)
-        kwargs = {}
-        if view is not None:
-            kwargs["view"] = view
-        if discord_file is not None:
-            kwargs["file"] = discord_file
-        await channel.send(chunk, **kwargs)
+        await _send_with_push_preview(
+            channel,
+            chunk,
+            view=view,
+            file=discord_file,
+            is_banana_stand=is_banana,
+        )
 
 
 INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
@@ -429,7 +481,7 @@ async def dispatch_scheduled_prompt(
             if not ok and bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
             pruned_count = len(details.get("pruned_threads", [])) if isinstance(details, dict) else 0
             print(f"[Scheduler] Executed nightly session retention & stale thread cleanup at 2:00 AM PT (ok={ok}, pruned_threads={pruned_count}).")
         except Exception as e:
@@ -437,7 +489,7 @@ async def dispatch_scheduled_prompt(
             if bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Daily Session Rollover Error**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Daily Session Rollover Error**: {e}")
         return
 
     # Morning Inbox & RCS Triage Decision Card
@@ -454,7 +506,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Morning inbox triage card execution error: {e}")
         return
@@ -473,7 +525,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Commute inbox triage card execution error: {e}")
         return
@@ -492,7 +544,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Family calendar radar card execution error: {e}")
         return
@@ -511,7 +563,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Dinner pivot card execution error: {e}")
         return
@@ -530,7 +582,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Actual budget anomaly card execution error: {e}")
         return
@@ -549,7 +601,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Weather energy card execution error: {e}")
         return
@@ -568,7 +620,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Midweek grocery card execution error: {e}")
         return
@@ -587,7 +639,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Evening PM build card execution error: {e}")
         return
@@ -605,7 +657,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Usage telemetry audit execution error: {e}")
         return
@@ -635,7 +687,7 @@ async def dispatch_scheduled_prompt(
             if bot and report and (not healthy or tools.sidecars.is_heartbeat_recovery_report(report)):
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(report)
+                    await _send_with_push_preview(ch, report)
         except Exception as e:
             print(f"[Scheduler] Heartbeat sweep execution error: {e}")
         return
@@ -648,7 +700,7 @@ async def dispatch_scheduled_prompt(
             if has_due and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
             else:
                 print("[Scheduler] Dated reminders checked: 0 due today (silent).")
         except Exception as e:
@@ -664,7 +716,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel(SHOPPING_CHANNEL_ID)
                 if ch:
                     file = discord.File(plot_path) if plot_path and os.path.exists(plot_path) else None
-                    await ch.send(rep, file=file)
+                    await _send_with_push_preview(ch, rep, file=file)
             else:
                 print("[Scheduler] EV9 monitor: daily capture completed (silent; no digest or trend plot).")
         except Exception as e:
@@ -680,7 +732,7 @@ async def dispatch_scheduled_prompt(
             if should_post and rep and rep.strip() and "No promotional emails" not in rep and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
             else:
                 print("[Scheduler] Marketing sweep: off-week, not due, or 0 senders (silent).")
         except Exception as e:
@@ -696,7 +748,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(rep):
-                        await ch.send(chunk)
+                        await _send_with_push_preview(ch, chunk)
         except Exception as e:
             print(f"[Scheduler] Nightly triage execution error: {e}")
         return
@@ -737,7 +789,7 @@ async def dispatch_scheduled_prompt(
                 })
             elif rep and bot and ch:
                 for chunk in chunk_text(rep):
-                    await ch.send(chunk)
+                    await _send_with_push_preview(ch, chunk)
         except Exception as e:
             print(f"[Scheduler] NAS log review execution error: {e}")
         return
@@ -751,7 +803,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
         except Exception as e:
             print(f"[Scheduler] Plex transcode cleanup execution error: {e}")
         return
@@ -764,14 +816,14 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Dreaming Consolidation Error**: {rep}")
+                    await _send_with_push_preview(ch, f"⚠️ **Dreaming Consolidation Error**: {rep}")
             print(f"[Scheduler] Dreaming memory consolidation completed: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Dreaming consolidation execution error: {e}")
             if bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Dreaming Consolidation Exception**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Dreaming Consolidation Exception**: {e}")
         return
 
     # Memory doctor weekly audit
@@ -784,7 +836,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     for chunk in chunk_text(rep):
-                        await ch.send(chunk)
+                        await _send_with_push_preview(ch, chunk)
             else:
                 print("[Scheduler] Memory doctor audit: 0 issues/warnings (silent nominal).")
         except Exception as e:
@@ -941,7 +993,7 @@ async def dispatch_scheduled_prompt(
             if (("Low Battery Alert" in out) or not ok) and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
         except Exception as e:
             print(f"[Scheduler] HA battery check execution error: {e}")
         return
@@ -954,7 +1006,7 @@ async def dispatch_scheduled_prompt(
             if (("Telemetry Anomaly Report" in out) or not ok) and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
         except Exception as e:
             print(f"[Scheduler] HA anomaly check execution error: {e}")
         return
@@ -967,7 +1019,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
         except Exception as e:
             print(f"[Scheduler] NAS storage check execution error: {e}")
         return
@@ -980,7 +1032,7 @@ async def dispatch_scheduled_prompt(
             if out and out != "(nominal - 0 Prowlarr failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Prowlarr indexers checked: nominal (silent).")
         except Exception as e:
@@ -995,7 +1047,7 @@ async def dispatch_scheduled_prompt(
             if out and out != "(nominal - 0 SABnzbd failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] SABnzbd checked: nominal (silent).")
         except Exception as e:
@@ -1010,7 +1062,7 @@ async def dispatch_scheduled_prompt(
             if out and out != "(nominal - 0 import failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Arr queue checked: nominal (silent).")
         except Exception as e:
@@ -1025,7 +1077,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print(f"[Scheduler] Seerr card sync checked: {out or 'nominal'} (silent).")
         except Exception as e:
@@ -1049,7 +1101,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print(f"[Scheduler] Mealie to Todoist sync checked: {out or 'nominal'} (silent).")
         except Exception as e:
@@ -1064,7 +1116,7 @@ async def dispatch_scheduled_prompt(
             if out and out != "(nominal - 0 HA integration failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] HA re-auth checked: nominal (silent).")
         except Exception as e:
@@ -1079,7 +1131,7 @@ async def dispatch_scheduled_prompt(
             if out and out != "(nominal - 0 lock failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Nest lock checked: nominal (silent).")
         except Exception as e:
@@ -1094,7 +1146,7 @@ async def dispatch_scheduled_prompt(
             if out and out != "(nominal - Kometa run clean)" and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Kometa audit checked: nominal (silent).")
         except Exception as e:
@@ -1125,7 +1177,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Google Tasks sync checked: nominal (silent).")
         except Exception as e:
@@ -1140,7 +1192,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Host 2 USB backup completed: nominal (silent).")
         except Exception as e:
@@ -1155,7 +1207,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Host 1 USB backup completed: nominal (silent).")
         except Exception as e:
@@ -1170,7 +1222,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] PID watchdog checked: nominal (silent).")
         except Exception as e:
@@ -1185,7 +1237,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] go2rtc watchdog checked: nominal (silent).")
         except Exception as e:
@@ -1200,7 +1252,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] Bridge watchdog checked: nominal (silent).")
         except Exception as e:
@@ -1220,7 +1272,7 @@ async def dispatch_scheduled_prompt(
             if (not ok or stopped) and out and out.strip() and bot:
                 ch = await get_dest_channel(channel_id or HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print("[Scheduler] OrcaSlicer idle reaper checked: nominal (silent).")
         except Exception as e:
@@ -1282,7 +1334,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(out):
-                        await ch.send(chunk)
+                        await _send_with_push_preview(ch, chunk)
         except Exception as e:
             print(f"[Scheduler] Weekly digest execution error: {e}")
         return
@@ -1312,7 +1364,7 @@ async def dispatch_scheduled_prompt(
             if out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             print(f"[Scheduler] Daily Gemini quota card dispatched: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Daily Gemini quota card execution error: {e}")
@@ -1330,7 +1382,7 @@ async def dispatch_scheduled_prompt(
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    await _send_with_push_preview(ch, out)
             else:
                 print(f"[Scheduler] Daily Zero & Ivy context email digest dispatched & archived: ok={ok}")
         except Exception as e:
@@ -1555,7 +1607,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel(default_cid=1561509863018856468)
                 if ch:
-                    await ch.send(f"⚠️ **GOTCHI Software Sprint Failure**:\n```\n{rep}\n```")
+                    await _send_with_push_preview(ch, f"⚠️ **GOTCHI Software Sprint Failure**:\n```\n{rep}\n```")
         except Exception as e:
             print(f"[Scheduler] GOTCHI Software Sprint execution error: {e}")
         return
@@ -1573,7 +1625,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel(default_cid=1558202642663211169)
                 if ch:
-                    await ch.send(f"⚠️ **Agora Roguelike Engineering Failure**:\n```\n{rep}\n```")
+                    await _send_with_push_preview(ch, f"⚠️ **Agora Roguelike Engineering Failure**:\n```\n{rep}\n```")
         except Exception as e:
             print(f"[Scheduler] Agora Roguelike Engineer execution error: {e}")
         return
@@ -1588,7 +1640,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     for chunk in chunk_text(rep):
-                        await ch.send(chunk)
+                        await _send_with_push_preview(ch, chunk)
             else:
                 print("[Scheduler] Monthly hardcoded rule audit: 0 findings (silent nominal).")
         except Exception as e:
@@ -1603,7 +1655,7 @@ async def dispatch_scheduled_prompt(
             if not ok and rep and bot:
                 ch = await get_dest_channel(default_cid=FINANCES_CHANNEL_ID)
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
             else:
                 print("[Scheduler] Actual Budget bank sync: nominal (silent).")
         except Exception as e:
@@ -1611,7 +1663,7 @@ async def dispatch_scheduled_prompt(
             if bot:
                 ch = await get_dest_channel(default_cid=FINANCES_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Actual Budget Sync Error**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Actual Budget Sync Error**: {e}")
         return
 
     # Kalshi Paper Trading Evening Review & Model Sync (sole daily consolidated Discord update to #vault)
@@ -1680,7 +1732,7 @@ async def dispatch_scheduled_prompt(
             if bot:
                 ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Kalshi Paper Bot Exception**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Kalshi Paper Bot Exception**: {e}")
         return
 
     # Multi-Venue Quant Paper Trading Sweep (silent morning 4-track sweep; alerts #vault only on error)
@@ -1730,7 +1782,7 @@ async def dispatch_scheduled_prompt(
             if (not ok or has_new) and rep and rep.strip() and bot:
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(rep)
+                    await _send_with_push_preview(ch, rep)
             else:
                 print("[Scheduler] Plex audiobook enricher: 0 new books (silent nominal).")
         except Exception as e:
@@ -1738,7 +1790,7 @@ async def dispatch_scheduled_prompt(
             if bot:
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Plex Audiobook Enricher Error**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Plex Audiobook Enricher Error**: {e}")
         return
 
     # Monthly Cash Sweep Policy Monitor
@@ -1752,7 +1804,7 @@ async def dispatch_scheduled_prompt(
             if bot:
                 ch = await get_dest_channel(FINANCES_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Cash Sweep Monitor Error**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Cash Sweep Monitor Error**: {e}")
         return
 
     # Monthly Financial Model Variance Digest
@@ -1766,7 +1818,7 @@ async def dispatch_scheduled_prompt(
             if bot:
                 ch = await get_dest_channel(FINANCES_CHANNEL_ID)
                 if ch:
-                    await ch.send(f"⚠️ **Monthly Variance Digest Error**: {e}")
+                    await _send_with_push_preview(ch, f"⚠️ **Monthly Variance Digest Error**: {e}")
         return
 
     # Daily Token Budget Watchdog
@@ -2217,7 +2269,7 @@ class BridgeScheduler:
                         print(f"[Outbox] Warning: Agent turn dispatch unavailable for {omsg_id}. Suppressing raw prompt to chat.")
                         continue
 
-                    is_banana_stand = (target_cid == 1534436119888793750 or str(ch_name) in ("the-banana-stand", "agent-chat"))
+                    is_banana_stand = (target_cid == BANANA_STAND_CHANNEL_ID or str(ch_name) in ("the-banana-stand", "agent-chat"))
                     raw_content = omsg.get("content", "")
 
                     if is_banana_stand:
@@ -2246,10 +2298,12 @@ class BridgeScheduler:
                         for idx, ch in enumerate(chunks):
                             is_last = (idx == len(chunks) - 1)
                             view = choice_view if is_last else None
-                            if view:
-                                await target_channel.send(ch, view=view)
-                            else:
-                                await target_channel.send(ch)
+                            await _send_with_push_preview(
+                                target_channel,
+                                ch,
+                                view=view,
+                                is_banana_stand=False,
+                            )
 
                     print(f"[Outbox] Dispatched message {omsg_id} to #{ch_name} ({target_cid})")
                     try:
@@ -2442,7 +2496,7 @@ class BridgeScheduler:
                                                 ch = self.bot.get_channel(TARGET_CHANNEL_ID)
                                         if ch:
                                             p_text = bdata.get('prompt') or '(empty)'
-                                            await ch.send(f"⚠️ **Wedge Alert:** Agent has been silent for >{int(silence/60)}m without output. Prompt: `{p_text}`")
+                                            await _send_with_push_preview(ch, f"⚠️ **Wedge Alert:** Agent has been silent for >{int(silence/60)}m without output. Prompt: `{p_text}`")
                     except Exception:
                         pass
 

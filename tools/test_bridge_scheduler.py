@@ -517,7 +517,10 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
                 turn_queue=mock_queue
             )
             mock_sidecar.assert_called_once()
-            mock_channel.send.assert_awaited_once_with(report_content)
+            from tools.bridge_formatting import strip_markdown_for_push_preview
+            expected_preview = strip_markdown_for_push_preview(report_content)
+            mock_channel.send.assert_awaited_once_with(expected_preview)
+            mock_channel.send.return_value.edit.assert_awaited_once_with(content=report_content)
             mock_queue.put.assert_not_called()
 
 
@@ -1897,6 +1900,228 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         # Verify exception safety
         with patch("tools.outbox.queue_outbox_message", side_effect=RuntimeError("outbox offline")):
             scheduler_tool._notify_schedule_recovery("Should not raise")
+
+    async def test_send_with_push_preview_edits_markdown_in_place(self):
+        """Verify _send_with_push_preview sends plain preview first and edits rich Markdown in place."""
+        from tools.bridge_formatting import strip_markdown_for_push_preview
+
+        mock_channel = AsyncMock()
+        mock_channel.id = 1542081375287640084
+        mock_channel.name = "zero-chat"
+        sent_msg = AsyncMock()
+        edited_msg = AsyncMock()
+        sent_msg.edit = AsyncMock(return_value=edited_msg)
+        mock_channel.send = AsyncMock(return_value=sent_msg)
+
+        mock_view = MagicMock()
+        mock_file = MagicMock()
+        rich_md = "### **Daily Digest**\n• **Status**: `OK`"
+        expected_preview = strip_markdown_for_push_preview(rich_md)
+        self.assertNotEqual(expected_preview, rich_md)
+
+        res = await bshed._send_with_push_preview(
+            mock_channel,
+            rich_md,
+            view=mock_view,
+            file=mock_file,
+        )
+
+        mock_channel.send.assert_awaited_once_with(expected_preview, view=mock_view, file=mock_file)
+        sent_msg.edit.assert_awaited_once_with(content=rich_md, view=mock_view)
+        self.assertIs(res, edited_msg)
+
+    async def test_send_with_push_preview_banana_stand_bypass(self):
+        """Verify #the-banana-stand bypasses push-preview stripping via flag, channel id, and channel name."""
+        rich_md = "### **Standup Proposal**\nLet's **ship** it."
+
+        # Explicit is_banana_stand=True
+        ch_flag = AsyncMock()
+        ch_flag.id = 123456
+        ch_flag.name = "general"
+        await bshed._send_with_push_preview(ch_flag, rich_md, is_banana_stand=True)
+        ch_flag.send.assert_awaited_once_with(rich_md)
+        ch_flag.send.return_value.edit.assert_not_called()
+
+        # Auto-detected by channel ID
+        ch_id = AsyncMock()
+        ch_id.id = bshed.BANANA_STAND_CHANNEL_ID
+        ch_id.name = "other"
+        await bshed._send_with_push_preview(ch_id, rich_md)
+        ch_id.send.assert_awaited_once_with(rich_md)
+        ch_id.send.return_value.edit.assert_not_called()
+
+        # Auto-detected by channel name
+        ch_name = AsyncMock()
+        ch_name.id = 999
+        ch_name.name = "the-banana-stand"
+        await bshed._send_with_push_preview(ch_name, rich_md)
+        ch_name.send.assert_awaited_once_with(rich_md)
+        ch_name.send.return_value.edit.assert_not_called()
+
+    async def test_send_with_push_preview_skips_edit_when_unchanged_and_empty_preview_fallback(self):
+        """Verify no-op edit skip when unchanged and fallback to raw content if stripped preview is blank."""
+        mock_channel = AsyncMock()
+        mock_channel.id = 1542081375287640084
+        mock_channel.name = "zero-chat"
+
+        plain = "Plain status update with no markdown"
+        await bshed._send_with_push_preview(mock_channel, plain)
+        mock_channel.send.assert_awaited_once_with(plain)
+        mock_channel.send.return_value.edit.assert_not_called()
+
+        mock_channel.reset_mock()
+        raw_tokens_only = "**   **"
+        with patch("tools.bridge_formatting.strip_markdown_for_push_preview", return_value="   "):
+            await bshed._send_with_push_preview(mock_channel, raw_tokens_only)
+        mock_channel.send.assert_awaited_once_with(raw_tokens_only)
+        mock_channel.send.return_value.edit.assert_not_called()
+
+    async def test_send_with_push_preview_edit_failure_resilience(self):
+        """Verify edit failure logs a warning and returns sent_msg without raising."""
+        mock_channel = AsyncMock()
+        mock_channel.id = 1542081375287640084
+        mock_channel.name = "zero-chat"
+        sent_msg = AsyncMock()
+        sent_msg.edit = AsyncMock(side_effect=RuntimeError("Discord 500 on edit"))
+        mock_channel.send = AsyncMock(return_value=sent_msg)
+
+        rich_md = "**Alert**: `failed`"
+        res = await bshed._send_with_push_preview(mock_channel, rich_md)
+
+        mock_channel.send.assert_awaited_once()
+        sent_msg.edit.assert_awaited_once_with(content=rich_md)
+        self.assertIs(res, sent_msg)
+
+    async def test_send_chunked_content_push_preview_and_banana_stand(self):
+        """Verify _send_chunked_content uses two-step push preview with view/file on last chunk and bypasses banana stand."""
+        from tools.bridge_formatting import strip_markdown_for_push_preview
+
+        img_path = self.temp_path / "chart.png"
+        img_path.write_bytes(b"png")
+
+        mock_channel = AsyncMock()
+        mock_channel.id = 1542081375287640084
+        mock_channel.name = "zero-chat"
+        mock_view = MagicMock()
+
+        chunk1 = "**Part 1**\n" + ("a" * 30)
+        chunk2 = "**Part 2**\n" + ("b" * 30)
+        with patch("tools.bridge_scheduler.chunk_text", return_value=[chunk1, chunk2]):
+            await bshed._send_chunked_content(
+                mock_channel,
+                chunk1 + "\n" + chunk2,
+                choice_view=mock_view,
+                file_path=str(img_path),
+            )
+
+        self.assertEqual(mock_channel.send.await_count, 2)
+        first_call = mock_channel.send.await_args_list[0]
+        second_call = mock_channel.send.await_args_list[1]
+        self.assertEqual(first_call.args[0], strip_markdown_for_push_preview(chunk1))
+        self.assertEqual(first_call.kwargs, {})
+        self.assertEqual(second_call.args[0], strip_markdown_for_push_preview(chunk2))
+        self.assertIs(second_call.kwargs["view"], mock_view)
+        self.assertIn("file", second_call.kwargs)
+
+        edit_calls = mock_channel.send.return_value.edit.await_args_list
+        self.assertEqual(len(edit_calls), 2)
+        self.assertEqual(edit_calls[0].kwargs, {"content": chunk1})
+        self.assertEqual(edit_calls[1].kwargs, {"content": chunk2, "view": mock_view})
+
+        # Banana stand bypasses stripping and edit
+        banana_ch = AsyncMock()
+        banana_ch.id = bshed.BANANA_STAND_CHANNEL_ID
+        banana_ch.name = "the-banana-stand"
+        await bshed._send_chunked_content(banana_ch, "**Banana** message")
+        banana_ch.send.assert_awaited_once_with("**Banana** message")
+        banana_ch.send.return_value.edit.assert_not_called()
+
+    async def test_flush_outbox_queue_two_step_push_preview_non_banana_and_banana_untouched(self):
+        """Verify flush_outbox_queue uses two-step push preview for non-banana channels and leaves banana stand untouched."""
+        from tools.bridge_formatting import strip_markdown_for_push_preview
+        from tools.bridge_handlers import QuickChoiceView
+
+        mock_bot = MagicMock()
+        non_banana_ch = AsyncMock()
+        non_banana_ch.id = 1542081375287640084
+        non_banana_ch.name = "zero-chat"
+        banana_ch = AsyncMock()
+        banana_ch.id = bshed.BANANA_STAND_CHANNEL_ID
+        banana_ch.name = "the-banana-stand"
+        mock_bot.get_channel.side_effect = lambda cid: banana_ch if cid == bshed.BANANA_STAND_CHANNEL_ID else non_banana_ch
+
+        scheduler = bshed.BridgeScheduler(
+            dispatch_fn=AsyncMock(),
+            bot=mock_bot,
+            quick_choice_view_cls=QuickChoiceView,
+            button_choice_fn=AsyncMock(),
+        )
+
+        rich_body = "### **Task Summary**\n• **Result**: `Ready`"
+        outbox_items = [
+            {
+                "id": "outbox-md-1",
+                "channel": "zero-chat",
+                "channel_id": 1542081375287640084,
+                "content": rich_body + "\n\n[CHOICES: Approve | Skip]",
+            },
+            {
+                "id": "outbox-banana-md-1",
+                "channel": "the-banana-stand",
+                "channel_id": bshed.BANANA_STAND_CHANNEL_ID,
+                "content": "**Banana RFC**: Keep raw markdown",
+            },
+        ]
+
+        with patch("tools.outbox.flush_pending_messages", return_value=outbox_items), \
+             patch("tools.outbox.record_dispatched_history"), \
+             patch("tools.banana.claim") as mock_claim, \
+             patch("tools.banana.release") as mock_release:
+            await scheduler.flush_outbox_queue()
+
+        # Non-banana channel: plain preview send with view -> rich markdown edit with view
+        non_banana_ch.send.assert_awaited_once()
+        send_args, send_kwargs = non_banana_ch.send.await_args
+        self.assertEqual(send_args[0], strip_markdown_for_push_preview(rich_body))
+        self.assertIsInstance(send_kwargs["view"], QuickChoiceView)
+        non_banana_ch.send.return_value.edit.assert_awaited_once_with(
+            content=rich_body,
+            view=send_kwargs["view"],
+        )
+
+        # Banana stand: untouched raw send under mutex, no edit
+        mock_claim.assert_called_once_with(subject="outbox-banana-md-1")
+        mock_release.assert_called_once()
+        banana_ch.send.assert_awaited_once_with("**Banana RFC**: Keep raw markdown")
+        banana_ch.send.return_value.edit.assert_not_called()
+
+    async def test_dispatch_scheduled_ev9_with_file_uses_push_preview(self):
+        """Verify direct scheduled sidecar sends with file= (e.g. EV9 digest) send preview with file and edit without file."""
+        from tools.bridge_formatting import strip_markdown_for_push_preview
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        plot_file = self.temp_path / "ev9_trend.png"
+        plot_file.write_bytes(b"png")
+
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_channel.id = bshed.SHOPPING_CHANNEL_ID
+        mock_bot.get_channel.return_value = mock_channel
+
+        digest_md = "🚙 **EV9 Weekly Digest**\n• **Best Deal**: `$54,200`"
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, digest_md, str(plot_file))):
+            await bshed.dispatch_scheduled_prompt(
+                "Run EV9 monitor via /workspace/tools/sidecars.py ev9",
+                job_name="EV9 Listing Monitor",
+                bot=mock_bot,
+                job_id="ev9_monitor",
+            )
+
+        mock_channel.send.assert_awaited_once()
+        send_args, send_kwargs = mock_channel.send.await_args
+        self.assertEqual(send_args[0], strip_markdown_for_push_preview(digest_md))
+        self.assertIn("file", send_kwargs)
+        mock_channel.send.return_value.edit.assert_awaited_once_with(content=digest_md)
 
 
 if __name__ == "__main__":
