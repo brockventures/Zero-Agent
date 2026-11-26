@@ -804,7 +804,12 @@ class BriefDaemonRunner:
         if dt.hour >= _MORNING_BRIEF_HOUR_PT and self._last_morning_brief_date != date_str:
             try:
                 ev_id = enqueue_morning_brief(
-                    self.queue, now=now_ts, tz_name=self.config.timezone
+                    self.queue,
+                    now=now_ts,
+                    tz_name=self.config.timezone,
+                    task_dir=self.config.task_dir,
+                    personal_tasks_path=self.config.personal_tasks_path,
+                    config=self.config,
                 )
                 self._last_morning_brief_date = date_str
                 enqueued["morning_brief"] = ev_id
@@ -818,6 +823,7 @@ class BriefDaemonRunner:
                     now=now_ts,
                     tz_name=self.config.timezone,
                     task_dir=self.config.task_dir,
+                    personal_tasks_path=self.config.personal_tasks_path,
                     gate_store=getattr(self.approval_gate, "gate_store", None),
                     config=self.config,
                     skip_if_empty=self.config.skip_empty_daily_review,
@@ -883,7 +889,7 @@ class BriefDaemonRunner:
             if hasattr(self.queue, "get_event"):
                 try:
                     row = self.queue.get_event(int(ev_id))
-                except Exception:
+                except Exception:  # noqa: BLE001
                     row = None
             elif hasattr(self.queue, "_tx"):
                 try:
@@ -900,7 +906,7 @@ class BriefDaemonRunner:
                             "trusted": bool(fetched["trusted"]),
                             "body": fetched["body"],
                         }
-                except Exception:
+                except Exception:  # noqa: BLE001
                     row = None
             if isinstance(row, Mapping):
                 for key in ("source", "sender", "trusted", "body"):

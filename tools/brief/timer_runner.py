@@ -17,7 +17,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.brief.config import BriefConfig
 from tools.brief.queue import BriefQueue
-from tools.brief.tasks import scan_tasks_for_daily_review
+from tools.brief.tasks import (
+    merge_personal_tasks_into_scan,
+    scan_personal_tasks,
+    scan_tasks_for_daily_review,
+)
 
 
 def _resolve_pt_datetime(
@@ -34,24 +38,86 @@ def _resolve_pt_datetime(
     return datetime.fromtimestamp(float(now), tz=UTC).astimezone(tz)
 
 
+def _build_task_scan(
+    *,
+    now_ts: float,
+    tz_name: str,
+    task_dir: Path | str | None = None,
+    personal_tasks_path: Path | str | None = None,
+    config: BriefConfig | None = None,
+) -> dict[str, Any]:
+    resolved_task_dir = (
+        Path(task_dir)
+        if task_dir is not None
+        else (config.task_dir if config is not None else None)
+    )
+    resolved_personal_path = (
+        Path(personal_tasks_path)
+        if personal_tasks_path is not None
+        else (config.personal_tasks_path if config is not None else None)
+    )
+    if resolved_task_dir is not None:
+        open_stale_days = config.task_open_stale_days if config is not None else 3
+        blocked_stale_days = config.task_blocked_stale_days if config is not None else 6
+        backoff_days = (
+            config.task_staleness_backoff_days if config is not None else (3, 7, 14)
+        )
+        return scan_tasks_for_daily_review(
+            resolved_task_dir,
+            now=now_ts,
+            open_stale_days=open_stale_days,
+            blocked_stale_days=blocked_stale_days,
+            backoff_days=backoff_days,
+            tz_name=tz_name,
+            personal_tasks_path=resolved_personal_path,
+        )
+
+    base_scan: dict[str, Any] = {
+        "open_count": 0,
+        "blocked_count": 0,
+        "due_tasks": [],
+        "stale_tasks": [],
+        "actionable_tasks": [],
+        "has_actionable_items": False,
+    }
+    if resolved_personal_path is not None and resolved_personal_path.is_file():
+        personal_scan = scan_personal_tasks(
+            resolved_personal_path,
+            now=now_ts,
+            tz_name=tz_name,
+        )
+        return merge_personal_tasks_into_scan(base_scan, personal_scan)
+    return base_scan
+
+
 def enqueue_morning_brief(
     queue: BriefQueue,
     now: float | datetime | None = None,
     *,
     tz_name: str = "America/Los_Angeles",
+    task_dir: Path | str | None = None,
+    personal_tasks_path: Path | str | None = None,
+    config: BriefConfig | None = None,
 ) -> int | None:
     """Enqueue today's morning brief timer event idempotently (zero LLM calls)."""
-    dt = _resolve_pt_datetime(now, tz_name=tz_name)
+    effective_tz = tz_name or (config.timezone if config is not None else "America/Los_Angeles")
+    dt = _resolve_pt_datetime(now, tz_name=effective_tz)
     date_str = dt.strftime("%Y-%m-%d")
     ts = dt.timestamp()
-    payload = json.dumps(
-        {
-            "type": "morning_brief",
-            "date": date_str,
-            "triggered_at_pt": f"{dt.strftime('%Y-%m-%d %H:%M')} PT",
-        },
-        sort_keys=True,
-    )
+    payload_dict: dict[str, Any] = {
+        "type": "morning_brief",
+        "date": date_str,
+        "triggered_at_pt": f"{dt.strftime('%Y-%m-%d %H:%M')} PT",
+    }
+    if task_dir is not None or personal_tasks_path is not None or config is not None:
+        payload_dict["task_scan"] = _build_task_scan(
+            now_ts=ts,
+            tz_name=effective_tz,
+            task_dir=task_dir,
+            personal_tasks_path=personal_tasks_path,
+            config=config,
+        )
+    payload = json.dumps(payload_dict, sort_keys=True)
     return queue.enqueue_event(
         source="timer",
         key="morning-brief",
@@ -69,6 +135,7 @@ def enqueue_daily_review(
     *,
     tz_name: str = "America/Los_Angeles",
     task_dir: Path | str | None = None,
+    personal_tasks_path: Path | str | None = None,
     gate_store: Any | None = None,
     config: BriefConfig | None = None,
     skip_if_empty: bool = False,
@@ -87,6 +154,7 @@ def enqueue_daily_review(
 
     has_scan_context = (
         task_dir is not None
+        or personal_tasks_path is not None
         or gate_store is not None
         or config is not None
         or skip_if_empty
@@ -95,34 +163,13 @@ def enqueue_daily_review(
     resolved_gate_store = gate_store
 
     if has_scan_context:
-        resolved_task_dir = (
-            Path(task_dir)
-            if task_dir is not None
-            else (config.task_dir if config is not None else None)
+        task_scan = _build_task_scan(
+            now_ts=ts,
+            tz_name=effective_tz,
+            task_dir=task_dir,
+            personal_tasks_path=personal_tasks_path,
+            config=config,
         )
-        if resolved_task_dir is not None:
-            open_stale_days = config.task_open_stale_days if config is not None else 3
-            blocked_stale_days = config.task_blocked_stale_days if config is not None else 6
-            backoff_days = (
-                config.task_staleness_backoff_days if config is not None else (3, 7, 14)
-            )
-            task_scan = scan_tasks_for_daily_review(
-                resolved_task_dir,
-                now=ts,
-                open_stale_days=open_stale_days,
-                blocked_stale_days=blocked_stale_days,
-                backoff_days=backoff_days,
-                tz_name=effective_tz,
-            )
-        else:
-            task_scan = {
-                "open_count": 0,
-                "blocked_count": 0,
-                "due_tasks": [],
-                "stale_tasks": [],
-                "actionable_tasks": [],
-                "has_actionable_items": False,
-            }
 
         if (
             resolved_gate_store is None
@@ -200,7 +247,14 @@ def main(argv: list[str] | None = None) -> int:
 
     enqueued: dict[str, int | None] = {}
     if args.kind in ("morning-brief", "both"):
-        enqueued["morning_brief"] = enqueue_morning_brief(queue, now=now_ts, tz_name=cfg.timezone)
+        enqueued["morning_brief"] = enqueue_morning_brief(
+            queue,
+            now=now_ts,
+            tz_name=cfg.timezone,
+            task_dir=cfg.task_dir,
+            personal_tasks_path=cfg.personal_tasks_path,
+            config=cfg,
+        )
     if args.kind in ("daily-review", "both"):
         gate_store = None
         if cfg.gate_db_path.is_file():
@@ -213,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             now=now_ts,
             tz_name=cfg.timezone,
             task_dir=cfg.task_dir,
+            personal_tasks_path=cfg.personal_tasks_path,
             gate_store=gate_store,
             config=cfg,
             skip_if_empty=cfg.skip_empty_daily_review,

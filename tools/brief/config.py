@@ -17,6 +17,7 @@ DEFAULT_MEMORY_DIR = Path("/workspace/memory/private/brief")
 DEFAULT_SECRETS_PATH = Path("/secrets/env.json")
 DEFAULT_READONLY_TOKEN_PATH = Path("/secrets/brief_readonly_token.json")
 DEFAULT_GATE_WRITE_TOKEN_PATH = Path("/secrets/brief_write_token.json")
+DEFAULT_PERSONAL_TASKS_PATH = Path("/workspace/data/tasks.json")
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts" / "brief"
 
 
@@ -199,6 +200,7 @@ class BriefConfig:
     task_blocked_stale_days: int = 6
     task_staleness_backoff_days: list[int] = field(default_factory=lambda: [3, 7, 14])
     skip_empty_daily_review: bool = True
+    personal_tasks_path: Path | None = None
 
     # [dismissals]
     dismissal_mute_strikes: int = 3
@@ -224,6 +226,8 @@ class BriefConfig:
         )
         if self.config_path is not None:
             self.config_path = Path(self.config_path)
+        if self.personal_tasks_path is not None:
+            self.personal_tasks_path = Path(self.personal_tasks_path)
         self.allowlisted_emails = _merge_unique_emails(self.allowlisted_emails)
         self.vip_senders = _merge_unique_emails(self.vip_senders)
         self.max_overnight_bypasses = max(0, int(self.max_overnight_bypasses))
@@ -394,6 +398,15 @@ class BriefConfig:
             "default_calendar_id",
             gate.get("gate_default_calendar_id", "primary"),
         )
+        if "personal_tasks_path" in tasks:
+            raw_personal_tasks = str(tasks.get("personal_tasks_path") or "").strip()
+            personal_tasks_path: Path | None = (
+                Path(raw_personal_tasks) if raw_personal_tasks else None
+            )
+        elif state_dir is None and memory_dir is None and config_path is None:
+            personal_tasks_path = DEFAULT_PERSONAL_TASKS_PATH
+        else:
+            personal_tasks_path = None
 
         return cls(
             channel_id=int(channel.get("channel_id", DEFAULT_CHANNEL_ID)),
@@ -433,6 +446,7 @@ class BriefConfig:
                 tasks.get("staleness_backoff_days", [3, 7, 14])
             ),
             skip_empty_daily_review=bool(tasks.get("skip_empty_daily_review", True)),
+            personal_tasks_path=personal_tasks_path,
             dismissal_mute_strikes=int(dismissals.get("mute_strikes", 3)),
             dismissal_window_days=int(dismissals.get("window_days", 30)),
             state_dir=resolved_state,

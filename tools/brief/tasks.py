@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -74,7 +74,7 @@ def format_pt_iso(
 def validate_task_slug(slug: str) -> str:
     """Validate task slug against _TASK_SLUG_RE and reject path traversal tokens."""
     if not isinstance(slug, str):
-        raise ValueError(f"Invalid task slug: {slug!r}")
+        raise ValueError(f"Invalid task slug: {slug!r}")  # noqa: TRY004
     candidate = slug.strip()
     if not candidate or "/" in candidate or "\\" in candidate or ".." in candidate:
         raise ValueError(f"Invalid task slug {slug!r}: path separators or '..' are prohibited")
@@ -113,7 +113,7 @@ def _normalize_str_list(raw: Any) -> list[str]:
     elif isinstance(raw, (list, tuple, set)):
         items = [str(x) for x in raw]
     else:
-        raise ValueError(f"Expected list of strings, got {type(raw).__name__}")
+        raise ValueError(f"Expected list of strings, got {type(raw).__name__}")  # noqa: TRY004
     seen: set[str] = set()
     result: list[str] = []
     for item in items:
@@ -141,9 +141,13 @@ def _strip_inline_yaml_comment(raw_val: str) -> str:
         if ch == "'" and not in_double:
             in_single = not in_single
             continue
-        if ch == "#" and not in_double and not in_single:
-            if idx == 0 or raw_val[idx - 1].isspace():
-                return raw_val[:idx].rstrip()
+        if (
+            ch == "#"
+            and not in_double
+            and not in_single
+            and (idx == 0 or raw_val[idx - 1].isspace())
+        ):
+            return raw_val[:idx].rstrip()
     return raw_val.rstrip()
 
 
@@ -227,7 +231,7 @@ def _normalize_frontmatter(
     tz_name: str = "America/Los_Angeles",
 ) -> dict[str, Any]:
     if not isinstance(frontmatter, dict):
-        raise ValueError("frontmatter must be a dict")
+        raise ValueError("frontmatter must be a dict")  # noqa: TRY004
     status = validate_task_status(frontmatter.get("status", "open"))
     waiting_on = str(frontmatter.get("waiting_on", "") or "").strip()
 
@@ -567,6 +571,212 @@ def mark_tasks_nudged(
     return updated
 
 
+_PERSONAL_CLOSED_STATUSES = frozenset({"completed", "retired", "done", "canceled", "cancelled"})
+_DEV_FALLBACK_PATTERNS = (
+    r"^(feat|fix|refactor|chore|test|perf|ci|docs)[\(:]",
+    r"https?://github\.com/",
+    r"github issue",
+    r"\(issue #\d+\)",
+    r"#\d+:",
+    r"\bpr #\d+\b",
+    r"\bagora[- ]roguelike\b",
+    r"\bagent[- ]playbook\b",
+    r"\bagora\b",
+    r"\bbanana[- ]protocol\b",
+    r"\begress telemetry\b",
+    r"\bucp client\b",
+    r"\bagentic storefronts\b",
+    r"\bharden agent identity\b",
+    r"\breview aerial/alex\b",
+    r"\bmarvin persona\b",
+    r"\bterminal web hud\b",
+    r"\bmarket variance rfc\b",
+    r"\brivals & corporate warfare\b",
+    r"\bmemsearch\b",
+)
+
+
+def _fallback_is_dev_task(task: dict[str, Any]) -> bool:
+    if task.get("dev") is True or task.get("type") in ("dev", "engineering", "code"):
+        return True
+    text = f"{task.get('title', '')} {task.get('notes') or ''}".lower().strip()
+    return any(re.search(pat, text) for pat in _DEV_FALLBACK_PATTERNS)
+
+
+try:
+    from tools.google_tasks_sync import is_dev_task as _google_is_dev_task
+except (ImportError, OSError, RuntimeError, ValueError):  # pragma: no cover - fallback when google_tasks_sync deps unavailable
+    _google_is_dev_task = _fallback_is_dev_task
+
+
+def _parse_personal_due_date(raw_due: Any, *, tz_name: str) -> date | None:
+    raw = str(raw_due or "").strip()
+    if not raw:
+        return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}", raw):
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            return None
+    try:
+        return parse_iso_datetime(raw, tz_name=tz_name).date()
+    except ValueError:
+        return None
+
+
+def _empty_personal_tasks_scan() -> dict[str, Any]:
+    return {
+        "open_personal_count": 0,
+        "due_today": [],
+        "overdue": [],
+        "high_priority": [],
+        "upcoming": [],
+        "backlog": [],
+        "actionable_personal_tasks": [],
+        "all_open_personal_tasks": [],
+        "has_actionable_personal": False,
+    }
+
+
+def scan_personal_tasks(
+    tasks_path: Path | str | None,
+    *,
+    now: float | None = None,
+    tz_name: str = "America/Los_Angeles",
+) -> dict[str, Any]:
+    """Scan personal Google Tasks JSON ledger and classify active non-dev tasks."""
+    if tasks_path is None:
+        return _empty_personal_tasks_scan()
+    path = Path(tasks_path)
+    if not path.exists() or not path.is_file():
+        return _empty_personal_tasks_scan()
+
+    try:
+        raw_tasks = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return _empty_personal_tasks_scan()
+    if not isinstance(raw_tasks, list):
+        return _empty_personal_tasks_scan()
+
+    today_date = _resolve_pt_datetime(now, tz_name=tz_name).date()
+
+    due_today: list[dict[str, Any]] = []
+    overdue: list[dict[str, Any]] = []
+    high_priority: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    backlog: list[dict[str, Any]] = []
+    all_open: list[dict[str, Any]] = []
+
+    for raw_task in raw_tasks:
+        if not isinstance(raw_task, dict):
+            continue
+        status = str(raw_task.get("status") or "pending").strip().lower()
+        if status in _PERSONAL_CLOSED_STATUSES:
+            continue
+        if _google_is_dev_task(raw_task):
+            continue
+        title = str(raw_task.get("title") or "").strip()
+        if not title:
+            continue
+
+        priority = str(raw_task.get("priority") or "p2").strip().lower() or "p2"
+        due_date = _parse_personal_due_date(raw_task.get("due"), tz_name=tz_name)
+
+        if due_date is not None and due_date < today_date:
+            urgency = "overdue"
+        elif due_date is not None and due_date == today_date:
+            urgency = "due_today"
+        elif priority == "p1":
+            urgency = "high_priority"
+        elif due_date is not None and due_date > today_date:
+            urgency = "upcoming"
+        else:
+            urgency = "backlog"
+
+        entry: dict[str, Any] = {
+            "source": "personal_tasks",
+            "id": raw_task.get("id"),
+            "title": title,
+            "priority": priority,
+            "status": status,
+            "due": due_date.isoformat() if due_date is not None else "",
+            "target_time_pt": str(raw_task.get("target_time_pt") or "").strip(),
+            "updated": str(raw_task.get("updated") or "").strip(),
+            "urgency": urgency,
+        }
+        all_open.append(entry)
+
+        if due_date is not None and due_date < today_date:
+            overdue.append(entry)
+        elif due_date is not None and due_date == today_date:
+            due_today.append(entry)
+        elif due_date is not None and due_date > today_date and priority != "p1":
+            upcoming.append(entry)
+        elif priority != "p1":
+            backlog.append(entry)
+
+        if priority == "p1":
+            high_priority.append(entry)
+
+    overdue.sort(key=lambda t: (t["due"], t["priority"], str(t.get("id") or "")))
+    due_today.sort(key=lambda t: (t["priority"], str(t.get("id") or "")))
+    high_priority.sort(key=lambda t: (t["due"] or "9999-99-99", str(t.get("id") or "")))
+    upcoming.sort(key=lambda t: (t["due"], t["priority"], str(t.get("id") or "")))
+
+    actionable_personal: list[dict[str, Any]] = []
+    seen_entries: set[int] = set()
+    for bucket in (overdue, due_today, high_priority):
+        for item in bucket:
+            obj_id = id(item)
+            if obj_id not in seen_entries:
+                seen_entries.add(obj_id)
+                actionable_personal.append(item)
+
+    return {
+        "open_personal_count": len(all_open),
+        "due_today": due_today,
+        "overdue": overdue,
+        "high_priority": high_priority,
+        "upcoming": upcoming,
+        "backlog": backlog,
+        "actionable_personal_tasks": actionable_personal,
+        "all_open_personal_tasks": all_open,
+        "has_actionable_personal": bool(actionable_personal),
+    }
+
+
+def merge_personal_tasks_into_scan(
+    base_scan: dict[str, Any],
+    personal_scan: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge personal task scan counts and actionable items into a daily review scan dict."""
+    merged_due = list(base_scan.get("due_tasks", []))
+    seen_personal_due: set[int] = set()
+    for item in (*personal_scan.get("overdue", []), *personal_scan.get("due_today", [])):
+        obj_id = id(item)
+        if obj_id not in seen_personal_due:
+            seen_personal_due.add(obj_id)
+            merged_due.append(item)
+
+    merged_actionable = [
+        *base_scan.get("actionable_tasks", []),
+        *personal_scan.get("actionable_personal_tasks", []),
+    ]
+    stale_tasks = list(base_scan.get("stale_tasks", []))
+    open_personal_count = int(personal_scan.get("open_personal_count", 0))
+
+    return {
+        "open_count": int(base_scan.get("open_count", 0)) + open_personal_count,
+        "blocked_count": int(base_scan.get("blocked_count", 0)),
+        "due_tasks": merged_due,
+        "stale_tasks": stale_tasks,
+        "actionable_tasks": merged_actionable,
+        "has_actionable_items": bool(merged_due or stale_tasks or merged_actionable),
+        "open_personal_count": open_personal_count,
+        "personal_tasks": personal_scan,
+    }
+
+
 def scan_tasks_for_daily_review(
     task_dir: Path | str,
     *,
@@ -575,8 +785,9 @@ def scan_tasks_for_daily_review(
     blocked_stale_days: int = 6,
     backoff_days: Sequence[int] = (3, 7, 14),
     tz_name: str = "America/Los_Angeles",
+    personal_tasks_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Scan task_dir/*.md for open/blocked tasks that are due or stale respecting backoff."""
+    """Scan task_dir/*.md (and optional personal tasks.json) for due, stale, or P1 tasks."""
     root = Path(task_dir)
     now_ts = time.time() if now is None else float(now)
 
@@ -586,65 +797,56 @@ def scan_tasks_for_daily_review(
     stale_tasks: list[dict[str, Any]] = []
     actionable_tasks: list[dict[str, Any]] = []
 
-    if not root.exists() or not root.is_dir():
-        return {
-            "open_count": 0,
-            "blocked_count": 0,
-            "due_tasks": [],
-            "stale_tasks": [],
-            "actionable_tasks": [],
-            "has_actionable_items": False,
-        }
+    if root.exists() and root.is_dir():
+        for path in sorted(root.glob("*.md")):
+            if path.name.startswith(".") or not path.is_file():
+                continue
+            try:
+                validate_task_slug(path.stem)
+                parsed = parse_task_file(path, tz_name=tz_name)
+            except ValueError:
+                continue
 
-    for path in sorted(root.glob("*.md")):
-        if path.name.startswith(".") or not path.is_file():
-            continue
-        try:
-            validate_task_slug(path.stem)
-            parsed = parse_task_file(path, tz_name=tz_name)
-        except ValueError:
-            continue
+            status = parsed["status"]
+            if status == "open":
+                open_count += 1
+            elif status == "blocked":
+                blocked_count += 1
+            else:
+                continue
 
-        status = parsed["status"]
-        if status == "open":
-            open_count += 1
-        elif status == "blocked":
-            blocked_count += 1
-        else:
-            continue
+            mtime = path.stat().st_mtime
+            eval_res = evaluate_task_staleness(
+                parsed,
+                mtime=mtime,
+                now=now_ts,
+                open_stale_days=open_stale_days,
+                blocked_stale_days=blocked_stale_days,
+                backoff_days=backoff_days,
+                tz_name=tz_name,
+            )
+            if not eval_res["should_surface"]:
+                continue
 
-        mtime = path.stat().st_mtime
-        eval_res = evaluate_task_staleness(
-            parsed,
-            mtime=mtime,
-            now=now_ts,
-            open_stale_days=open_stale_days,
-            blocked_stale_days=blocked_stale_days,
-            backoff_days=backoff_days,
-            tz_name=tz_name,
-        )
-        if not eval_res["should_surface"]:
-            continue
+            entry = {
+                "slug": parsed["slug"],
+                "path": str(path),
+                "status": status,
+                "waiting_on": parsed["waiting_on"],
+                "next_check": parsed["next_check"],
+                "entities": parsed["entities"],
+                "gate_receipts": parsed["gate_receipts"],
+                "nudge_count": parsed["nudge_count"],
+                "last_nudged_at": parsed["last_nudged_at"],
+                **eval_res,
+            }
+            actionable_tasks.append(entry)
+            if eval_res["due_for_check"]:
+                due_tasks.append(entry)
+            if eval_res["is_stale"]:
+                stale_tasks.append(entry)
 
-        entry = {
-            "slug": parsed["slug"],
-            "path": str(path),
-            "status": status,
-            "waiting_on": parsed["waiting_on"],
-            "next_check": parsed["next_check"],
-            "entities": parsed["entities"],
-            "gate_receipts": parsed["gate_receipts"],
-            "nudge_count": parsed["nudge_count"],
-            "last_nudged_at": parsed["last_nudged_at"],
-            **eval_res,
-        }
-        actionable_tasks.append(entry)
-        if eval_res["due_for_check"]:
-            due_tasks.append(entry)
-        if eval_res["is_stale"]:
-            stale_tasks.append(entry)
-
-    return {
+    base_scan: dict[str, Any] = {
         "open_count": open_count,
         "blocked_count": blocked_count,
         "due_tasks": due_tasks,
@@ -652,6 +854,14 @@ def scan_tasks_for_daily_review(
         "actionable_tasks": actionable_tasks,
         "has_actionable_items": bool(due_tasks or stale_tasks),
     }
+    if personal_tasks_path is not None and Path(personal_tasks_path).is_file():
+        personal_scan = scan_personal_tasks(
+            personal_tasks_path,
+            now=now_ts,
+            tz_name=tz_name,
+        )
+        return merge_personal_tasks_into_scan(base_scan, personal_scan)
+    return base_scan
 
 
 def _resolve_cli_task_dir(args: argparse.Namespace) -> tuple[Path, BriefConfig]:
@@ -699,6 +909,12 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--task-dir", type=Path, default=None, help="Explicit task directory.")
     p_scan.add_argument("--memory-dir", type=Path, default=None, help="Override memory directory.")
     p_scan.add_argument("--config", type=Path, default=None, help="Optional BriefConfig TOML path.")
+    p_scan.add_argument(
+        "--personal-tasks-path",
+        type=Path,
+        default=None,
+        help="Optional personal tasks.json path.",
+    )
     p_scan.add_argument("--open-stale-days", type=int, default=None, help="Open staleness threshold.")
     p_scan.add_argument(
         "--blocked-stale-days", type=int, default=None, help="Blocked staleness threshold."
@@ -748,16 +964,29 @@ def main(argv: list[str] | None = None) -> int:
             if args.blocked_stale_days is not None
             else cfg.task_blocked_stale_days
         )
+        if args.personal_tasks_path is not None:
+            personal_tasks_path = args.personal_tasks_path
+        elif args.task_dir is not None and args.memory_dir is None and args.config is None:
+            personal_tasks_path = None
+        else:
+            personal_tasks_path = cfg.personal_tasks_path
+
         scan_result = scan_tasks_for_daily_review(
             task_dir,
             open_stale_days=open_days,
             blocked_stale_days=blocked_days,
             backoff_days=cfg.task_staleness_backoff_days,
             tz_name=tz_name,
+            personal_tasks_path=personal_tasks_path,
         )
         if args.mark_nudged and scan_result["actionable_tasks"]:
-            slugs = [item["slug"] for item in scan_result["actionable_tasks"]]
-            mark_tasks_nudged(task_dir, slugs, tz_name=tz_name)
+            slugs = [
+                item["slug"]
+                for item in scan_result["actionable_tasks"]
+                if item.get("slug") and item.get("source") != "personal_tasks"
+            ]
+            if slugs:
+                mark_tasks_nudged(task_dir, slugs, tz_name=tz_name)
         print(json.dumps(scan_result, sort_keys=True))
         return 0
 

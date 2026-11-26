@@ -274,7 +274,14 @@ def _cmd_morning_brief(args: argparse.Namespace) -> int:
     cfg = _load_runtime_config(args)
     queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
     queue.init_db()
-    event_id = enqueue_morning_brief(queue, now=time.time(), tz_name=cfg.timezone)
+    event_id = enqueue_morning_brief(
+        queue,
+        now=time.time(),
+        tz_name=cfg.timezone,
+        task_dir=cfg.task_dir,
+        personal_tasks_path=cfg.personal_tasks_path,
+        config=cfg,
+    )
     print(
         json.dumps(
             {
@@ -292,7 +299,14 @@ def _cmd_daily_review(args: argparse.Namespace) -> int:
     cfg = _load_runtime_config(args)
     queue = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
     queue.init_db()
-    event_id = enqueue_daily_review(queue, now=time.time(), tz_name=cfg.timezone)
+    event_id = enqueue_daily_review(
+        queue,
+        now=time.time(),
+        tz_name=cfg.timezone,
+        task_dir=cfg.task_dir,
+        personal_tasks_path=cfg.personal_tasks_path,
+        config=cfg,
+    )
     print(
         json.dumps(
             {

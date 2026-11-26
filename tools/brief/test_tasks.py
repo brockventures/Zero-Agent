@@ -18,13 +18,16 @@ from tools.brief.tasks import (
     _TASK_SLUG_RE,
     create_or_update_task_handoff,
     evaluate_task_staleness,
-    main as tasks_cli_main,
     mark_tasks_nudged,
     parse_task_file,
     render_task_file,
     resolve_task_path,
+    scan_personal_tasks,
     scan_tasks_for_daily_review,
     validate_task_slug,
+)
+from tools.brief.tasks import (
+    main as tasks_cli_main,
 )
 
 PT = ZoneInfo("America/Los_Angeles")
@@ -349,3 +352,147 @@ def test_cli_handoff_and_scan_commands(
     parsed = parse_task_file(task_dir / "20261124-cli-check.md")
     assert parsed["nudge_count"] == 1
     assert parsed["last_nudged_at"] != ""
+
+
+def test_scan_personal_tasks_filters_and_classifies(tmp_path: Path) -> None:
+    now_ts = _pt_epoch(2026, 11, 26, 7, 0)
+
+    # Missing or invalid file returns empty scan cleanly
+    missing_scan = scan_personal_tasks(tmp_path / "missing.json", now=now_ts)
+    assert missing_scan["open_personal_count"] == 0
+    assert missing_scan["actionable_personal_tasks"] == []
+    assert missing_scan["has_actionable_personal"] is False
+
+    tasks_json = tmp_path / "tasks.json"
+    tasks_json.write_text(
+        json.dumps(
+            [
+                {"id": 1, "title": "Completed chore", "priority": "p1", "status": "completed"},
+                {"id": 2, "title": "Retired chore", "priority": "p2", "status": "retired"},
+                {"id": 3, "title": "Canceled chore", "priority": "p2", "status": "canceled"},
+                {"id": 4, "title": "fix(brief): dev ticket", "priority": "p1", "status": "pending"},
+                {"id": 5, "title": "Internal flagged", "priority": "p1", "status": "pending", "dev": True},
+                {
+                    "id": 114,
+                    "title": "Replace front yard irrigation controller",
+                    "priority": "p2",
+                    "status": "pending",
+                    "due": "2026-11-16",
+                },
+                {
+                    "id": 116,
+                    "title": "Enable HA Companion App BLE Transmitter",
+                    "priority": "p2",
+                    "status": "pending",
+                    "due": "2026-11-26T00:00:00.000Z",
+                    "target_time_pt": "Thu Nov 26 @ 10:00 AM PT",
+                },
+                {
+                    "id": 117,
+                    "title": "Urgent school form",
+                    "priority": "p1",
+                    "status": "pending",
+                    "due": "2026-11-26",
+                },
+                {
+                    "id": 48,
+                    "title": "Rewire the BAF fans",
+                    "priority": "p1",
+                    "status": "pending",
+                },
+                {
+                    "id": 115,
+                    "title": "Evaluate Nest 4th-Gen Matter update",
+                    "priority": "p2",
+                    "status": "pending",
+                    "due": "2026-12-15",
+                },
+                {
+                    "id": 30,
+                    "title": "Setup living room motion detector",
+                    "priority": "p2",
+                    "status": "pending",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    res = scan_personal_tasks(tasks_json, now=now_ts)
+    assert res["open_personal_count"] == 6
+    assert [t["id"] for t in res["overdue"]] == [114]
+    assert [t["id"] for t in res["due_today"]] == [117, 116]
+    assert [t["id"] for t in res["high_priority"]] == [117, 48]
+    assert [t["id"] for t in res["upcoming"]] == [115]
+    assert [t["id"] for t in res["backlog"]] == [30]
+    # Deduplicated actionable tasks: overdue (114) -> due_today (117, 116) -> remaining p1 (48)
+    assert [t["id"] for t in res["actionable_personal_tasks"]] == [114, 117, 116, 48]
+    assert len(res["all_open_personal_tasks"]) == 6
+    assert res["has_actionable_personal"] is True
+
+
+def test_scan_tasks_for_daily_review_merges_personal_tasks_and_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    task_dir = tmp_path / "task"
+    tasks_json = tmp_path / "tasks.json"
+    tasks_json.write_text(
+        json.dumps(
+            [
+                {
+                    "id": 116,
+                    "title": "Enable HA Companion App BLE Transmitter",
+                    "priority": "p2",
+                    "status": "pending",
+                    "due": "2026-11-26",
+                },
+                {
+                    "id": 48,
+                    "title": "Rewire the BAF fans",
+                    "priority": "p1",
+                    "status": "pending",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Works even when task_dir does not exist yet
+    now_ts = _pt_epoch(2026, 11, 26, 7, 0)
+    merged = scan_tasks_for_daily_review(
+        task_dir,
+        now=now_ts,
+        personal_tasks_path=tasks_json,
+    )
+    assert merged["open_count"] == 2
+    assert merged["open_personal_count"] == 2
+    assert merged["has_actionable_items"] is True
+    assert len(merged["due_tasks"]) == 1
+    assert len(merged["actionable_tasks"]) == 2
+    assert merged["personal_tasks"]["open_personal_count"] == 2
+
+    # CLI scan with --personal-tasks-path and --mark-nudged handles personal tasks cleanly
+    create_or_update_task_handoff(
+        task_dir,
+        "20261124-follow-up-item",
+        status="open",
+        next_check="2020-01-01T09:00:00-08:00",
+        summary="MD task due",
+    )
+    rc = tasks_cli_main(
+        [
+            "scan",
+            "--task-dir",
+            str(task_dir),
+            "--personal-tasks-path",
+            str(tasks_json),
+            "--mark-nudged",
+        ]
+    )
+    assert rc == 0
+    cli_out = json.loads(capsys.readouterr().out)
+    assert cli_out["has_actionable_items"] is True
+    assert cli_out["open_personal_count"] == 2
+    assert len(cli_out["actionable_tasks"]) == 3
+    assert parse_task_file(task_dir / "20261124-follow-up-item.md")["nudge_count"] == 1

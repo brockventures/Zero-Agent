@@ -540,3 +540,120 @@ def test_brief_prompts_allow_gmail_create_draft_and_prohibit_gmail_send() -> Non
         assert "owner sends manually" in lowered
         for arg_name in required_draft_args:
             assert f"`{arg_name}`" in text, f"{filename} missing gmail.create_draft arg {arg_name}"
+
+
+def test_brief_config_personal_tasks_path_isolation_and_toml(tmp_path: Path) -> None:
+    # Hermetic load with custom state_dir/memory_dir never leaks host /workspace/data/tasks.json
+    hermetic_cfg = BriefConfig.load(
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path / "memory",
+        secrets_path=None,
+    )
+    assert hermetic_cfg.personal_tasks_path is None
+
+    # Default load with no path overrides resolves DEFAULT_PERSONAL_TASKS_PATH
+    default_cfg = BriefConfig.load(secrets_path=None)
+    assert default_cfg.personal_tasks_path == Path("/workspace/data/tasks.json")
+
+    # TOML [tasks].personal_tasks_path overrides cleanly
+    custom_tasks = tmp_path / "my_tasks.json"
+    toml_path = tmp_path / "brief.toml"
+    toml_path.write_text(
+        f'[tasks]\npersonal_tasks_path = "{custom_tasks}"\n',
+        encoding="utf-8",
+    )
+    toml_cfg = BriefConfig.load(config_path=toml_path, secrets_path=None)
+    assert toml_cfg.personal_tasks_path == custom_tasks
+
+
+def test_enqueue_morning_brief_and_daily_review_include_personal_task_scan(
+    tmp_path: Path,
+) -> None:
+    tasks_json = tmp_path / "tasks.json"
+    tasks_json.write_text(
+        json.dumps(
+            [
+                {"id": 10, "title": "Completed item", "priority": "p1", "status": "completed"},
+                {"id": 11, "title": "fix(ui): dev ticket", "priority": "p1", "status": "pending"},
+                {
+                    "id": 114,
+                    "title": "Replace front yard irrigation controller",
+                    "priority": "p2",
+                    "status": "pending",
+                    "due": "2026-11-16",
+                },
+                {
+                    "id": 116,
+                    "title": "Enable HA Companion App BLE Transmitter",
+                    "priority": "p2",
+                    "status": "pending",
+                    "due": "2026-11-26",
+                },
+                {
+                    "id": 48,
+                    "title": "Rewire the BAF fans",
+                    "priority": "p1",
+                    "status": "pending",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = _make_config(tmp_path, personal_tasks_path=tasks_json)
+    q = BriefQueue(cfg.db_path, allowlisted_senders=cfg.allowlisted_emails)
+    q.init_db()
+
+    pt_morning = datetime(2026, 11, 26, 7, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    pt_afternoon = datetime(2026, 11, 26, 17, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+    mb_id = enqueue_morning_brief(q, now=pt_morning, config=cfg)
+    assert mb_id is not None
+
+    dr_id = enqueue_daily_review(q, now=pt_afternoon, config=cfg, skip_if_empty=True)
+    assert dr_id is not None
+
+    with q._tx() as conn:
+        mb_row = conn.execute("SELECT body FROM events WHERE id = ?", (mb_id,)).fetchone()
+        dr_row = conn.execute("SELECT body FROM events WHERE id = ?", (dr_id,)).fetchone()
+    assert mb_row is not None and dr_row is not None
+
+    mb_payload = json.loads(mb_row["body"])
+    assert mb_payload["type"] == "morning_brief"
+    assert mb_payload["task_scan"]["has_actionable_items"] is True
+    assert mb_payload["task_scan"]["open_personal_count"] == 3
+    assert len(mb_payload["task_scan"]["personal_tasks"]["actionable_personal_tasks"]) == 3
+
+    dr_payload = json.loads(dr_row["body"])
+    assert dr_payload["type"] == "daily_review"
+    assert dr_payload["has_actionable_items"] is True
+    assert dr_payload["task_scan"]["open_personal_count"] == 3
+
+    # Backlog-only personal tasks keep skip_if_empty=True daily_review silent
+    backlog_only_json = tmp_path / "backlog_only.json"
+    backlog_only_json.write_text(
+        json.dumps(
+            [
+                {"id": 30, "title": "Setup living room motion detector", "priority": "p2", "status": "pending"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg_backlog = _make_config(
+        tmp_path / "backlog",
+        personal_tasks_path=backlog_only_json,
+    )
+    q_backlog = BriefQueue(cfg_backlog.db_path, allowlisted_senders=cfg_backlog.allowlisted_emails)
+    q_backlog.init_db()
+    assert (
+        enqueue_daily_review(q_backlog, now=pt_afternoon, config=cfg_backlog, skip_if_empty=True)
+        is None
+    )
+
+    # Prompts instruct BRIEF to inspect task_scan and omit zero-task filler
+    intake_prompt = (REPO_ROOT / "prompts" / "brief" / "intake.md").read_text(encoding="utf-8")
+    review_prompt = (REPO_ROOT / "prompts" / "brief" / "review.md").read_text(encoding="utf-8")
+    assert "task_scan" in intake_prompt
+    assert "Zero open tasks" in intake_prompt
+    assert "task_scan" in review_prompt
+    assert "Zero open tasks" in review_prompt
