@@ -12765,13 +12765,13 @@ def _format_header_decision_line(d: dict[str, Any]) -> str:
             if m2:
                 reason_title = m2.group(1).strip()
         if reason_title:
-            return f"- 🔄 **Reload Bridge:** {_truncate_label(reason_title, 48)} ({ch_ref})"
-        return f"- 🔄 **Reload Bridge** ({ch_ref})"
+            return f"- 🔄 Reload Bridge: {_truncate_label(reason_title, 48)} ({ch_ref})"
+        return f"- 🔄 Reload Bridge ({ch_ref})"
 
     raw_title = str(d.get("title") or "").strip()
     clean_title = re.sub(r"\s*\((?:fg|dec|dt)-[A-Za-z0-9_-]+\)", "", raw_title).strip()
     clean_title = re.sub(r"^\[?[A-Z_]+\]?\s*", "", clean_title).strip() or raw_title
-    return f"- 🛡️ **{_truncate_label(clean_title, 56)}** ({ch_ref})"
+    return f"- 🛡️ {_truncate_label(clean_title, 56)} ({ch_ref})"
 
 
 def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
@@ -12813,7 +12813,7 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
         for b in builds:
             st = str(b["status"] or "running").replace("_", " ").title()
             origin = b["origin_thread_id"] or b["origin_channel_id"]
-            lines.append(f"- 🔨 **{_truncate_label(b['title'], 56)}** · {st} (<#{origin}>)")
+            lines.append(f"- 🔨 {_truncate_label(b['title'], 56)} · {st} (<#{origin}>)")
 
     if not jobs:
         lines.append("**Active Tasks:** None")
@@ -12824,7 +12824,7 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
         for j in jobs:
             st = str(j["status"] or "running").replace("_", " ").title()
             ch_ref = _format_channel_mention(j["channel"])
-            lines.append(f"- ⚙️ **{_truncate_label(j['name'], 56)}** · {st} ({ch_ref})")
+            lines.append(f"- ⚙️ {_truncate_label(j['name'], 56)} · {st} ({ch_ref})")
 
     if not decisions:
         lines.append("**Pending Approvals:** None")
@@ -12933,9 +12933,9 @@ def _merge_remote_active_embeds_into_header(
             m_st = re.match(r"^\*\*([^*]+)\*\*", first_line)
             st_label = (m_st.group(1) if m_st else "RUNNING").title()
             if is_active_build:
-                remote_build_lines.append(f"- 🔨 **{short_title}** · {st_label} ({ch_ref})")
+                remote_build_lines.append(f"- 🔨 {short_title} · {st_label} ({ch_ref})")
             elif is_active_job:
-                remote_job_lines.append(f"- ⚙️ **{short_title}** · {st_label} ({ch_ref})")
+                remote_job_lines.append(f"- ⚙️ {short_title} · {st_label} ({ch_ref})")
         except Exception:
             continue
 
@@ -12979,6 +12979,25 @@ def sync_forge_channel_header(
     """Update the #forge header message in place whenever active builds, tasks, or decisions change."""
     if not force and Path(db_path).resolve() != FORGE_DB_PATH.resolve():
         return False
+
+    if not force and _is_prod_forge_env(db_path):
+        try:
+            from tools.bridge_state import is_vulcan_agent, is_vulcan_delegated
+            is_vulc = is_vulcan_agent()
+            is_delegated = is_vulcan_delegated()
+        except Exception:
+            is_vulc = os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+            is_delegated = os.getenv("VULCAN_DELEGATED", "").strip().lower() in {"1", "true", "yes"}
+        if not is_vulc and (is_ivy_container() or is_delegated):
+            for hb_candidate in (
+                DATA_DIR / "vulcan_heartbeat.json",
+                Path("/opt/zero/workspace/data/vulcan_heartbeat.json"),
+            ):
+                try:
+                    if hb_candidate.exists() and (time.time() - hb_candidate.stat().st_mtime) < 180:
+                        return False
+                except Exception:
+                    pass
 
     if not force:
         try:

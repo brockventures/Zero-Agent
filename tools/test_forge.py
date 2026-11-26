@@ -621,7 +621,8 @@ class TestForgeEngine(unittest.TestCase):
         header = forge_mod.format_forge_channel_header(db_path=self.db_path)
         self.assertIn("VULCAN · FORGE Board", header)
         self.assertIn("**Active Builds**", header)
-        self.assertIn("Ivy Projection Engine Upgrade", header)
+        self.assertIn("- 🔨 Ivy Projection Engine Upgrade", header)
+        self.assertNotIn("**Ivy Projection Engine Upgrade**", header)
         self.assertIn("**Active Tasks:** None", header)
         self.assertIn("**Pending Approvals:** None", header)
         self.assertIn("**Recently Completed (Last 5):** None", header)
@@ -646,7 +647,8 @@ class TestForgeEngine(unittest.TestCase):
                 "'{\"reason\": \"FORGE build fg-123-heartbeat (Fix Heartbeat Guard)\"}', 1544955535722545253, 0, 'pending', 1700009500.0, 1700095900.0)"
             )
         header_with_recent = forge_mod.format_forge_channel_header(db_path=self.db_path)
-        self.assertIn("🔄 **Reload Bridge:** Fix Heartbeat Guard (<#1544955535722545253>)", header_with_recent)
+        self.assertIn("🔄 Reload Bridge: Fix Heartbeat Guard (<#1544955535722545253>)", header_with_recent)
+        self.assertNotIn("**Reload Bridge:**", header_with_recent)
         self.assertNotIn("dec-abc123-bridgere", header_with_recent)
         self.assertNotIn("fg-123-heartbeat", header_with_recent)
         self.assertNotIn("Completed Build 1", header_with_recent)
@@ -5205,7 +5207,8 @@ def test_decision_card_bridge_reload_omits_ids_and_pending_expiration(tmp_path, 
     assert "dec-" not in card_text
 
     header_line = forge_mod._format_header_decision_line(dict(dec_row))
-    assert "🔄 **Reload Bridge:**" in header_line
+    assert "🔄 Reload Bridge:" in header_line
+    assert "**" not in header_line
     assert "fg-" not in header_line
     assert "dec-" not in header_line
 
@@ -8115,10 +8118,10 @@ def test_merge_remote_active_embeds_without_footer_ids(monkeypatch):
         forge.FORGE_CHANNEL_ID,
         "fake-token",
     )
-    assert merged.count("- 🔨 **Remote Peer Build**") == 1
-    assert "- 🔨 **Remote Peer Build** · Running (<#1542081375287640084>)" in merged
-    assert "- ⚙️ **Remote Peer Task** · Running (<#1548196929308065893>)" in merged
-    assert "- ⚙️ **Queued Startup Task** · Starting (<#1542081375287640084>)" in merged
+    assert merged.count("- 🔨 Remote Peer Build") == 1
+    assert "- 🔨 Remote Peer Build · Running (<#1542081375287640084>)" in merged
+    assert "- ⚙️ Remote Peer Task · Running (<#1548196929308065893>)" in merged
+    assert "- ⚙️ Queued Startup Task · Starting (<#1542081375287640084>)" in merged
     assert "System Warning" not in merged
     assert "Completed Remote Build" not in merged
 
