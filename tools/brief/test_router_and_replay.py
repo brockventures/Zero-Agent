@@ -523,3 +523,20 @@ def test_dry_run_replay_all_canned_fixtures_pass() -> None:
         "untrusted_prompt_injection": "BLOCKED_INJECTION",
     }
     assert replay_main() == 0
+
+
+def test_brief_prompts_allow_gmail_create_draft_and_prohibit_gmail_send() -> None:
+    prompts_dir = REPO_ROOT / "prompts" / "brief"
+    required_draft_args = ("to", "subject", "body", "cc", "bcc", "thread_id", "in_reply_to", "references")
+
+    for filename in ("base.md", "intake.md", "task.md"):
+        text = (prompts_dir / filename).read_text(encoding="utf-8")
+        lowered = text.lower()
+        for action in ("calendar.create", "calendar.update", "gmail.create_draft"):
+            assert action in text, f"{filename} must allowlist {action}"
+        assert "proposals/pending/<id>.json" in text
+        assert "gmail.send" in text, f"{filename} must explicitly mention gmail.send prohibition"
+        assert "prohibited" in lowered, f"{filename} must explicitly prohibit gmail.send"
+        assert "owner sends manually" in lowered
+        for arg_name in required_draft_args:
+            assert f"`{arg_name}`" in text, f"{filename} missing gmail.create_draft arg {arg_name}"
