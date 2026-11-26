@@ -1,7 +1,10 @@
-"""Unit tests for BRIEF gate config, write action validation, OAuth separation, and Calendar write execution."""
+"""Unit tests for BRIEF gate config, write action validation, split OAuth, and Calendar/Gmail draft execution."""
 
 from __future__ import annotations
 
+import base64
+import email
+import email.policy
 import io
 import json
 import logging
@@ -21,9 +24,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.brief.actions import (
     ALLOWED_GATE_ACTIONS,
+    CALENDAR_WRITE_SCOPE,
+    GMAIL_API_BASE,
+    GMAIL_COMPOSE_SCOPE,
+    READONLY_OAUTH_SCOPES,
+    WRITE_OAUTH_SCOPES,
     GoogleCalendarWriteClient,
+    GoogleGmailDraftWriteClient,
     build_oauth_consent_urls,
     canonical_proposal_hash,
+    exchange_oauth_authorization_code,
     execute_action,
     resolve_gate_write_credentials,
     validate_action_args,
@@ -129,7 +139,7 @@ def test_gate_config_defaults_toml_example_and_aliases(
 
 
 def test_allowlist_and_canonical_proposal_hash_stability() -> None:
-    assert ALLOWED_GATE_ACTIONS == frozenset({"calendar.create", "calendar.update"})
+    assert ALLOWED_GATE_ACTIONS == frozenset({"calendar.create", "calendar.update", "gmail.create_draft"})
 
     for blocked in ("gmail.send", "gmail.delete", "calendar.delete", "shell.exec", ""):
         with pytest.raises(ValueError):
@@ -259,6 +269,114 @@ def test_validate_action_args_create_and_update_schemas() -> None:
     }
 
 
+def test_validate_action_args_gmail_create_draft_and_crlf_injection() -> None:
+    # Single recipient string normalized to lowercase list
+    draft_single = validate_action_args(
+        "gmail.create_draft",
+        {
+            "to": "Coach Bob <Coach@Example.org>",
+            "subject": "  Saturday Practice Update  ",
+            "body": "Hi Coach,\n\nWe will arrive 15 minutes early.\n",
+        },
+    )
+    assert draft_single == {
+        "to": ["coach@example.org"],
+        "subject": "Saturday Practice Update",
+        "body": "Hi Coach,\n\nWe will arrive 15 minutes early.",
+    }
+
+    # Multi-recipient deduplication + threading metadata
+    draft_full = validate_action_args(
+        "gmail.create_draft",
+        {
+            "to": ["Owner <owner@example.com>", "coach@example.org", "OWNER@example.com"],
+            "cc": ["Assistant <asst@example.org>", "ASST@example.org"],
+            "bcc": "archive@example.com",
+            "subject": "Re: Game Schedule",
+            "body": "Confirmed for 10:00 AM PT.",
+            "thread_id": "18f123abc_XYZ-9",
+            "in_reply_to": " <msg-123@mail.example.com> ",
+            "references": " <msg-100@mail.example.com> <msg-123@mail.example.com> ",
+        },
+    )
+    assert draft_full == {
+        "to": ["owner@example.com", "coach@example.org"],
+        "cc": ["asst@example.org"],
+        "bcc": ["archive@example.com"],
+        "subject": "Re: Game Schedule",
+        "body": "Confirmed for 10:00 AM PT.",
+        "thread_id": "18f123abc_XYZ-9",
+        "in_reply_to": "<msg-123@mail.example.com>",
+        "references": "<msg-100@mail.example.com> <msg-123@mail.example.com>",
+    }
+
+    # Missing required arguments
+    for missing_field in ("to", "subject", "body"):
+        base = {"to": ["a@example.com"], "subject": "Hi", "body": "Hello"}
+        base.pop(missing_field)
+        with pytest.raises(ValueError, match="Missing required argument"):
+            validate_action_args("gmail.create_draft", base)
+
+    # Unsupported extra arguments rejected
+    with pytest.raises(ValueError, match="Unsupported argument"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "Hi", "body": "Hello", "send_now": True},
+        )
+
+    # CRLF header injection strictly rejected across all header fields
+    crlf_cases = [
+        {"to": "a@example.com\r\nBcc: evil@example.org", "subject": "Hi", "body": "Hello"},
+        {"to": ["a@example.com\nX-Evil: 1"], "subject": "Hi", "body": "Hello"},
+        {"to": "a@example.com", "cc": "b@example.com\r\nBcc: evil@example.org", "subject": "Hi", "body": "Hello"},
+        {"to": "a@example.com", "bcc": "b@example.com\nX-Injected: 1", "subject": "Hi", "body": "Hello"},
+        {"to": "a@example.com", "subject": "Hello\r\nBcc: evil@example.org", "body": "Hello"},
+        {"to": "a@example.com", "subject": "Hello\n", "body": "Hello"},
+        {"to": "a@example.com", "subject": "Hi", "body": "Hello", "in_reply_to": "<id@example.com>\r\nBcc: x@y.com"},
+        {"to": "a@example.com", "subject": "Hi", "body": "Hello", "references": "<id@example.com>\nX: y"},
+        {"to": "a@example.com", "subject": "Hi", "body": "Hello", "thread_id": "abc\n"},
+    ]
+    for bad_payload in crlf_cases:
+        with pytest.raises(ValueError, match="CR, LF, or NUL"):
+            validate_action_args("gmail.create_draft", bad_payload)
+
+    # Invalid emails, empty to, bad thread_id, oversized fields
+    with pytest.raises(ValueError, match="at least one valid email"):
+        validate_action_args("gmail.create_draft", {"to": [], "subject": "Hi", "body": "Hello"})
+    with pytest.raises(ValueError, match="not a valid email"):
+        validate_action_args("gmail.create_draft", {"to": "not-an-email", "subject": "Hi", "body": "Hello"})
+    with pytest.raises(ValueError, match="thread_id"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "Hi", "body": "Hello", "thread_id": "bad/thread id"},
+        )
+    with pytest.raises(ValueError, match="thread_id"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "Hi", "body": "Hello", "thread_id": "a" * 129},
+        )
+    with pytest.raises(ValueError, match="subject must be at most 500"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "s" * 501, "body": "Hello"},
+        )
+    with pytest.raises(ValueError, match="body must be at most 50000"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "Hi", "body": "b" * 50001},
+        )
+    with pytest.raises(ValueError, match="in_reply_to must be at most 500"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "Hi", "body": "Hello", "in_reply_to": "r" * 501},
+        )
+    with pytest.raises(ValueError, match="references must be at most 2000"):
+        validate_action_args(
+            "gmail.create_draft",
+            {"to": "a@example.com", "subject": "Hi", "body": "Hello", "references": "r" * 2001},
+        )
+
+
 def test_resolve_gate_write_credentials_strict_separation_and_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -278,8 +396,10 @@ def test_resolve_gate_write_credentials_strict_separation_and_fallback(
     with pytest.raises(RuntimeError, match="gate_allow_shared_oauth_fallback is disabled"):
         resolve_gate_write_credentials(cfg_strict, fallback_oauth_path=shared_oauth)
 
-    # 2. Missing write token + fallback enabled -> uses shared oauth + exchanges token
+    # 2. Missing write token + fallback enabled -> uses shared oauth for calendar,
+    #    but STRICTLY REFUSES fallback for gmail.* actions
     captured_requests: list[dict[str, Any]] = []
+    mock_scope = f"{CALENDAR_WRITE_SCOPE} {GMAIL_COMPOSE_SCOPE}"
 
     def _fake_urlopen(req: Any, timeout: float = 15.0) -> _FakeHttpResponse:
         captured_requests.append(
@@ -295,7 +415,7 @@ def test_resolve_gate_write_credentials_strict_separation_and_fallback(
                 "access_token": "ya29.write-access-token",
                 "expires_in": 3600,
                 "token_type": "Bearer",
-                "scope": "https://www.googleapis.com/auth/calendar.events",
+                "scope": mock_scope,
             }
         )
 
@@ -307,8 +427,22 @@ def test_resolve_gate_write_credentials_strict_separation_and_fallback(
         gate_write_token_path=write_token,
         gate_allow_shared_oauth_fallback=True,
     )
+    with pytest.raises(RuntimeError, match="shared fallback is strictly prohibited"):
+        resolve_gate_write_credentials(
+            cfg_fallback,
+            action="gmail.create_draft",
+            fallback_oauth_path=shared_oauth,
+        )
+    with pytest.raises(RuntimeError, match="strictly prohibited"):
+        resolve_gate_write_credentials(
+            cfg_fallback,
+            action="gmail.send",
+            fallback_oauth_path=shared_oauth,
+        )
+
     res_fb = resolve_gate_write_credentials(
         cfg_fallback,
+        action="calendar.create",
         now_fn=lambda: 1000.0,
         fallback_oauth_path=shared_oauth,
     )
@@ -323,6 +457,7 @@ def test_resolve_gate_write_credentials_strict_separation_and_fallback(
     with caplog.at_level(logging.WARNING):
         res_dedicated = resolve_gate_write_credentials(
             cfg_strict,
+            action="gmail.create_draft",
             now_fn=lambda: 2000.0,
             fallback_oauth_path=shared_oauth,
         )
@@ -331,7 +466,32 @@ def test_resolve_gate_write_credentials_strict_separation_and_fallback(
     assert "client_id=dedicated-write-cid" in captured_requests[-1]["body"]
     assert "overly permissive mode" in caplog.text
 
-    # 4. Token HTTP error never leaks client_secret or refresh_token
+    # gmail.send remains strictly refused even when dedicated write token exists
+    with pytest.raises(RuntimeError, match="strictly prohibited"):
+        resolve_gate_write_credentials(
+            cfg_strict,
+            action="gmail.send",
+            fallback_oauth_path=shared_oauth,
+        )
+
+    # 4. Scope verification: fail closed if token exchange returns non-empty scope missing action scope
+    mock_scope = CALENDAR_WRITE_SCOPE  # missing gmail.compose
+    with pytest.raises(RuntimeError, match=GMAIL_COMPOSE_SCOPE):
+        resolve_gate_write_credentials(
+            cfg_strict,
+            action="gmail.create_draft",
+            fallback_oauth_path=shared_oauth,
+        )
+
+    mock_scope = GMAIL_COMPOSE_SCOPE  # missing calendar.events
+    with pytest.raises(RuntimeError, match=CALENDAR_WRITE_SCOPE):
+        resolve_gate_write_credentials(
+            cfg_strict,
+            action="calendar.update",
+            fallback_oauth_path=shared_oauth,
+        )
+
+    # 5. Token HTTP error never leaks client_secret or refresh_token
     def _failing_urlopen(req: Any, timeout: float = 15.0) -> Any:
         raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", hdrs=None, fp=io.BytesIO(b""))
 
@@ -371,17 +531,238 @@ def test_build_oauth_consent_urls_never_leaks_client_secret(tmp_path: Path) -> N
     assert "gmail.readonly" in ro_qs["scope"][0]
     assert "calendar.readonly" in ro_qs["scope"][0]
     assert "calendar.events" not in ro_qs["scope"][0]
+    assert "gmail.compose" not in ro_qs["scope"][0]
+    assert "gmail.send" not in ro_qs["scope"][0]
 
     wr_parsed = urllib.parse.urlparse(urls["write_url"])
     wr_qs = urllib.parse.parse_qs(wr_parsed.query)
     assert wr_qs["client_id"] == ["12345.apps.googleusercontent.com"]
     assert wr_qs["access_type"] == ["offline"]
     assert wr_qs["prompt"] == ["consent"]
-    assert wr_qs["scope"] == ["https://www.googleapis.com/auth/calendar.events"]
+    assert wr_qs["scope"] == [WRITE_OAUTH_SCOPES]
+    assert CALENDAR_WRITE_SCOPE in wr_qs["scope"][0]
+    assert GMAIL_COMPOSE_SCOPE in wr_qs["scope"][0]
+    assert "gmail.send" not in wr_qs["scope"][0]
 
     serialized = json.dumps(urls)
     assert secret_val not in serialized
     assert "client_secret" not in serialized
+
+
+def test_exchange_oauth_authorization_code_roles_scopes_and_atomic_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_path = tmp_path / "google_oauth.json"
+    secret_val = "GOCSPX-EXCHANGE-SECRET-999"
+    client_path.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "client_id": "cid-split-1",
+                    "client_secret": secret_val,
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    token_requests: list[dict[str, Any]] = []
+    mock_response_payload: dict[str, Any] = {}
+
+    def _mock_urlopen(req: Any, timeout: float = 15.0) -> _FakeHttpResponse:
+        body_qs = urllib.parse.parse_qs(req.data.decode("utf-8"))
+        token_requests.append({"url": req.full_url, "form": body_qs, "timeout": timeout})
+        return _FakeHttpResponse(mock_response_payload)
+
+    monkeypatch.setattr("tools.brief.actions.urllib.request.urlopen", _mock_urlopen)
+
+    # 1. Read-only role extracts code from redirect URL and writes 0600 JSON
+    ro_out = tmp_path / "secrets" / "brief_readonly_token.json"
+    mock_response_payload = {
+        "access_token": "ya29.ro-access",
+        "refresh_token": "1//ro-refresh-secret",
+        "expires_in": 3599,
+        "token_type": "Bearer",
+        "scope": READONLY_OAUTH_SCOPES,
+    }
+    ro_meta = exchange_oauth_authorization_code(
+        "http://localhost/?code=4%2F0A-ro-code-123&scope=ignored",
+        role="readonly",
+        oauth_client_path=client_path,
+        output_path=ro_out,
+    )
+    assert token_requests[-1]["form"]["code"] == ["4/0A-ro-code-123"]
+    assert token_requests[-1]["form"]["grant_type"] == ["authorization_code"]
+    assert ro_meta["role"] == "readonly"
+    assert ro_meta["written"] is True
+    assert ro_meta["output_path"] == str(ro_out)
+    assert (ro_out.stat().st_mode & 0o777) == 0o600
+    ro_dumped = json.dumps(ro_meta)
+    assert secret_val not in ro_dumped
+    assert "1//ro-refresh-secret" not in ro_dumped
+    assert "ya29.ro-access" not in ro_dumped
+
+    # 2. Write role with raw code writes flat 0600 JSON usable by resolve_gate_write_credentials
+    wr_out = tmp_path / "secrets" / "brief_write_token.json"
+    mock_response_payload = {
+        "access_token": "ya29.wr-access",
+        "refresh_token": "1//wr-refresh-secret",
+        "expires_in": 3600,
+        "token_type": "Bearer",
+        "scope": WRITE_OAUTH_SCOPES,
+    }
+    wr_meta = exchange_oauth_authorization_code(
+        "4/0A-raw-write-code",
+        role="write",
+        oauth_client_path=client_path,
+        output_path=wr_out,
+    )
+    assert token_requests[-1]["form"]["code"] == ["4/0A-raw-write-code"]
+    assert wr_meta["role"] == "write"
+    assert (wr_out.stat().st_mode & 0o777) == 0o600
+    wr_written = json.loads(wr_out.read_text(encoding="utf-8"))
+    assert wr_written["client_id"] == "cid-split-1"
+    assert wr_written["refresh_token"] == "1//wr-refresh-secret"
+    assert wr_written["role"] == "write"
+
+    # Verify resolve_gate_write_credentials loads the newly written write token
+    cfg_written = BriefConfig(
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path / "memory",
+        gate_write_token_path=wr_out,
+        gate_allow_shared_oauth_fallback=False,
+    )
+    resolved = resolve_gate_write_credentials(cfg_written, action="gmail.create_draft")
+    assert resolved["access_token"] == "ya29.wr-access"
+
+    # 3. Missing refresh_token rejected
+    mock_response_payload = {"access_token": "ya29.no-rt", "scope": WRITE_OAUTH_SCOPES}
+    with pytest.raises(RuntimeError, match="missing refresh_token"):
+        exchange_oauth_authorization_code("4/code", role="write", oauth_client_path=client_path)
+
+    # 4. Scope mismatches & forbidden scopes rejected
+    mock_response_payload = {
+        "access_token": "ya29.bad-scope",
+        "refresh_token": "1//rt",
+        "scope": READONLY_OAUTH_SCOPES,
+    }
+    with pytest.raises(RuntimeError, match="missing required scope"):
+        exchange_oauth_authorization_code("4/code", role="write", oauth_client_path=client_path)
+
+    mock_response_payload = {
+        "access_token": "ya29.send-scope",
+        "refresh_token": "1//rt",
+        "scope": f"{WRITE_OAUTH_SCOPES} https://www.googleapis.com/auth/gmail.send",
+    }
+    with pytest.raises(RuntimeError, match="prohibited scope"):
+        exchange_oauth_authorization_code("4/code", role="write", oauth_client_path=client_path)
+
+    mock_response_payload = {
+        "access_token": "ya29.ro-with-write",
+        "refresh_token": "1//rt",
+        "scope": f"{READONLY_OAUTH_SCOPES} {GMAIL_COMPOSE_SCOPE}",
+    }
+    with pytest.raises(RuntimeError, match="prohibited scope"):
+        exchange_oauth_authorization_code("4/code", role="readonly", oauth_client_path=client_path)
+
+    # 5. OAuth redirect error & bad role rejected
+    with pytest.raises(RuntimeError, match="access_denied"):
+        exchange_oauth_authorization_code(
+            "http://localhost/?error=access_denied",
+            role="write",
+            oauth_client_path=client_path,
+        )
+    with pytest.raises(ValueError, match="Unsupported OAuth role"):
+        exchange_oauth_authorization_code("4/code", role="admin", oauth_client_path=client_path)
+
+
+def test_google_gmail_draft_write_client_mime_threading_and_401_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_token = _write_oauth_file(tmp_path / "brief_write_token.json", mode=0o600)
+    cfg = BriefConfig(
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path / "memory",
+        gate_write_token_path=write_token,
+        dry_run=False,
+    )
+
+    # MIME & threading header encoding
+    raw_b64 = GoogleGmailDraftWriteClient.build_raw_mime_message(
+        to=["coach@example.org", "owner@example.com"],
+        cc=["team@example.org"],
+        bcc="bcc@example.com",
+        subject="Practice — Saturday",
+        body="See you at 09:00 PT.\nBring water.",
+        in_reply_to="<orig-1@mail.example.com>",
+        references="<root-0@mail.example.com> <orig-1@mail.example.com>",
+    )
+    decoded_bytes = base64.urlsafe_b64decode(raw_b64.encode("ascii"))
+    parsed_msg = email.message_from_bytes(decoded_bytes, policy=email.policy.default)
+    assert parsed_msg["To"] == "coach@example.org, owner@example.com"
+    assert parsed_msg["Cc"] == "team@example.org"
+    assert parsed_msg["Bcc"] == "bcc@example.com"
+    assert parsed_msg["Subject"] == "Practice — Saturday"
+    assert parsed_msg["In-Reply-To"] == "<orig-1@mail.example.com>"
+    assert parsed_msg["References"] == "<root-0@mail.example.com> <orig-1@mail.example.com>"
+    assert "Bring water." in parsed_msg.get_content()
+
+    # 401 triggers single forced token refresh and retries draft POST
+    token_seq = iter(["ya29.expired-token", "ya29.fresh-token"])
+    draft_attempts = 0
+    seen_calls: list[dict[str, Any]] = []
+
+    def _mock_urlopen(req: Any, timeout: float = 15.0) -> _FakeHttpResponse:
+        nonlocal draft_attempts
+        url = req.full_url
+        method = req.get_method()
+        raw_body = req.data.decode("utf-8") if req.data else ""
+        headers = {k.lower(): v for k, v in req.header_items()}
+        seen_calls.append({"url": url, "method": method, "body": raw_body, "headers": headers})
+
+        if url == "https://oauth2.googleapis.com/token":
+            return _FakeHttpResponse(
+                {
+                    "access_token": next(token_seq),
+                    "expires_in": 3600,
+                    "scope": WRITE_OAUTH_SCOPES,
+                }
+            )
+        if url == f"{GMAIL_API_BASE}/users/me/drafts" and method == "POST":
+            draft_attempts += 1
+            if draft_attempts == 1:
+                assert headers["authorization"] == "Bearer ya29.expired-token"
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", hdrs=None, fp=io.BytesIO(b""))
+            assert headers["authorization"] == "Bearer ya29.fresh-token"
+            return _FakeHttpResponse(
+                {
+                    "id": "r-draft-100",
+                    "message": {
+                        "id": "18f-msg-200",
+                        "threadId": "18f-thread-9",
+                        "labelIds": ["DRAFT"],
+                    },
+                }
+            )
+        raise AssertionError(f"Unexpected HTTP call: {method} {url}")
+
+    monkeypatch.setattr("tools.brief.actions.urllib.request.urlopen", _mock_urlopen)
+
+    client = GoogleGmailDraftWriteClient(cfg, now_fn=lambda: 5000.0)
+    resp = client.create_draft(
+        {
+            "message": {
+                "raw": raw_b64,
+                "threadId": "18f-thread-9",
+            }
+        }
+    )
+    assert resp["id"] == "r-draft-100"
+    assert draft_attempts == 2
+    assert len(seen_calls) == 4  # token1 -> 401 draft -> token2 -> 200 draft
 
 
 def test_execute_action_dry_run_and_live_http_requests(
@@ -419,7 +800,30 @@ def test_execute_action_dry_run_and_live_http_requests(
     assert dry_receipt["end_pt"] == "2026-11-24 14:30 PT"
     assert dry_receipt["html_link"]
 
-    # Live execution via GoogleCalendarWriteClient + mocked urllib
+    # Dry-run gmail.create_draft returns deterministic receipt without network calls
+    dry_draft = execute_action(
+        "gmail.create_draft",
+        {
+            "to": ["Coach <coach@example.org>"],
+            "cc": ["owner@example.com"],
+            "subject": "Game Snacks",
+            "body": "We can bring oranges.",
+            "thread_id": "thr-42",
+        },
+        cfg_dry,
+    )
+    assert dry_draft["dry_run"] is True
+    assert dry_draft["action"] == "gmail.create_draft"
+    assert dry_draft["draft_id"].startswith("dryrun-")
+    assert dry_draft["message_id"].startswith("dryrun-msg-")
+    assert dry_draft["thread_id"] == "thr-42"
+    assert dry_draft["to"] == ["coach@example.org"]
+    assert dry_draft["cc"] == ["owner@example.com"]
+    assert dry_draft["subject"] == "Game Snacks"
+    assert dry_draft["gmail_url"].startswith("https://mail.google.com/mail/u/0/#drafts?compose=")
+    assert len(dry_draft["proposal_hash"]) == 64
+
+    # Live execution via GoogleCalendarWriteClient + GoogleGmailDraftWriteClient + mocked urllib
     http_calls: list[dict[str, Any]] = []
 
     def _mock_urlopen(req: Any, timeout: float = 15.0) -> _FakeHttpResponse:
@@ -448,6 +852,17 @@ def test_execute_action_dry_run_and_live_http_requests(
                     "summary": "Updated Title",
                     "start": {"dateTime": "2026-11-24T15:00:00-08:00"},
                     "end": {"dateTime": "2026-11-24T16:00:00-08:00"},
+                }
+            )
+        if method == "POST" and url == f"{GMAIL_API_BASE}/users/me/drafts":
+            return _FakeHttpResponse(
+                {
+                    "id": "r-live-draft-7",
+                    "message": {
+                        "id": "18f-live-msg-7",
+                        "threadId": "thr-live-99",
+                        "labelIds": ["DRAFT"],
+                    },
                 }
             )
         raise AssertionError(f"Unexpected HTTP call: {method} {url}")
@@ -500,15 +915,46 @@ def test_execute_action_dry_run_and_live_http_requests(
     assert update_receipt["start_pt"] == "2026-11-24 15:00 PT"
     assert update_receipt["end_pt"] == "2026-11-24 16:00 PT"
 
-    # 1 token exchange + 1 POST + 1 PATCH
-    assert len(http_calls) == 3
+    # Live gmail.create_draft receipt
+    draft_receipt = execute_action(
+        "gmail.create_draft",
+        {
+            "to": "coach@example.org",
+            "cc": ["parent@example.com"],
+            "subject": "Roster Question",
+            "body": "Is Saturday still on?",
+            "thread_id": "thr-live-99",
+            "in_reply_to": "<msg-0@mail.example.com>",
+        },
+        cfg_live,
+    )
+    assert draft_receipt["dry_run"] is False
+    assert draft_receipt["action"] == "gmail.create_draft"
+    assert draft_receipt["draft_id"] == "r-live-draft-7"
+    assert draft_receipt["message_id"] == "18f-live-msg-7"
+    assert draft_receipt["thread_id"] == "thr-live-99"
+    assert draft_receipt["to"] == ["coach@example.org"]
+    assert draft_receipt["cc"] == ["parent@example.com"]
+    assert draft_receipt["subject"] == "Roster Question"
+    assert draft_receipt["gmail_url"] == "https://mail.google.com/mail/u/0/#drafts?compose=18f-live-msg-7"
+
+    draft_http_payload = json.loads(http_calls[-1]["body"])
+    assert draft_http_payload["message"]["threadId"] == "thr-live-99"
+    raw_mime = base64.urlsafe_b64decode(draft_http_payload["message"]["raw"].encode("ascii"))
+    parsed_live_mime = email.message_from_bytes(raw_mime, policy=email.policy.default)
+    assert parsed_live_mime["In-Reply-To"] == "<msg-0@mail.example.com>"
+    assert "Is Saturday still on?" in parsed_live_mime.get_content()
+
+    # 1 calendar token + 1 POST + 1 PATCH + 1 gmail token + 1 gmail draft POST = 5 calls
+    assert len(http_calls) == 5
     assert http_calls[1]["method"] == "POST"
     assert http_calls[2]["method"] == "PATCH"
+    assert http_calls[4]["method"] == "POST"
     post_payload = json.loads(http_calls[1]["body"])
     assert post_payload["attendees"] == [{"email": "owner@example.com"}]
 
     # Secrets must never appear in receipts
-    for receipt in (create_receipt, update_receipt):
+    for receipt in (create_receipt, update_receipt, draft_receipt):
         dumped = json.dumps(receipt)
         assert "ya29.live-write-token" not in dumped
         assert "super-secret-value-do-not-leak" not in dumped
