@@ -8689,5 +8689,305 @@ def test_ensure_decision_action_clarity_forge_enqueue_card_title_dedup():
     assert "**Approve Action:** Queue this 1-chunk build in #forge" in text
 
 
+def test_is_ephemeral_lifecycle_message():
+    import tools.forge as forge
+
+    assert forge.EPHEMERAL_LIFECYCLE_MSG_TTL_SECONDS == 300.0
+    assert forge.REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS == 60.0
+
+    # Valid bot-authored lifecycle notices
+    for content in (
+        "🔄 Reloading Vulcan bridge in-place...",
+        "🔄 Dispatching full Zero Docker container restart...",
+        "🟢 **Vulcan is online and ready.** Ready for #forge tasks.",
+        "🟢 **Zero is online and ready.**",
+        "🟢 **Ivy is online and ready.** Ready in #baseball.",
+    ):
+        assert forge.is_ephemeral_lifecycle_message(
+            {
+                "content": content,
+                "author": {"bot": True},
+                "pinned": False,
+                "embeds": [],
+                "components": [],
+            }
+        )
+
+    # Reject non-dict, non-bot, pinned, embeds, components, and normal text
+    assert not forge.is_ephemeral_lifecycle_message(None)  # type: ignore[arg-type]
+    assert not forge.is_ephemeral_lifecycle_message("not a dict")  # type: ignore[arg-type]
+    assert not forge.is_ephemeral_lifecycle_message(
+        {"content": "🔄 Reloading Vulcan bridge in-place...", "author": {"bot": False}}
+    )
+    assert not forge.is_ephemeral_lifecycle_message(
+        {"content": "🔄 Reloading Vulcan bridge in-place...", "author": {}}
+    )
+    assert not forge.is_ephemeral_lifecycle_message(
+        {"content": "🔄 Reloading Vulcan bridge in-place...", "author": {"bot": True}, "pinned": True}
+    )
+    assert not forge.is_ephemeral_lifecycle_message(
+        {
+            "content": "🟢 **Zero is online and ready.**",
+            "author": {"bot": True},
+            "embeds": [{"title": "Status"}],
+        }
+    )
+    assert not forge.is_ephemeral_lifecycle_message(
+        {
+            "content": "🟢 **Zero is online and ready.**",
+            "author": {"bot": True},
+            "components": [{"type": 1, "components": [{"type": 2, "label": "Run Check"}]}],
+        }
+    )
+    assert not forge.is_ephemeral_lifecycle_message(
+        {"content": "Normal bot status message", "author": {"bot": True}}
+    )
+
+
+def test_sweep_stale_forge_channel_embeds_ephemeral_lifecycle(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    now = time.time()
+    expired_iso = datetime.fromtimestamp(now - 310.0, tz=timezone.utc).isoformat()
+    fresh_iso = datetime.fromtimestamp(now - 120.0, tz=timezone.utc).isoformat()
+
+    fake_messages = [
+        {
+            "id": "4000000001",
+            "timestamp": expired_iso,
+            "content": "🔄 Reloading Vulcan bridge in-place...",
+            "author": {"bot": True},
+            "pinned": False,
+            "embeds": [],
+            "components": [],
+        },
+        {
+            "id": "4000000002",
+            "timestamp": expired_iso,
+            "content": "🟢 **Vulcan is online and ready.**",
+            "author": {"bot": True},
+            "pinned": False,
+            "embeds": [],
+            "components": [],
+        },
+        {
+            "id": "4000000003",
+            "timestamp": fresh_iso,
+            "content": "🔄 Reloading Vulcan bridge in-place...",
+            "author": {"bot": True},
+            "pinned": False,
+            "embeds": [],
+            "components": [],
+        },
+        {
+            "id": "4000000004",
+            "timestamp": expired_iso,
+            "content": "🟢 **Vulcan is online and ready.**",
+            "author": {"bot": False},
+            "pinned": False,
+            "embeds": [],
+            "components": [],
+        },
+        {
+            "id": "4000000005",
+            "timestamp": expired_iso,
+            "content": "🟢 **Vulcan is online and ready.**",
+            "author": {"bot": True},
+            "pinned": False,
+            "embeds": [],
+            "components": [{"type": 1, "components": [{"type": 2, "label": "Ack"}]}],
+        },
+    ]
+
+    deleted_ids: list[str] = []
+
+    class FakeResp:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    monkeypatch.setattr(forge.requests, "get", lambda url, **kw: FakeResp(200, fake_messages))
+    monkeypatch.setattr(
+        forge.requests,
+        "delete",
+        lambda url, **kw: (deleted_ids.append(url.rsplit("/", 1)[-1]), FakeResp(204))[1],
+    )
+
+    swept = forge._sweep_stale_forge_channel_embeds(
+        cutoff=now - 3600.0,
+        forge_channel_id=forge.FORGE_CHANNEL_ID,
+        token="fake-token",
+        db_paths=[db_p],
+    )
+    assert set(swept) == {"lifecycle-4000000001", "lifecycle-4000000002"}
+    assert set(deleted_ids) == {"4000000001", "4000000002"}
+
+
+def test_sweep_ephemeral_lifecycle_messages_channel_and_guards(monkeypatch):
+    from datetime import datetime, timezone
+    import tools.forge as forge
+
+    now = time.time()
+    expired_iso = datetime.fromtimestamp(now - 350.0, tz=timezone.utc).isoformat()
+    fresh_iso = datetime.fromtimestamp(now - 60.0, tz=timezone.utc).isoformat()
+
+    # 1. Blocked under pytest when requests.get is unmocked
+    assert forge.sweep_ephemeral_lifecycle_messages(1542081375287640084, token="tok") == []
+
+    seen_urls: list[str] = []
+    deleted_ids: list[str] = []
+
+    fake_messages = [
+        {
+            "id": str(forge.FORGE_HEADER_MESSAGE_ID),
+            "timestamp": expired_iso,
+            "content": "🟢 **Zero is online and ready.**",
+            "author": {"bot": True},
+        },
+        {
+            "id": "5000000001",
+            "timestamp": expired_iso,
+            "content": "🔄 Dispatching full Zero Docker container restart...",
+            "author": {"bot": True},
+        },
+        {
+            "id": "5000000002",
+            "timestamp": expired_iso,
+            "content": "🟢 **Zero is online and ready.**",
+            "author": {"bot": True},
+        },
+        {
+            "id": "5000000003",
+            "timestamp": fresh_iso,
+            "content": "🔄 Reloading Zero bridge in-place...",
+            "author": {"bot": True},
+        },
+        {
+            "id": "5000000004",
+            "timestamp": expired_iso,
+            "content": "🟢 **Zero is online and ready.**",
+            "author": {"bot": True},
+            "pinned": True,
+        },
+        {
+            "id": "5000000005",
+            "timestamp": expired_iso,
+            "content": "🟢 **Zero is online and ready.**",
+            "author": {"bot": True},
+            "components": [{"type": 1, "components": [{"type": 2, "label": "Choice"}]}],
+        },
+    ]
+
+    class FakeResp:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    def fake_get(url, **kw):
+        seen_urls.append(url)
+        assert kw["headers"]["Authorization"] == "Bot resolved-tok"
+        return FakeResp(200, fake_messages)
+
+    def fake_delete(url, **kw):
+        deleted_ids.append(url.rsplit("/", 1)[-1])
+        return FakeResp(204)
+
+    # 2. Missing/empty token returns [] without issuing GET
+    monkeypatch.setattr(forge, "_get_discord_token", lambda **kw: None)
+    monkeypatch.setattr(forge.requests, "get", fake_get)
+    monkeypatch.setattr(forge.requests, "delete", fake_delete)
+    assert forge.sweep_ephemeral_lifecycle_messages(1542081375287640084) == []
+    assert seen_urls == []
+
+    # 3. Resolved token sweeps expired messages and clamps limit to 100
+    monkeypatch.setattr(forge, "_get_discord_token", lambda **kw: "resolved-tok")
+    swept = forge.sweep_ephemeral_lifecycle_messages(1544953279664889888, limit=500)
+    assert swept == ["5000000001", "5000000002"]
+    assert deleted_ids == ["5000000001", "5000000002"]
+    assert seen_urls[-1].endswith("limit=100")
+
+    # 4. Respects _is_live_discord_blocked on requests.delete
+    deleted_ids.clear()
+    monkeypatch.setattr(forge, "_is_live_discord_blocked", lambda fn: fn is forge.requests.delete)
+    assert forge.sweep_ephemeral_lifecycle_messages(1542081375287640084) == []
+    assert deleted_ids == []
+
+
+def test_bridge_scheduler_sync_housekeeping_ephemeral_lifecycle_sweep(monkeypatch):
+    import tools.bridge_scheduler as bs
+    import tools.bridge_state as bstate
+    import tools.forge as forge
+    import tools.process_probe as pprobe
+
+    monkeypatch.setenv("FORGE_TEST_LIFECYCLE_SWEEP", "1")
+    monkeypatch.setattr(bs, "ensure_peer_shared_customizations_registered", lambda: None)
+    monkeypatch.setattr(bstate, "update_gateway_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(bstate, "get_all_active_pids", lambda: [])
+    monkeypatch.setattr(pprobe, "reap_stale_agy_processes", lambda **kw: None)
+    monkeypatch.setattr(bs, "TARGET_CHANNEL_ID", 1111111111)
+    monkeypatch.setattr(bs, "ZERO_OPS_CHANNEL_ID", 2222222222)
+
+    swept_calls: list[int] = []
+    now_box = [1000.0]
+
+    monkeypatch.setattr(bs.time, "time", lambda: now_box[0])
+    monkeypatch.setattr(forge, "sweep_ephemeral_lifecycle_messages", lambda cid: swept_calls.append(cid) or [])
+    monkeypatch.setattr(bstate, "is_vulcan_agent", lambda: False)
+    monkeypatch.setattr(forge, "is_ivy_container", lambda: False)
+
+    # Safe for __new__ fixtures without __init__
+    sched = bs.BridgeScheduler.__new__(bs.BridgeScheduler)
+    sched.bot = None
+
+    sched._sync_housekeeping()
+    assert swept_calls == [1111111111, 2222222222]
+
+    # Throttled within 60s
+    swept_calls.clear()
+    now_box[0] = 1059.0
+    sched._sync_housekeeping()
+    assert swept_calls == []
+
+    # Fires again after 60s
+    now_box[0] = 1060.0
+    sched._sync_housekeeping()
+    assert swept_calls == [1111111111, 2222222222]
+
+    # Deduplicates identical channel IDs and omits falsy IDs
+    swept_calls.clear()
+    now_box[0] = 1120.0
+    monkeypatch.setattr(bs, "ZERO_OPS_CHANNEL_ID", 1111111111)
+    sched._sync_housekeeping()
+    assert swept_calls == [1111111111]
+
+    # Ivy omits ZERO_OPS_CHANNEL_ID
+    swept_calls.clear()
+    now_box[0] = 1180.0
+    monkeypatch.setattr(bs, "ZERO_OPS_CHANNEL_ID", 2222222222)
+    monkeypatch.setattr(forge, "is_ivy_container", lambda: True)
+    sched._sync_housekeeping()
+    assert swept_calls == [1111111111]
+
+    # Vulcan skips entirely
+    swept_calls.clear()
+    now_box[0] = 1240.0
+    monkeypatch.setattr(bstate, "is_vulcan_agent", lambda: True)
+    sched._sync_housekeeping()
+    assert swept_calls == []
+
+    # __init__ initializes _last_lifecycle_sweep_ts
+    init_sched = bs.BridgeScheduler(dispatch_fn=lambda *a, **kw: None)
+    assert init_sched._last_lifecycle_sweep_ts == 0.0
+
+
 if __name__ == "__main__":
     unittest.main()

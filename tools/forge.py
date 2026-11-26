@@ -4949,7 +4949,8 @@ def post_or_update_job_widget(
 
 
 _LAST_REMOTE_CHANNEL_SWEEP_TS: float = 0.0
-REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS: float = 300.0
+REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS: float = 60.0
+EPHEMERAL_LIFECYCLE_MSG_TTL_SECONDS: float = 300.0
 FAILED_JOB_WIDGET_TTL_SECONDS: float = 600.0
 TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled", "timed_out", "unknown_exit")
 TERMINAL_BUILD_STATUSES = ("completed", "failed", "cancelled")
@@ -5037,6 +5038,101 @@ def prune_completed_job_widgets(
     return pruned_ids
 
 
+_EPHEMERAL_LIFECYCLE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^🔄\s*Reloading\s+.+?\s+bridge\s+in-place\b", re.IGNORECASE),
+    re.compile(r"^🔄\s*Dispatching\s+full\s+.+?\s+Docker\s+container\s+restart\b", re.IGNORECASE),
+    re.compile(r"^🟢\s*\*\*(?:Vulcan|Zero|Ivy)\s+is\s+online\s+and\s+ready\.\*\*", re.IGNORECASE),
+)
+
+
+def is_ephemeral_lifecycle_message(msg: dict) -> bool:
+    """Return True if `msg` is a routine bot-authored bridge reload or startup check-in notice eligible for auto-expiry."""
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("pinned"):
+        return False
+    if msg.get("embeds"):
+        return False
+    if msg.get("components"):
+        return False
+    author = msg.get("author")
+    if not isinstance(author, dict) or author.get("bot") is not True:
+        return False
+    content = str(msg.get("content") or "").strip()
+    if not content:
+        return False
+    return any(pat.match(content) for pat in _EPHEMERAL_LIFECYCLE_PATTERNS)
+
+
+def sweep_ephemeral_lifecycle_messages(
+    channel_id: int,
+    token: Optional[str] = None,
+    ttl_seconds: float = EPHEMERAL_LIFECYCLE_MSG_TTL_SECONDS,
+    limit: int = 50,
+) -> list[str]:
+    """Delete bot-authored bridge reload and startup check-in messages older than `ttl_seconds` in `channel_id`."""
+    deleted_ids: list[str] = []
+    if _is_live_discord_blocked(requests.get):
+        return deleted_ids
+    if not channel_id:
+        return deleted_ids
+    try:
+        cid = int(channel_id)
+    except (TypeError, ValueError):
+        return deleted_ids
+    if cid <= 0:
+        return deleted_ids
+
+    resolved_token = str(token).strip() if token else ""
+    if not resolved_token:
+        resolved_token = str(
+            _get_discord_token(
+                for_forge_channel=(cid == FORGE_CHANNEL_ID),
+                for_channel_id=cid,
+            )
+            or ""
+        ).strip()
+    if not resolved_token:
+        return deleted_ids
+
+    clamped_limit = max(1, min(100, int(limit)))
+    headers = {"Authorization": f"Bot {resolved_token}"}
+    try:
+        url = f"https://discord.com/api/v10/channels/{cid}/messages?limit={clamped_limit}"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return deleted_ids
+        messages = resp.json()
+        if not isinstance(messages, list):
+            return deleted_ids
+    except Exception:
+        return deleted_ids
+
+    now = time.time()
+    ttl = max(0.0, float(ttl_seconds))
+    for msg in messages:
+        try:
+            if not is_ephemeral_lifecycle_message(msg):
+                continue
+            msg_id_raw = msg.get("id")
+            if not msg_id_raw or int(msg_id_raw) == FORGE_HEADER_MESSAGE_ID:
+                continue
+            ts_str = msg.get("edited_timestamp") or msg.get("timestamp")
+            msg_ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() if ts_str else 0.0
+            if msg_ts <= 0 or (now - msg_ts) < ttl:
+                continue
+            if _is_live_discord_blocked(requests.delete):
+                continue
+            del_url = f"https://discord.com/api/v10/channels/{cid}/messages/{msg_id_raw}"
+            del_resp = requests.delete(del_url, headers=headers, timeout=10)
+            if del_resp.status_code in (200, 204, 404):
+                deleted_ids.append(str(msg_id_raw))
+        except Exception:
+            continue
+
+    return deleted_ids
+
+
 def _sweep_stale_forge_channel_embeds(
     cutoff: float,
     forge_channel_id: int,
@@ -5068,6 +5164,19 @@ def _sweep_stale_forge_channel_embeds(
         try:
             msg_id_raw = msg.get("id")
             if not msg_id_raw or int(msg_id_raw) == FORGE_HEADER_MESSAGE_ID:
+                continue
+            if is_ephemeral_lifecycle_message(msg):
+                ts_str = msg.get("edited_timestamp") or msg.get("timestamp")
+                msg_ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() if ts_str else 0.0
+                if (
+                    msg_ts > 0
+                    and (now - msg_ts) >= EPHEMERAL_LIFECYCLE_MSG_TTL_SECONDS
+                    and not _is_live_discord_blocked(requests.delete)
+                ):
+                    del_url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id_raw}"
+                    del_resp = requests.delete(del_url, headers=headers, timeout=10)
+                    if del_resp.status_code in (200, 204, 404):
+                        swept_ids.append(f"lifecycle-{msg_id_raw}")
                 continue
             embeds = msg.get("embeds") or []
             if not embeds:

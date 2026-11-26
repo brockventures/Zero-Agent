@@ -1982,6 +1982,7 @@ class BridgeScheduler:
         self._task = None
         self._heartbeat_task = None
         self._active_job_tasks = set()
+        self._last_lifecycle_sweep_ts = 0.0
 
     def _record_job_success(self, job_id: str | None, job_name: str, success_ts: float) -> None:
         """Persist last_success_ts and last_run_ts only after a dispatched job succeeds."""
@@ -2371,6 +2372,35 @@ class BridgeScheduler:
             except Exception:
                 pass
             reap_stale_agy_processes(allowed_active_pids=allowed_pids)
+        except Exception:
+            pass
+
+        # Ephemeral Lifecycle Message Sweeper (5-minute TTL for reload & online check-in notices)
+        try:
+            allow_in_test = os.environ.get("FORGE_TEST_LIFECYCLE_SWEEP", "").strip().lower() in {"1", "true", "yes"}
+            if (not os.environ.get("PYTEST_CURRENT_TEST")) or allow_in_test:
+                from tools.bridge_state import is_vulcan_agent
+                if not is_vulcan_agent():
+                    now_ts = time.time()
+                    last_sweep_ts = float(getattr(self, "_last_lifecycle_sweep_ts", 0.0) or 0.0)
+                    if (now_ts - last_sweep_ts) >= 60.0:
+                        self._last_lifecycle_sweep_ts = now_ts
+                        from tools.forge import is_ivy_container, sweep_ephemeral_lifecycle_messages
+                        candidate_cids = [TARGET_CHANNEL_ID]
+                        if not is_ivy_container():
+                            candidate_cids.append(ZERO_OPS_CHANNEL_ID)
+                        seen_cids: list[int] = []
+                        for raw_cid in candidate_cids:
+                            if not raw_cid:
+                                continue
+                            cid = int(raw_cid)
+                            if cid not in seen_cids:
+                                seen_cids.append(cid)
+                        for cid in seen_cids:
+                            try:
+                                sweep_ephemeral_lifecycle_messages(cid)
+                            except Exception:
+                                pass
         except Exception:
             pass
 
