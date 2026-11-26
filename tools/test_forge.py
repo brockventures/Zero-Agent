@@ -1307,7 +1307,7 @@ class TestForgeEngine(unittest.TestCase):
             exec_res = execute_decision(res_t3["decision_id"], user_id=OWNER_USER_ID, db_path=self.db_path)
         self.assertTrue(exec_res["ok"])
         self.assertEqual(exec_res["status"], "approved")
-        self.assertIn("2 chunk(s)", exec_res["receipt"])
+        self.assertIn("2 chunks", exec_res["receipt"])
 
         # 3. Wide blast radius (>=6 production files) or core bridge or >180s (>=4 scratch runs) calibration also triggers approval gate
         wide_plan = {
@@ -8987,6 +8987,185 @@ def test_bridge_scheduler_sync_housekeeping_ephemeral_lifecycle_sweep(monkeypatc
     # __init__ initializes _last_lifecycle_sweep_ts
     init_sched = bs.BridgeScheduler(dispatch_fn=lambda *a, **kw: None)
     assert init_sched._last_lifecycle_sweep_ts == 0.0
+
+
+def test_forge_enqueue_approval_receipt_omits_alphanumeric_ids(tmp_path, monkeypatch):
+    """Verify forge_enqueue approval receipts and rendered embeds use clean chunk labels and omit fg-/dec- IDs."""
+    db_p = tmp_path / "forge_enqueue_receipt.db"
+    forge_mod.init_forge_db(db_p)
+    repo_dir = tmp_path / "repo"
+    repo_dir_2 = tmp_path / "repo2"
+    for rdir, fnames in ((repo_dir, ("only_mod.py",)), (repo_dir_2, ("c1.py", "c2.py"))):
+        (rdir / ".git").mkdir(parents=True)
+        (rdir / "tools").mkdir(parents=True)
+        for fname in fnames:
+            (rdir / "tools" / fname).write_text("# stub\n", encoding="utf-8")
+
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: 999111)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: True)
+
+    one_chunk_plan = {
+        "title": "Single Chunk Clean Receipt",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Fact 1"],
+        "chunks": [
+            {
+                "title": "Only Chunk",
+                "target_files": ["tools/only_mod.py"],
+                "instructions": "Update only_mod.py cleanly.",
+            }
+        ],
+    }
+    staged_1 = forge_mod.stage_decision(
+        category="forge",
+        title="Single Chunk Clean Receipt",
+        summary="**Files:** `only_mod.py`",
+        handler_type="forge_enqueue",
+        payload={"title": "Single Chunk Clean Receipt", "chunk_count": 1, "plan": one_chunk_plan},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )
+    assert staged_1["decision_id"].startswith("dec-")
+
+    res_1 = forge_mod.execute_approval_card(staged_1["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_p)
+    assert res_1["ok"] is True
+    assert res_1["receipt"] == f"Queued build (1 chunk) in <#{forge_mod.FORGE_CHANNEL_ID}>"
+    assert "fg-" not in res_1["receipt"]
+    assert "dec-" not in res_1["receipt"]
+
+    embed_1 = res_1["formatted_embed"]
+    assert f"Queued build (1 chunk) in <#{forge_mod.FORGE_CHANNEL_ID}>" in embed_1["description"]
+    assert "fg-" not in embed_1["title"] and "fg-" not in embed_1["description"]
+    assert "dec-" not in embed_1["title"] and "dec-" not in embed_1["description"]
+    assert "fg-" not in embed_1["footer"]["text"] and "dec-" not in embed_1["footer"]["text"]
+    assert "fg-" not in res_1["formatted_card"] and "dec-" not in res_1["formatted_card"]
+
+    two_chunk_plan = {
+        "title": "Two Chunk Clean Receipt",
+        "repo": str(repo_dir_2),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Fact 1"],
+        "chunks": [
+            {
+                "title": "Chunk 1",
+                "target_files": ["tools/c1.py"],
+                "instructions": "Implement c1.py module and verify unit tests cleanly.",
+            },
+            {
+                "title": "Chunk 2",
+                "target_files": ["tools/c2.py"],
+                "instructions": "Implement c2.py module and verify unit tests cleanly.",
+            },
+        ],
+    }
+    staged_2 = forge_mod.stage_decision(
+        category="forge",
+        title="Two Chunk Clean Receipt",
+        summary="Two chunk plan.",
+        handler_type="forge_enqueue",
+        payload={"title": "Two Chunk Clean Receipt", "chunk_count": 2, "plan": two_chunk_plan},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )
+    res_2 = forge_mod.execute_approval_card(staged_2["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_p)
+    assert res_2["ok"] is True
+    assert res_2["receipt"] == f"Queued build (2 chunks) in <#{forge_mod.FORGE_CHANNEL_ID}>"
+    assert "fg-" not in res_2["receipt"]
+    assert "dec-" not in res_2["receipt"]
+    embed_2 = res_2["formatted_embed"]
+    assert f"Queued build (2 chunks) in <#{forge_mod.FORGE_CHANNEL_ID}>" in embed_2["description"]
+    assert "fg-" not in embed_2["description"] and "dec-" not in embed_2["description"]
+
+
+def test_brief_proposal_approval_receipt_and_modal_titles_omit_ids(tmp_path, monkeypatch):
+    """Verify brief_proposal approval receipts omit event_id/proposal_id and modal titles omit decision IDs."""
+    import asyncio
+    import tools.brief.gate as brief_gate
+
+    db_p = tmp_path / "forge_brief_receipt.db"
+    forge_mod.init_forge_db(db_p)
+
+    # 1. brief_proposal with non-empty summary omits event_id and raw IDs
+    staged_sum = forge_mod.stage_decision(
+        category="brief",
+        title="Create Calendar Event",
+        summary="Dentist Appointment tomorrow at 9 AM.",
+        handler_type="brief_proposal",
+        payload={"proposal_id": "prop-abc123456", "action": "calendar.create", "args": {"summary": "Dentist Appointment"}},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_p,
+    )
+    monkeypatch.setattr(
+        brief_gate,
+        "handle_forge_decision_approve",
+        lambda orig, edited_payload=None: {
+            "ok": True,
+            "proposal_id": "prop-abc123456",
+            "action": "calendar.create",
+            "receipt": {
+                "event_id": "evt-secret-998877",
+                "summary": "  Dentist Appointment  ",
+                "dry_run": False,
+            },
+        },
+    )
+    res_sum = forge_mod.execute_approval_card(staged_sum["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_p)
+    assert res_sum["ok"] is True
+    assert res_sum["receipt"] == "BRIEF `calendar.create` executed (Dentist Appointment)"
+    assert "event_id=" not in res_sum["receipt"]
+    assert "evt-secret-998877" not in res_sum["receipt"]
+    assert "prop-abc123456" not in res_sum["receipt"]
+    assert "dec-" not in res_sum["receipt"]
+    assert "evt-secret-998877" not in res_sum["formatted_embed"]["description"]
+
+    # 2. brief_proposal with empty summary falls back cleanly without event_id or proposal_id
+    staged_empty = forge_mod.stage_decision(
+        category="brief",
+        title="Update Calendar Event",
+        summary="Update calendar entry.",
+        handler_type="brief_proposal",
+        payload={"proposal_id": "prop-xyz987", "action": "calendar.update", "args": {}},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_p,
+    )
+    monkeypatch.setattr(
+        brief_gate,
+        "handle_forge_decision_approve",
+        lambda orig, edited_payload=None: {
+            "ok": True,
+            "proposal_id": "prop-xyz987",
+            "action": "calendar.update",
+            "receipt": {"event_id": "evt-hidden-1122", "summary": "   ", "dry_run": True},
+        },
+    )
+    res_empty = forge_mod.execute_approval_card(staged_empty["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_p)
+    assert res_empty["ok"] is True
+    assert res_empty["receipt"] == "BRIEF `calendar.update` [DRY-RUN] executed"
+    assert "event_id=" not in res_empty["receipt"]
+    assert "evt-hidden-1122" not in res_empty["receipt"]
+    assert "prop-xyz987" not in res_empty["receipt"]
+
+    # 3. Modal titles omit decision IDs
+    dec_id = "dec-abcdef1234567890"
+
+    async def _check_modals():
+        m_edit = forge_mod.ForgeDecisionEditModal(dec_id, {"command": "echo ok"}, db_path=db_p)
+        m_brief_edit = forge_mod.BriefProposalEditModal(
+            dec_id,
+            {"action": "calendar.create", "args": {"summary": "Dentist", "start": "2026-12-01T09:00:00-08:00", "end": "2026-12-01T10:00:00-08:00"}},
+            db_path=db_p,
+        )
+        m_brief_dismiss = forge_mod.BriefProposalDismissModal(dec_id, db_path=db_p)
+        return m_edit.title, m_brief_edit.title, m_brief_dismiss.title
+
+    t_edit, t_brief_edit, t_brief_dismiss = asyncio.run(_check_modals())
+    assert t_edit == "Edit Staged Action"
+    assert t_brief_edit == "Edit BRIEF Event"
+    assert t_brief_dismiss == "Dismiss BRIEF Proposal"
+    for title in (t_edit, t_brief_edit, t_brief_dismiss):
+        assert "dec-" not in title
+        assert dec_id[:12] not in title
 
 
 if __name__ == "__main__":

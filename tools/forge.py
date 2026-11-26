@@ -11862,7 +11862,9 @@ def execute_approval_card(
                 )
                 ok = bool(enq_res.get("ok"))
                 if ok:
-                    receipt = f"Enqueued FORGE build `{enq_res['build_id']}` ({enq_res.get('chunk_count', 1)} chunk(s)) in <#{FORGE_CHANNEL_ID}>"
+                    chunk_count = int(enq_res.get("chunk_count", 1) or 1)
+                    chunk_label = "1 chunk" if chunk_count == 1 else f"{chunk_count} chunks"
+                    receipt = f"Queued build ({chunk_label}) in <#{FORGE_CHANNEL_ID}>"
                 else:
                     receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
 
@@ -11873,13 +11875,13 @@ def execute_approval_card(
             ok = bool(gate_res.get("ok"))
             if ok:
                 rec = gate_res.get("receipt") if isinstance(gate_res.get("receipt"), dict) else {}
-                pid = str(gate_res.get("proposal_id") or original_payload.get("proposal_id") or "")
                 cal_action = str(gate_res.get("action") or original_payload.get("action") or "calendar")
-                event_id = str(rec.get("event_id") or "")
-                summary_txt = str(rec.get("summary") or "")
+                summary_txt = str(rec.get("summary") or "").strip()
                 dry_tag = " [DRY-RUN]" if rec.get("dry_run") else ""
-                details = summary_txt or event_id or pid
-                receipt = f"BRIEF `{cal_action}`{dry_tag} executed (`{details}`, event_id=`{event_id}`)"
+                if summary_txt:
+                    receipt = f"BRIEF `{cal_action}`{dry_tag} executed ({summary_txt})"
+                else:
+                    receipt = f"BRIEF `{cal_action}`{dry_tag} executed"
             else:
                 receipt = str(
                     gate_res.get("error")
@@ -12283,7 +12285,7 @@ class ForgeDecisionEditModal(discord.ui.Modal):
     """Native Discord Modal allowing Ryan to edit staged action parameters before execution."""
 
     def __init__(self, decision_id: str, current_payload: dict, db_path: Path | str = FORGE_DB_PATH):
-        super().__init__(title=f"Edit Staged Action ({decision_id[:12]})")
+        super().__init__(title="Edit Staged Action")
         self.decision_id = decision_id
         self.db_path = db_path
         self.payload_input = discord.ui.TextInput(
@@ -12455,7 +12457,7 @@ class BriefProposalEditModal(discord.ui.Modal):
     """Native Discord Modal for editing BRIEF calendar proposal fields before execution."""
 
     def __init__(self, decision_id: str, current_payload: dict, db_path: Path | str = FORGE_DB_PATH):
-        super().__init__(title=f"Edit BRIEF Event ({decision_id[:12]})")
+        super().__init__(title="Edit BRIEF Event")
         self.decision_id = decision_id
         self.db_path = db_path
         self._current_payload = dict(current_payload or {})
@@ -12583,7 +12585,7 @@ class BriefProposalDismissModal(discord.ui.Modal):
     """Native Discord Modal capturing optional dismissal feedback to teach BRIEF."""
 
     def __init__(self, decision_id: str, db_path: Path | str = FORGE_DB_PATH):
-        super().__init__(title=f"Dismiss BRIEF Proposal ({decision_id[:12]})")
+        super().__init__(title="Dismiss BRIEF Proposal")
         self.decision_id = decision_id
         self.db_path = db_path
         self.reason_input = discord.ui.TextInput(
