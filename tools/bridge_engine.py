@@ -50,6 +50,7 @@ from tools.bridge_state import (
     update_beacon,
 )
 from tools.process_probe import diagnose_process_tree
+from tools.bridge_steering import purge_channel_steers
 
 # Global active process map: channel_id -> subprocess.Popen
 channel_active_procs: dict[int, Any] = {}
@@ -62,6 +63,35 @@ channel_active_reply_targets: dict[int, Any] = {}
 
 # Global steering tracking: channel/thread IDs actively being steered mid-turn
 steering_channels: set[int] = set()
+
+# Global turn-phase map for hybrid steering routing:
+# channel_id -> {"phase": str, "tool_name": Optional[str], "updated_at": float}
+channel_turn_phases: dict[int, dict[str, Any]] = {}
+
+
+def set_channel_turn_phase(
+    channel_id: int, phase: str, tool_name: Optional[str] = None
+) -> None:
+    """Record the current execution phase for an active channel turn."""
+    channel_turn_phases[int(channel_id)] = {
+        "phase": str(phase),
+        "tool_name": tool_name,
+        "updated_at": time.time(),
+    }
+
+
+def get_channel_turn_phase(channel_id: int) -> str:
+    """Return the current turn phase for a channel (or 'unknown' if unset)."""
+    entry = channel_turn_phases.get(int(channel_id))
+    if not isinstance(entry, dict):
+        return "unknown"
+    return str(entry.get("phase") or "unknown")
+
+
+def clear_channel_turn_phase(channel_id: Optional[int]) -> None:
+    """Clear the recorded turn phase for a channel."""
+    if channel_id is not None:
+        channel_turn_phases.pop(int(channel_id), None)
 
 # Global active presence map:
 # channel_id -> {"channel_name": str, "verb": str, "general_verb": str, "started_at": float}
@@ -436,6 +466,8 @@ class TurnCoordinator:
                     channel_active_procs[self.thread.id] = proc
                     if TARGET_CHANNEL_ID in channel_active_procs:
                         del channel_active_procs[TARGET_CHANNEL_ID]
+                if TARGET_CHANNEL_ID in channel_turn_phases:
+                    channel_turn_phases[self.thread.id] = channel_turn_phases.pop(TARGET_CHANNEL_ID)
                 if self.prompt:
                     channel_active_prompts[self.thread.id] = self.prompt
                     channel_active_prompts.pop(TARGET_CHANNEL_ID, None)
@@ -584,6 +616,11 @@ class TurnCoordinator:
             return True, f"Agent response DONE ({int(agent_done_window)}s quiescent)"
         return False, ""
 
+    def _active_phase_channel_id(self) -> int:
+        if self.escalated_to_thread and self.thread and hasattr(self.thread, "id"):
+            return int(self.thread.id)
+        return int(self.channel_id)
+
     def process_stream_event(
         self,
         event: dict,
@@ -595,6 +632,7 @@ class TurnCoordinator:
             return
 
         ev_name = event.get("event") or event.get("type")
+        phase_cid = self._active_phase_channel_id()
 
         if stream_parser:
             stream_parser.process_event(event)
@@ -614,6 +652,7 @@ class TurnCoordinator:
             tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
 
             if (stype in ("tool", "system_message", "system") or tname) and sstate != "DONE":
+                set_channel_turn_phase(phase_cid, "tool_loop", tool_name=tname)
                 if timer:
                     timer.mark_event(tool_name=tname)
                 self.agent_response_done_at = None
@@ -640,6 +679,7 @@ class TurnCoordinator:
                 if delta and isinstance(delta, str) and delta.strip():
                     if not is_internal_cli_leak(delta):
                         self.had_substantive_delta = True
+                        set_channel_turn_phase(phase_cid, "streaming_text")
                         if timer:
                             timer.mark_event(is_token=True)
                         self.current_action = "Drafting response..."
@@ -685,6 +725,7 @@ class TurnCoordinator:
                 if self.result_received_at is None:
                     self.result_received_at = time.time()
                 self.current_action = "Finalizing output..."
+                set_channel_turn_phase(self._active_phase_channel_id(), "finalizing")
 
             if not self.recorded_usage:
                 usage = res_data.get("usage") or event.get("usage")
@@ -892,6 +933,8 @@ class TurnCoordinator:
                         f"{now_res - self.turn_start_time:.3f}s with no turn delta. Discarding residue..."
                     )
                     self.result_received_at = None
+                    if get_channel_turn_phase(self._active_phase_channel_id()) == "finalizing":
+                        set_channel_turn_phase(self._active_phase_channel_id(), "tool_loop")
                     continue
 
                 res_cid = res_data.get("conversation_id")
@@ -957,6 +1000,8 @@ class TurnCoordinator:
                                 f"(tasks={len(pending_sdk_tasks)}, stream_bg={has_pending_bg}, reason={t_status.get('reason')}); continuing stdout stream..."
                             )
                             self.result_received_at = None
+                            if get_channel_turn_phase(self._active_phase_channel_id()) == "finalizing":
+                                set_channel_turn_phase(self._active_phase_channel_id(), "tool_loop")
                             stream_parser.reset_pre_completion_draft()
                             continue
                     except Exception as pte:
@@ -1140,6 +1185,11 @@ class TurnCoordinator:
             del channel_active_procs[self.channel_id]
         channel_active_prompts.pop(self.channel_id, None)
         channel_active_reply_targets.pop(self.channel_id, None)
+        clear_channel_turn_phase(self.channel_id)
+        try:
+            purge_channel_steers(self.channel_id)
+        except Exception:
+            pass
         thread_id = (
             getattr(self.thread, "id", None)
             if (self.escalated_to_thread and self.thread and hasattr(self.thread, "id"))
@@ -1150,6 +1200,11 @@ class TurnCoordinator:
                 del channel_active_procs[thread_id]
             channel_active_prompts.pop(thread_id, None)
             channel_active_reply_targets.pop(thread_id, None)
+            clear_channel_turn_phase(thread_id)
+            try:
+                purge_channel_steers(thread_id)
+            except Exception:
+                pass
         unregister_active_presence(self.channel_id, thread_id=thread_id)
 
         if self.mode == "home":

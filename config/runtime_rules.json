@@ -54,6 +54,8 @@
         1534436119888793750,
         "1534436119888793750"
     ],
+    "hybrid_steering_enabled": true,
+    "hybrid_steering_hook_timeout_seconds": 2.5,
     "ambient_classifier_enabled": true,
     "ambient_relevance_threshold": 0.6,
     "auto_thread_escalation_enabled": false,
