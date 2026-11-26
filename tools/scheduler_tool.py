@@ -26,6 +26,7 @@ import tools.bridge_state as bs
 PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = bs.DATA_DIR
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
+ZERO_OPS_CHANNEL_ID = 1544953279664889888
 
 log = logging.getLogger("scheduler_tool")
 
@@ -901,12 +902,88 @@ def get_last_execution_for_job(
 
     return latest_epoch, latest_pt
 
+def _notify_schedule_recovery(message: str = "", *, reason: str | None = None) -> None:
+    """Log a warning and best-effort enqueue an alert to #zero-ops (1544953279664889888)."""
+    msg = reason if reason is not None else message
+    log.warning("Schedule recovery alert: %s", msg)
+    alert_text = (
+        msg
+        if msg.startswith(("⚠️", "🚨"))
+        else f"⚠️ **Scheduler Auto-Recovery Alert:** {msg}"
+    )
+    try:
+        from tools import outbox
+
+        enqueue_fn = getattr(outbox, "enqueue_message", None) or getattr(
+            outbox, "queue_outbox_message", None
+        )
+        if callable(enqueue_fn):
+            enqueue_fn(
+                str(ZERO_OPS_CHANNEL_ID),
+                alert_text,
+                source_turn="scheduler_recovery",
+            )
+    except Exception as e:
+        log.warning("Failed to enqueue schedule recovery alert to #zero-ops: %s", e)
+
+
+def _read_valid_schedule_list(path) -> tuple[list[dict] | None, str | None]:
+    """Read and validate a schedule JSON file as a non-empty list of job dicts."""
+    if not path.exists():
+        return None, f"{path.name} is missing"
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, list) and len(data) > 0 and all(isinstance(x, dict) for x in data):
+            return data, None
+        return None, f"{path.name} is empty or not a valid job list"
+    except Exception as e:
+        return None, f"{path.name} failed JSON parsing ({e})"
+
+
 def load_schedule() -> list[dict]:
-    """Load schedule.json, seeding defaults if missing and reconciling with sidecar_status.json."""
+    """Load schedule.json, auto-recovering from rolling backup or Zero-Vault mirror if missing/corrupt."""
     bs.DATA_DIR.mkdir(parents=True, exist_ok=True)
     sched_file = bs.DATA_DIR / "schedule.json"
     status_map = _load_sidecar_status_map()
-    if not sched_file.exists():
+
+    jobs, primary_err = _read_valid_schedule_list(sched_file)
+    recovered_from: str | None = None
+    recovered_count: int = 0
+
+    if jobs is None:
+        if sched_file.exists():
+            log.warning("Primary schedule.json unusable (%s) — attempting backup recovery", primary_err)
+        recovery_candidates = [
+            ("schedule.json.bak", bs.DATA_DIR / "schedule.json.bak"),
+            (
+                "zero_vault_repo/config/schedule.json",
+                bs.DATA_DIR / "zero_vault_repo" / "config" / "schedule.json",
+            ),
+        ]
+        for label, candidate_path in recovery_candidates:
+            cand_jobs, cand_err = _read_valid_schedule_list(candidate_path)
+            if cand_jobs is not None:
+                jobs = [dict(j) for j in cand_jobs]
+                recovered_from = label
+                recovered_count = len(jobs)
+                log.warning(
+                    "Recovered %d jobs from %s (reason: %s)",
+                    recovered_count,
+                    label,
+                    primary_err,
+                )
+                break
+            if candidate_path.exists():
+                log.warning("Backup candidate %s unusable: %s", label, cand_err)
+
+    if jobs is None:
+        if (bs.DATA_DIR / "sidecar_status.json").exists():
+            _notify_schedule_recovery(
+                f"🚨 HIGH PRIORITY: schedule.json lost/corrupt ({primary_err}) with no valid backup "
+                f"(schedule.json.bak and zero_vault_repo/config/schedule.json unavailable). "
+                f"Falling back to DEFAULT_JOBS ({len(DEFAULT_JOBS)} jobs)."
+            )
         jobs = [dict(d) for d in DEFAULT_JOBS]
         for j in jobs:
             last_epoch, last_pt = get_last_execution_for_job(j, status_map=status_map)
@@ -917,45 +994,48 @@ def load_schedule() -> list[dict]:
         save_schedule(jobs)
         return jobs
 
-    try:
-        with open(sched_file, "r") as f:
-            jobs = json.load(f)
-        
-        # Ensure any new defaults exist
-        existing_ids = {j["id"] for j in jobs}
-        updated = False
-        for d in DEFAULT_JOBS:
-            if d["id"] not in existing_ids:
-                job_entry = dict(d)
-                last_epoch, last_pt = get_last_execution_for_job(job_entry, status_map=status_map)
-                if last_epoch:
-                    job_entry["last_run_ts"] = last_epoch
-                    job_entry["last_run_at"] = last_pt
-                job_entry["next_run_ts"] = calculate_next_run(job_entry)
-                jobs.append(job_entry)
-                updated = True
+    if recovered_from is not None:
+        save_schedule(jobs)
 
-        # Reconcile historical executions from sidecar_status.json and normalize dict quiet_hours
-        for j in jobs:
-            if isinstance(j.get("quiet_hours"), dict):
-                coerced_q = _coerce_quiet_hours(j.get("quiet_hours"))
-                j["quiet_hours"] = list(coerced_q) if coerced_q is not None else None
-                updated = True
-            last_epoch, last_pt = get_last_execution_for_job(j, status_map=status_map)
-            if last_epoch and (not j.get("last_run_ts") or last_epoch > j.get("last_run_ts", 0)):
-                j["last_run_ts"] = last_epoch
-                j["last_run_at"] = last_pt
-                updated = True
+    # Ensure any new defaults exist
+    existing_ids = {j["id"] for j in jobs if isinstance(j, dict) and "id" in j}
+    updated = False
+    for d in DEFAULT_JOBS:
+        if d["id"] not in existing_ids:
+            job_entry = dict(d)
+            last_epoch, last_pt = get_last_execution_for_job(job_entry, status_map=status_map)
+            if last_epoch:
+                job_entry["last_run_ts"] = last_epoch
+                job_entry["last_run_at"] = last_pt
+            job_entry["next_run_ts"] = calculate_next_run(job_entry)
+            jobs.append(job_entry)
+            updated = True
 
-        if updated:
-            save_schedule(jobs)
-        return jobs
-    except Exception as e:
-        log.error("Failed reading schedule.json: %s — using defaults", e)
-        return DEFAULT_JOBS
+    # Reconcile historical executions from sidecar_status.json and normalize dict quiet_hours
+    for j in jobs:
+        if isinstance(j.get("quiet_hours"), dict):
+            coerced_q = _coerce_quiet_hours(j.get("quiet_hours"))
+            j["quiet_hours"] = list(coerced_q) if coerced_q is not None else None
+            updated = True
+        last_epoch, last_pt = get_last_execution_for_job(j, status_map=status_map)
+        if last_epoch and (not j.get("last_run_ts") or last_epoch > j.get("last_run_ts", 0)):
+            j["last_run_ts"] = last_epoch
+            j["last_run_at"] = last_pt
+            updated = True
+
+    if updated:
+        save_schedule(jobs)
+
+    if recovered_from is not None:
+        _notify_schedule_recovery(
+            f"Restored {recovered_count} jobs from `{recovered_from}` ({primary_err})."
+        )
+
+    return jobs
+
 
 def save_schedule(jobs: list[dict]):
-    """Persist schedule safely with a process/thread-isolated atomic write."""
+    """Persist schedule safely with a process/thread-isolated atomic write and shrink-guarded rolling backup."""
     bs.DATA_DIR.mkdir(parents=True, exist_ok=True)
     sched_file = bs.DATA_DIR / "schedule.json"
     tmp = sched_file.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
@@ -966,6 +1046,40 @@ def save_schedule(jobs: list[dict]):
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+    if isinstance(jobs, list) and len(jobs) > 0:
+        bak_file = bs.DATA_DIR / "schedule.json.bak"
+        should_write_bak = True
+        if bak_file.exists():
+            try:
+                with open(bak_file, "r") as bf:
+                    prev_bak = json.load(bf)
+                if (
+                    isinstance(prev_bak, list)
+                    and len(prev_bak) > 10
+                    and len(jobs) < int(len(prev_bak) * 0.7)
+                ):
+                    log.warning(
+                        "Shrink guard: refusing to overwrite schedule.json.bak "
+                        "(new count %d < 70%% of existing backup count %d)",
+                        len(jobs),
+                        len(prev_bak),
+                    )
+                    should_write_bak = False
+            except Exception as e:
+                log.warning("Failed reading existing schedule.json.bak during shrink check: %s", e)
+
+        if should_write_bak:
+            bak_tmp = bak_file.with_suffix(f".bak.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                with open(bak_tmp, "w") as bf:
+                    json.dump(jobs, bf, indent=2)
+                bak_tmp.replace(bak_file)
+            except Exception as e:
+                log.warning("Failed writing rolling backup schedule.json.bak: %s", e)
+            finally:
+                if bak_tmp.exists():
+                    bak_tmp.unlink(missing_ok=True)
 
 def format_schedule_summary() -> str:
     """Format upcoming schedule in clean Option 3 inline bullets."""

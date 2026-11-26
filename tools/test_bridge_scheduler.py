@@ -1725,6 +1725,179 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_prune.assert_called_once_with(max_age_days=30, dry_run=False)
         self.assertIn("Pruned **1 stale thread mapping(s)**", report)
 
+    def test_save_schedule_creates_rolling_bak(self):
+        """(a) Verify save_schedule writes both schedule.json and schedule.json.bak atomically."""
+        from tools import scheduler_tool
+
+        jobs = [
+            {"id": "job_alpha", "name": "Alpha Job", "schedule_type": "daily", "hour_pt": 8, "minute_pt": 0},
+            {"id": "job_beta", "name": "Beta Job", "schedule_type": "daily", "hour_pt": 9, "minute_pt": 30},
+        ]
+        with patch.object(bs, "DATA_DIR", self.temp_path):
+            scheduler_tool.save_schedule(jobs)
+
+        sched_file = self.temp_path / "schedule.json"
+        bak_file = self.temp_path / "schedule.json.bak"
+        self.assertTrue(sched_file.exists())
+        self.assertTrue(bak_file.exists())
+        self.assertEqual(json.loads(sched_file.read_text()), jobs)
+        self.assertEqual(json.loads(bak_file.read_text()), jobs)
+
+    def test_save_schedule_shrink_guard_protects_large_bak(self):
+        """(b) Verify shrink-guard prevents a small write (<70% of >10 jobs) from clobbering schedule.json.bak."""
+        from tools import scheduler_tool
+
+        large_jobs = [
+            {"id": f"job_{i}", "name": f"Job {i}", "schedule_type": "daily", "hour_pt": 8, "minute_pt": 0}
+            for i in range(20)
+        ]
+        degraded_jobs = [
+            {"id": f"job_{i}", "name": f"Job {i}", "schedule_type": "daily", "hour_pt": 8, "minute_pt": 0}
+            for i in range(5)
+        ]
+        with patch.object(bs, "DATA_DIR", self.temp_path):
+            scheduler_tool.save_schedule(large_jobs)
+            bak_file = self.temp_path / "schedule.json.bak"
+            self.assertEqual(len(json.loads(bak_file.read_text())), 20)
+
+            # Now attempt a degraded write of 5 jobs (< int(20 * 0.7) == 14)
+            scheduler_tool.save_schedule(degraded_jobs)
+
+            # Primary schedule.json reflects the write, but schedule.json.bak is preserved at 20 jobs
+            sched_file = self.temp_path / "schedule.json"
+            self.assertEqual(len(json.loads(sched_file.read_text())), 5)
+            self.assertEqual(len(json.loads(bak_file.read_text())), 20)
+
+    def test_load_schedule_recovers_missing_from_bak_and_alerts(self):
+        """(c) Verify missing schedule.json auto-recovers from schedule.json.bak and fires alert."""
+        from tools import scheduler_tool
+
+        custom_job = {
+            "id": "custom_bak_job",
+            "name": "Custom Backup Job",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 7,
+            "minute_pt": 15,
+            "next_run_ts": 1900000000.0,
+        }
+        bak_jobs = [custom_job] + [dict(d) for d in scheduler_tool.DEFAULT_JOBS]
+        bak_file = self.temp_path / "schedule.json.bak"
+        bak_file.write_text(json.dumps(bak_jobs, indent=2), encoding="utf-8")
+
+        with patch.object(bs, "DATA_DIR", self.temp_path), \
+             patch("tools.scheduler_tool._notify_schedule_recovery") as mock_notify:
+            loaded = scheduler_tool.load_schedule()
+
+        mock_notify.assert_called_once()
+        alert_msg = mock_notify.call_args[0][0]
+        self.assertIn("schedule.json.bak", alert_msg)
+        self.assertIn(str(len(bak_jobs)), alert_msg)
+
+        loaded_ids = {j["id"] for j in loaded}
+        self.assertIn("custom_bak_job", loaded_ids)
+        self.assertTrue((self.temp_path / "schedule.json").exists())
+        persisted_ids = {j["id"] for j in json.loads((self.temp_path / "schedule.json").read_text())}
+        self.assertIn("custom_bak_job", persisted_ids)
+
+    def test_load_schedule_recovers_from_zero_vault_mirror_when_bak_missing(self):
+        """(d) Verify missing schedule.json + missing .bak auto-recovers from zero_vault_repo/config/schedule.json."""
+        from tools import scheduler_tool
+
+        vault_dir = self.temp_path / "zero_vault_repo" / "config"
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        vault_sched = vault_dir / "schedule.json"
+        custom_vault_job = {
+            "id": "custom_vault_job",
+            "name": "Custom Vault Job",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 11,
+            "minute_pt": 0,
+            "next_run_ts": 1900000000.0,
+        }
+        vault_jobs = [custom_vault_job] + [dict(d) for d in scheduler_tool.DEFAULT_JOBS]
+        vault_sched.write_text(json.dumps(vault_jobs, indent=2), encoding="utf-8")
+
+        with patch.object(bs, "DATA_DIR", self.temp_path), \
+             patch("tools.scheduler_tool._notify_schedule_recovery") as mock_notify:
+            loaded = scheduler_tool.load_schedule()
+
+        mock_notify.assert_called_once()
+        alert_msg = mock_notify.call_args[0][0]
+        self.assertIn("zero_vault_repo/config/schedule.json", alert_msg)
+        self.assertIn(str(len(vault_jobs)), alert_msg)
+
+        loaded_ids = {j["id"] for j in loaded}
+        self.assertIn("custom_vault_job", loaded_ids)
+        self.assertTrue((self.temp_path / "schedule.json").exists())
+
+    def test_load_schedule_recovers_corrupt_schedule_from_bak(self):
+        """(e) Verify corrupt schedule.json auto-recovers from schedule.json.bak and fires alert."""
+        from tools import scheduler_tool
+
+        sched_file = self.temp_path / "schedule.json"
+        sched_file.write_text("{corrupt json payload///", encoding="utf-8")
+
+        custom_job = {
+            "id": "recovered_after_corrupt",
+            "name": "Recovered After Corrupt",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 10,
+            "minute_pt": 0,
+            "next_run_ts": 1900000000.0,
+        }
+        bak_jobs = [custom_job] + [dict(d) for d in scheduler_tool.DEFAULT_JOBS]
+        bak_file = self.temp_path / "schedule.json.bak"
+        bak_file.write_text(json.dumps(bak_jobs, indent=2), encoding="utf-8")
+
+        with patch.object(bs, "DATA_DIR", self.temp_path), \
+             patch("tools.scheduler_tool._notify_schedule_recovery") as mock_notify:
+            loaded = scheduler_tool.load_schedule()
+
+        mock_notify.assert_called_once()
+        alert_msg = mock_notify.call_args[0][0]
+        self.assertIn("schedule.json.bak", alert_msg)
+        loaded_ids = {j["id"] for j in loaded}
+        self.assertIn("recovered_after_corrupt", loaded_ids)
+        # Verify corrupt schedule.json was overwritten with valid JSON
+        repaired = json.loads(sched_file.read_text(encoding="utf-8"))
+        self.assertIsInstance(repaired, list)
+        self.assertIn("recovered_after_corrupt", {j["id"] for j in repaired})
+
+    def test_load_schedule_total_loss_with_sidecar_status_alerts_and_falls_back(self):
+        """(f) Verify total schedule loss with sidecar_status.json present falls back to DEFAULT_JOBS and fires alert."""
+        from tools import scheduler_tool
+
+        status_file = self.temp_path / "sidecar_status.json"
+        status_file.write_text(json.dumps({"heartbeat": {"timestamp_epoch": 1788000000, "status": "ok"}}), encoding="utf-8")
+
+        with patch.object(bs, "DATA_DIR", self.temp_path), \
+             patch("tools.scheduler_tool._notify_schedule_recovery") as mock_notify:
+            loaded = scheduler_tool.load_schedule()
+
+        mock_notify.assert_called_once()
+        alert_msg = mock_notify.call_args[0][0]
+        self.assertIn("DEFAULT_JOBS", alert_msg)
+        self.assertEqual(len(loaded), len(scheduler_tool.DEFAULT_JOBS))
+        self.assertTrue((self.temp_path / "schedule.json").exists())
+
+    def test_notify_schedule_recovery_dispatches_to_zero_ops_outbox(self):
+        """Verify _notify_schedule_recovery enqueues to #zero-ops (1544953279664889888) and swallows errors safely."""
+        from tools import scheduler_tool
+
+        with patch("tools.outbox.queue_outbox_message") as mock_queue:
+            scheduler_tool._notify_schedule_recovery("Restored 25 jobs from schedule.json.bak")
+            mock_queue.assert_called_once()
+            args, kwargs = mock_queue.call_args
+            self.assertEqual(args[0], str(scheduler_tool.ZERO_OPS_CHANNEL_ID))
+            self.assertIn("Restored 25 jobs from schedule.json.bak", args[1])
+
+        # Verify exception safety
+        with patch("tools.outbox.queue_outbox_message", side_effect=RuntimeError("outbox offline")):
+            scheduler_tool._notify_schedule_recovery("Should not raise")
+
 
 if __name__ == "__main__":
     unittest.main()
