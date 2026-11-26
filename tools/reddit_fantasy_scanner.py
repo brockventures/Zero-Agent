@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Reddit Fantasy Baseball Scanner & Draft Proposal Sidecar.
 
 Scans r/fantasybaseball for active keeper, trade, and roster dilemma comments,
@@ -482,7 +483,7 @@ def post_draft_reply_via_pixel(
     draft_text: str,
     thing_id: Optional[str] = None,
 ) -> Tuple[bool, str]:
-    """Upvote the target dilemma comment and submit the approved draft reply via u/prime416 on Old Reddit."""
+    """Submit the approved draft reply via u/prime416 on Old Reddit without automated voting."""
     if not thread_url or not draft_text or not draft_text.strip():
         return False, "Missing thread_url or draft_text"
 
@@ -567,21 +568,7 @@ def post_draft_reply_via_pixel(
                                 return { ok: false, error: `Could not locate target comment for u/${args.author} in thread JSON` };
                             }
 
-                            // 1. Upvote the comment via /api/vote
-                            const voteParams = new URLSearchParams({
-                                id: targetFullname,
-                                dir: '1',
-                                uh: modhash,
-                                api_type: 'json'
-                            });
-                            await fetch('https://old.reddit.com/api/vote', {
-                                method: 'POST',
-                                credentials: 'include',
-                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                                body: voteParams.toString()
-                            });
-
-                            // 2. Submit reply via /api/comment
+                            // Submit reply via /api/comment
                             const commentParams = new URLSearchParams({
                                 api_type: 'json',
                                 text: args.draftText,

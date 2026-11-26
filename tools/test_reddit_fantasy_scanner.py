@@ -1,3 +1,4 @@
+# ruff: noqa
 from pathlib import Path
 import sys
 import unittest
@@ -296,8 +297,8 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertIn("--draft", cmd)
 
     @patch("tools.pixel_browser.pixel_session")
-    def test_post_draft_reply_via_pixel_upvotes_and_posts_comment(self, mock_pixel_session):
-        """Verify post_draft_reply_via_pixel evaluates Old Reddit API upvote + comment and returns permalink."""
+    def test_post_draft_reply_via_pixel_posts_comment_without_upvoting(self, mock_pixel_session):
+        """Verify post_draft_reply_via_pixel evaluates Old Reddit API comment without calling /api/vote and returns permalink."""
         import types
         from unittest.mock import MagicMock
 
@@ -326,6 +327,9 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("/comments/abc123/nightly/new_reply_1/", permalink)
         mock_page.evaluate.assert_called_once()
+        eval_js = mock_page.evaluate.call_args[0][0]
+        self.assertNotIn("/api/vote", eval_js)
+        self.assertIn("/api/comment", eval_js)
         eval_args = mock_page.evaluate.call_args[0][1]
         self.assertEqual(eval_args["author"], "KeeperKing")
         self.assertEqual(eval_args["thingId"], "t1_xyz789")
