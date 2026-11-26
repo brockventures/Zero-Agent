@@ -10,8 +10,10 @@ channel context isolation and air-gap boundaries.
 import asyncio
 import json
 import os
+import re
 import time
 from collections import deque
+from typing import Any
 import discord
 
 from tools.bridge_state import (
@@ -47,6 +49,49 @@ from tools.task_settle import get_turn_pending_tasks
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "4h")
 IDLE_WORKER_TIMEOUT_SECONDS = float(os.getenv("AGY_IDLE_WORKER_TIMEOUT", "1200"))
+
+_INTERIM_WAITING_PHRASES = (
+    "will wait for it to finish",
+    "launched the command",
+    "running as a background task",
+    "background task in progress",
+    "waiting for the background task",
+    "waiting for background task",
+    "completing silently",
+    "executing silently",
+    "waiting silently",
+    "stand by",
+    "standing by",
+    "hold on",
+    "hang tight",
+    "one moment",
+    "just a sec",
+    "working on it",
+)
+
+_INTERIM_LAUNCH_RE = re.compile(
+    r"^(?:i(?:'m| am)\s+)?(?:running|checking|starting|launching|executing|fetching|"
+    r"querying|polling|probing|investigating|diagnosing|scanning|pulling|building|"
+    r"testing|waiting)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_interim_waiting_chatter(text: str | None) -> bool:
+    """Return True if text is empty, placeholder, or short interim waiting/launch narration."""
+    from tools.task_settle import is_substantive_response
+
+    if not is_substantive_response(text):
+        return True
+    stripped = (text or "").strip()
+    if len(stripped) > 220 or "\n" in stripped or "```" in stripped:
+        return False
+    low = stripped.lower()
+    if any(phrase in low for phrase in _INTERIM_WAITING_PHRASES):
+        return True
+    if len(stripped) <= 140 and _INTERIM_LAUNCH_RE.match(stripped):
+        return True
+    return False
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 LOUNGE_CHANNEL_ID = 1534452820995080192
@@ -493,6 +538,7 @@ class PersistentChannelWorker:
         pre_settle_text: str | None = None,
         is_ambient_chime_in: bool = False,
         from_choice_button: bool = False,
+        deliver_output: bool = True,
         **kwargs,
     ):
         """Execute a conversational turn on the persistent warm worker via stdin/stdout streaming."""
@@ -517,6 +563,7 @@ class PersistentChannelWorker:
                 pre_settle_text=pre_settle_text,
                 is_ambient_chime_in=is_ambient_chime_in,
                 from_choice_button=from_choice_button,
+                deliver_output=deliver_output,
             )
 
         async with self.lock:
@@ -540,6 +587,7 @@ class PersistentChannelWorker:
                 pre_settle_text=pre_settle_text,
                 is_ambient_chime_in=is_ambient_chime_in,
                 from_choice_button=from_choice_button,
+                deliver_output=deliver_output,
             )
         self._schedule_post_turn_compaction()
         return result
@@ -565,6 +613,7 @@ class PersistentChannelWorker:
         pre_settle_text: str | None = None,
         is_ambient_chime_in: bool = False,
         from_choice_button: bool = False,
+        deliver_output: bool = True,
     ):
         from tools.bridge_runner import (
             steering_channels,
@@ -825,11 +874,98 @@ class PersistentChannelWorker:
 
         final_text = output_response or "*(No output from agent)*"
 
+        if not is_settle_reinvocation and self.conv_id:
+            import tools.task_settle as task_settle
+
+            pending_fn = (
+                get_turn_pending_tasks
+                if getattr(get_turn_pending_tasks, "__module__", "") != "tools.task_settle"
+                else task_settle.get_turn_pending_tasks
+            )
+            try:
+                pending_before = await asyncio.to_thread(pending_fn, self.conv_id)
+            except Exception as pbe:
+                print(f"[BridgeDaemon] Warning checking pending tasks before settle: {pbe}")
+                pending_before = []
+
+            has_pending_before = bool(
+                pending_before
+                or getattr(stream_parser, "has_pending_background_task", False)
+            )
+            if has_pending_before:
+                async def _reinvoke_for_settle(
+                    prompt: str,
+                    status_msg: Any,
+                    reply_target: Any,
+                    attachments: list[str],
+                    mode: str | None = None,
+                    channel_id: int | None = None,
+                    is_settle_reinvocation: bool = True,
+                    pre_settle_text: str | None = None,
+                    **reinvoke_kwargs,
+                ):
+                    return await self._execute_turn_core(
+                        prompt=prompt,
+                        status_msg=status_msg,
+                        reply_target=reply_target,
+                        attachments=attachments,
+                        author_name=reinvoke_kwargs.get("author_name", author_name),
+                        apply_presence_fn=reinvoke_kwargs.get("apply_presence_fn", apply_presence_fn),
+                        button_choice_fn=reinvoke_kwargs.get("button_choice_fn", button_choice_fn),
+                        quick_choice_view_cls=reinvoke_kwargs.get("quick_choice_view_cls", quick_choice_view_cls),
+                        reload_fn=reinvoke_kwargs.get("reload_fn", reload_fn),
+                        is_last_word=reinvoke_kwargs.get("is_last_word", is_last_word),
+                        last_word_bot_id=reinvoke_kwargs.get("last_word_bot_id", last_word_bot_id),
+                        last_word_bot_name=reinvoke_kwargs.get("last_word_bot_name", last_word_bot_name),
+                        last_word_streak=reinvoke_kwargs.get("last_word_streak", last_word_streak),
+                        is_settle_reinvocation=True,
+                        is_physical_mention=reinvoke_kwargs.get("is_physical_mention", is_physical_mention),
+                        pre_settle_text=pre_settle_text,
+                        is_ambient_chime_in=reinvoke_kwargs.get("is_ambient_chime_in", is_ambient_chime_in),
+                        from_choice_button=reinvoke_kwargs.get("from_choice_button", from_choice_button),
+                        deliver_output=False,
+                    )
+
+                settle_current_text = "" if _is_interim_waiting_chatter(final_text) else final_text
+                was_settled, settled_text = await task_settle.evaluate_and_settle_turn(
+                    conv_id=self.conv_id,
+                    channel_id=self.channel_id,
+                    mode=self.mode,
+                    status_msg=coord.status_msg,
+                    reply_target=reply_target,
+                    reinvoke_coro_fn=_reinvoke_for_settle,
+                    current_text=settle_current_text,
+                )
+                if was_settled:
+                    if settled_text:
+                        final_text = settled_text
+                else:
+                    try:
+                        still_pending_after = await asyncio.to_thread(pending_fn, self.conv_id)
+                    except Exception:
+                        still_pending_after = []
+                    if still_pending_after and _is_interim_waiting_chatter(final_text):
+                        print(
+                            f"[BridgeDaemon] 🤫 Suppressing interim waiting chatter in #{self.name} "
+                            f"while {len(still_pending_after)} pending background task(s) await async outbox wakeup."
+                        )
+                        if coord.status_msg:
+                            try:
+                                await coord.status_msg.delete()
+                            except Exception:
+                                pass
+                        timer.finish("DEFERRED_BG_TASK")
+                        return ""
+
         if is_settle_reinvocation and pre_settle_text:
             from tools.bridge_stream import reconcile_step_segments
             from tools.task_settle import is_substantive_response
             if is_substantive_response(final_text):
                 final_text = reconcile_step_segments(pre_settle_text, final_text)
+
+        if not deliver_output:
+            timer.finish("SETTLED_REINVOCATION" if is_settle_reinvocation else "SUCCESS")
+            return final_text
 
         # Deliver response output to Discord
         await deliver_turn_output(

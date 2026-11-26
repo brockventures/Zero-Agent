@@ -884,6 +884,84 @@ class TestBridgeStream(unittest.TestCase):
         parser.reset_pre_completion_draft(clear_pending_task=True)
         self.assertFalse(parser.has_pending_background_task)
 
+    def test_non_completion_system_message_does_not_clear_pending_background_task(self):
+        """Verify unrelated system_messages (e.g. 'Reminder: work efficiently') keep has_pending_background_task armed until real completion."""
+        from tools.bridge_stream import _is_background_task_launch
+
+        # Case-insensitive background task + task id match, preserving daemon carveout
+        self.assertTrue(_is_background_task_launch("Detached Background Task started with Task ID: task-96"))
+        self.assertFalse(
+            _is_background_task_launch(
+                '{"IsDaemon": true, "result": "Detached Background Task started with Task ID: task-96"}'
+            )
+        )
+
+        # 1. step_update branch
+        parser = AgyStreamParser(conv_id="conv-bg-reminder")
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "result": "Command detached as Background Task with Task ID: task-96",
+                },
+            },
+        })
+        self.assertTrue(parser.has_pending_background_task)
+
+        # Unrelated efficiency reminder system_message MUST NOT disarm has_pending_background_task
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+                "content": "Reminder: work efficiently. Batch independent tool calls in parallel.",
+            },
+        })
+        self.assertTrue(parser.has_pending_background_task)
+
+        # Real background task completion system_message DOES disarm it and resets pre-completion draft
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "step_index": 2,
+                "text_delta": "Running the Home Assistant Kasa diagnostic check now.",
+                "state": "DONE",
+            },
+        })
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+                "content": "Background task task-96 finished with result: exit code 0",
+            },
+        })
+        self.assertFalse(parser.has_pending_background_task)
+        self.assertEqual(parser.last_substantive_response, "")
+        self.assertEqual(len(parser.accumulated_segment), 0)
+
+        # 2. Top-level event branch
+        top_parser = AgyStreamParser(conv_id="conv-bg-reminder-top")
+        top_parser.process_event({
+            "event": "tool_use",
+            "tool_name": "run_command",
+            "output": "Background Task launched (Task ID: task-97)",
+        })
+        self.assertTrue(top_parser.has_pending_background_task)
+
+        top_parser.process_event({
+            "event": "system_message",
+            "content": "Reminder: work efficiently.",
+        })
+        self.assertTrue(top_parser.has_pending_background_task)
+
+        top_parser.process_event({
+            "event": "system_message",
+            "content": "Task ID task-97 finished with result: ok",
+        })
+        self.assertFalse(top_parser.has_pending_background_task)
+
 
 class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration unit tests for TurnCoordinator and bridge_runner stream interruption recovery."""
@@ -1139,6 +1217,119 @@ class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
         # is_aborted_stream_stub honors canonical silence sentinels
         self.assertFalse(is_aborted_stream_stub("reply:none"))
         self.assertFalse(is_aborted_stream_stub("no_op"))
+
+    async def test_persistent_worker_settles_pending_bg_task_and_delivers_once(self):
+        """Verify PersistentChannelWorker._execute_turn_core invokes evaluate_and_settle_turn on pending bg task and delivers settled output exactly once."""
+        import tools.bridge_daemons as bd
+
+        worker = bd.PersistentChannelWorker(
+            channel_id=1542081375287640084,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-settle-kasa-96"
+        worker.is_ready = True
+        worker.proc = MagicMock()
+        worker.proc.pid = 42424
+        worker.proc.returncode = None
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+        worker.proc.stdout.readline = AsyncMock(return_value=b"")
+
+        mock_status = AsyncMock()
+        mock_status.id = 88801
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = 1542081375287640084
+        mock_target.reference = None
+
+        stream_outputs = iter([
+            "Running the Home Assistant Kasa diagnostic check now.",
+            "Kasa diagnostic complete: Living Room plug is online (12ms latency).",
+        ])
+
+        async def _fake_stream_loop(*args, **kwargs):
+            return next(stream_outputs)
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.increment_session_turn", return_value=1), \
+             patch("tools.bridge_daemons.prepare_turn_prompt", side_effect=lambda **kw: kw["prompt"]), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", side_effect=_fake_stream_loop), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=["task-96"]), \
+             patch("tools.task_settle.get_turn_pending_tasks", return_value=["task-96"]), \
+             patch("tools.task_settle.wait_for_tasks_to_settle", new_callable=AsyncMock, return_value=(True, 1.2, [])), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver:
+            result = await worker._execute_turn_core(
+                prompt="Check the Kasa plugs in Home Assistant",
+                status_msg=mock_status,
+                reply_target=mock_target,
+                attachments=[],
+            )
+
+        self.assertEqual(
+            result,
+            "Kasa diagnostic complete: Living Room plug is online (12ms latency).",
+        )
+        # Must deliver settled output exactly once (inner reinvocation must NOT double-deliver)
+        mock_deliver.assert_awaited_once()
+        self.assertEqual(
+            mock_deliver.call_args.kwargs["output_text"],
+            "Kasa diagnostic complete: Living Room plug is online (12ms latency).",
+        )
+
+    async def test_persistent_worker_suppresses_interim_chatter_when_settle_times_out(self):
+        """Verify interim waiting chatter is suppressed and status_msg deleted when pending tasks exceed settle window."""
+        import tools.bridge_daemons as bd
+
+        worker = bd.PersistentChannelWorker(
+            channel_id=1542081375287640084,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-settle-timeout-96"
+        worker.is_ready = True
+        worker.proc = MagicMock()
+        worker.proc.pid = 42425
+        worker.proc.returncode = None
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+        worker.proc.stdout.readline = AsyncMock(return_value=b"")
+
+        mock_status = AsyncMock()
+        mock_status.id = 88802
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = 1542081375287640084
+        mock_target.reference = None
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.increment_session_turn", return_value=1), \
+             patch("tools.bridge_daemons.prepare_turn_prompt", side_effect=lambda **kw: kw["prompt"]), \
+             patch(
+                 "tools.bridge_daemons.TurnCoordinator.execute_stream_loop",
+                 new_callable=AsyncMock,
+                 return_value="Running the Home Assistant Kasa diagnostic check now.",
+             ), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=["task-96"]), \
+             patch("tools.task_settle.evaluate_and_settle_turn", new_callable=AsyncMock, return_value=(False, None)) as mock_settle, \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver:
+            result = await worker._execute_turn_core(
+                prompt="Check the Kasa plugs in Home Assistant",
+                status_msg=mock_status,
+                reply_target=mock_target,
+                attachments=[],
+            )
+
+        mock_settle.assert_awaited_once()
+        mock_deliver.assert_not_awaited()
+        mock_status.delete.assert_awaited_once()
+        self.assertEqual(result, "")
 
 
 if __name__ == "__main__":

@@ -524,6 +524,7 @@ def _is_background_task_launch(payload_str: str) -> bool:
     return (
         "tool is running as a background task" in low
         or "running as a background task with task id" in low
+        or ("background task" in low and "task id" in low)
     )
 
 
@@ -683,10 +684,7 @@ class AgyStreamParser:
                     or stype in ("error_message", "error")
                     or step.get("state") == "ERROR"
                 )
-                if not is_int and (
-                    self.has_pending_background_task
-                    or _is_background_task_completion(step_str)
-                ):
+                if not is_int and _is_background_task_completion(step_str):
                     self.reset_pre_completion_draft(clear_pending_task=True)
                 else:
                     self._rotate_accumulated_segment(interrupted=is_int)
@@ -736,10 +734,7 @@ class AgyStreamParser:
                 or ev_type in ("error", "error_message")
                 or event.get("type") == "ERROR_MESSAGE"
             )
-            if not is_int and (
-                self.has_pending_background_task
-                or _is_background_task_completion(ev_str)
-            ):
+            if not is_int and _is_background_task_completion(ev_str):
                 self.reset_pre_completion_draft(clear_pending_task=True)
             else:
                 self._rotate_accumulated_segment(interrupted=is_int)
