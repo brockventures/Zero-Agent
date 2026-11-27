@@ -52,7 +52,7 @@ HEAVY_CONTAINERS: tuple[str, ...] = (
 
 WATCHDOG_BEGIN_MARKER = "# === BEGIN HOST1_IO_SSHD_HARDENING ==="
 WATCHDOG_END_MARKER = "# === END HOST1_IO_SSHD_HARDENING ==="
-HA_NVME_CONFIG_DIR = "/volume2/docker/homeassistant/config"
+HA_NVME_CONFIG_DIR = "/volume2/docker-nvme/homeassistant/config"
 
 
 def _resolve_ha_credentials(host: str | None = None) -> tuple[str, str]:
@@ -334,7 +334,7 @@ def apply_recorder_and_btrfs_tuning(
     auto_purge: bool = True,
 ) -> dict[str, Any]:
     """
-    1. On Host 1 (preferring NVMe `/volume2/docker/homeassistant/config`, falling back to
+    1. On Host 1 (preferring NVMe `/volume2/docker-nvme/homeassistant/config`, falling back to
        `$DOCKER_ROOT/homeassistant/config` when absent or when explicit `docker_root` is provided),
        ensure `chattr +C` (`nodatacow`) is applied to the config directory and SQLite DB directory/files.
     2. Configure `recorder:` in `configuration.yaml` with `commit_interval: 30` and

@@ -1197,7 +1197,7 @@ def run_plex_session_cleanup(dry_run: bool = False) -> tuple[bool, str]:
             return True, ""
 
         # Scan for stale sessions > 60m old
-        transcode_sessions_dir = "/volume2/docker/appdata/plex/Temp/Transcode/Sessions"
+        transcode_sessions_dir = "/volume2/docker-nvme/appdata/plex/Temp/Transcode/Sessions"
         cmd = (
             f"[ -d {transcode_sessions_dir} ] && "
             f"find {transcode_sessions_dir} -maxdepth 1 -name 'plex-transcode-*' -mmin +60 || true"
@@ -2789,7 +2789,7 @@ def check_slzb_stable_release(force: bool = False) -> dict:
 
     outer_py = (
         f"import base64, json, os, subprocess, sys\n"
-        f"nvme_cfg = '/volume2/docker/homeassistant/config/.storage/core.config_entries'\n"
+        f"nvme_cfg = '/volume2/docker-nvme/homeassistant/config/.storage/core.config_entries'\n"
         f"fallback_cfg = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
         f"cfg_path = nvme_cfg if os.path.exists(nvme_cfg) else fallback_cfg\n"
         f"try:\n"
@@ -2933,7 +2933,7 @@ def flash_slzb_stable() -> tuple[bool, str]:
 
     outer_flash_py = (
         f"import base64, json, os, subprocess, sys\n"
-        f"nvme_cfg = '/volume2/docker/homeassistant/config/.storage/core.config_entries'\n"
+        f"nvme_cfg = '/volume2/docker-nvme/homeassistant/config/.storage/core.config_entries'\n"
         f"fallback_cfg = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
         f"cfg_path = nvme_cfg if os.path.exists(nvme_cfg) else fallback_cfg\n"
         f"try:\n"

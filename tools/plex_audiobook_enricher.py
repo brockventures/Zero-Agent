@@ -49,7 +49,7 @@ except ImportError:
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 STATE_FILE = DATA_DIR / "audiobook_enricher_state.json"
 COVER_CACHE_DIR = DATA_DIR / "audiobook_covers_clean"
-PLEX_NVME_PREFERENCES_PATH = "/volume2/docker/appdata/plex/Preferences.xml"
+PLEX_NVME_PREFERENCES_PATH = "/volume2/docker-nvme/appdata/plex/Preferences.xml"
 
 # Baseline curated catalog for instant, deterministic enrichment of core library titles
 BOOK_CATALOG: dict[str, dict[str, Any]] = {

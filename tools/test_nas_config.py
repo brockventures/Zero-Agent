@@ -274,7 +274,7 @@ def test_validate_remote_ssh_command_blocks_unbounded_du_direct_and_base64(monke
 
 
 def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
-    """Verify Host 1 compose root defaults to Volume 1 while NVMe appdata, HA config, and Host 2 default to Volume 2 with POSIX slashes."""
+    """Verify Host 1 compose root defaults to Volume 1, Host 1 NVMe defaults to docker-nvme on Volume 2, and Host 2 defaults to Volume 2 docker."""
     monkeypatch.delenv("NAS_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_1_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_1_NVME_DOCKER_ROOT", raising=False)
@@ -283,17 +283,21 @@ def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
     monkeypatch.setattr(nas_config.os.path, "exists", lambda p: p != "/secrets/env.json")
     reloaded = _load_local_module("nas_config")
     expected_h1 = posixpath.join(VOL1_ROOT, "docker")
+    expected_h1_nvme = posixpath.join(VOL2_ROOT, "docker-nvme")
     expected_h2 = posixpath.join(VOL2_ROOT, "docker")
-    expected_ha = posixpath.join(expected_h2, "homeassistant", "config")
+    expected_ha = posixpath.join(expected_h1_nvme, "homeassistant", "config")
     assert reloaded.HOST_1_DOCKER_ROOT == expected_h1
     assert reloaded.DOCKER_ROOT == expected_h1
-    assert reloaded.HOST_1_NVME_DOCKER_ROOT == expected_h2
+    assert reloaded.HOST_1_NVME_DOCKER_ROOT == expected_h1_nvme
     assert reloaded.HA_CONFIG_ROOT == expected_ha
     assert reloaded.HOST_2_DOCKER_ROOT == expected_h2
     assert "\\" not in reloaded.HOST_1_DOCKER_ROOT
     assert "\\" not in reloaded.HOST_1_NVME_DOCKER_ROOT
     assert "\\" not in reloaded.HA_CONFIG_ROOT
     assert "\\" not in reloaded.HOST_2_DOCKER_ROOT
+    blocked_nvme, reason_nvme = reloaded.validate_remote_ssh_command(f"rm -rf {expected_h1_nvme}")
+    assert blocked_nvme is False
+    assert "NAS SSH Command Filter Blocked" in reason_nvme
     blocked, reason = reloaded.validate_remote_ssh_command(f"rm -rf {expected_h2}")
     assert blocked is False
     assert "NAS SSH Command Filter Blocked" in reason
@@ -439,6 +443,8 @@ def test_volume2_recursive_delete_and_du_guards(monkeypatch):
     blocked_rm = [
         f"rm -rf {posixpath.join(VOL2_ROOT, 'docker')}",
         f"rm -rf {posixpath.join(VOL2_ROOT, 'docker')}/*",
+        f"rm -rf {posixpath.join(VOL2_ROOT, 'docker-nvme')}",
+        f"rm -rf {posixpath.join(VOL2_ROOT, 'docker-nvme')}/*",
         f"rm -rf {custom_h1_nvme}",
         f"rm -rf {custom_h1_nvme}/*",
         f"rm -rf {custom_h2}",
@@ -462,6 +468,7 @@ def test_volume2_recursive_delete_and_du_guards(monkeypatch):
 
     allowed_rm = [
         f"rm -rf {posixpath.join(VOL2_ROOT, 'docker', 'hearth', 'tmp')}",
+        f"rm -rf {posixpath.join(VOL2_ROOT, 'docker-nvme', 'homeassistant', 'tmp')}",
         f"rm -rf {custom_h1_nvme}/homeassistant/tmp",
         "rm -rf $NAS_HOST_1_NVME_DOCKER_ROOT/homeassistant",
         "rm -rf ${HOST_1_NVME_DOCKER_ROOT}/plex/cache",
@@ -474,6 +481,7 @@ def test_volume2_recursive_delete_and_du_guards(monkeypatch):
 
     blocked_du = [
         f"du -sh {posixpath.join(VOL2_ROOT, 'docker')}",
+        f"du -sh {posixpath.join(VOL2_ROOT, 'docker-nvme')}",
         "du -sh $NAS_HOST_1_NVME_DOCKER_ROOT",
         "du -sh ${NAS_HOST_1_NVME_DOCKER_ROOT}/homeassistant",
         "du -sh $HOST_1_NVME_DOCKER_ROOT",
@@ -487,3 +495,18 @@ def test_volume2_recursive_delete_and_du_guards(monkeypatch):
         allowed, reason = nas_config.validate_remote_ssh_command(cmd)
         assert allowed is False, f"Expected du walk to be blocked: {cmd}"
         assert "NAS SSH Command Filter Blocked" in reason
+
+
+def test_is_protected_nas_recursive_delete_target_blocks_volume2_docker_nvme(monkeypatch):
+    """Verify _is_protected_nas_recursive_delete_target and SSH guard block rm -rf on Host 1 NVMe docker-nvme root."""
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    monkeypatch.setenv("NAS_HOST_1_NVME_DOCKER_ROOT", "/mnt/other-nvme")
+    vol2_nvme = posixpath.join(VOL2_ROOT, "docker-nvme")
+    protected, desc = nas_config._is_protected_nas_recursive_delete_target(vol2_nvme)
+    assert protected is True
+    assert desc
+    allowed, reason = nas_config.validate_remote_ssh_command(f"rm -rf {vol2_nvme}")
+    assert allowed is False
+    assert "NAS SSH Command Filter Blocked" in reason
+    safe_sub, _ = nas_config._is_protected_nas_recursive_delete_target(posixpath.join(vol2_nvme, "homeassistant", "tmp"))
+    assert safe_sub is False

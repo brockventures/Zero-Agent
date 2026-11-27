@@ -17,10 +17,10 @@ from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
 RETENTION_DAYS = 14
-HA_NVME_ROOT = "/volume2/docker/homeassistant"
-HOMEBRIDGE_NVME_ROOT = "/volume2/docker/homebridge"
-APPDATA_NVME_ROOT = "/volume2/docker/appdata"
-HOMEPAGE_NVME_ROOT = "/volume2/docker/homepage"
+HA_NVME_ROOT = "/volume2/docker-nvme/homeassistant"
+HOMEBRIDGE_NVME_ROOT = "/volume2/docker-nvme/homebridge"
+APPDATA_NVME_ROOT = "/volume2/docker-nvme/appdata"
+HOMEPAGE_NVME_ROOT = "/volume2/docker-nvme/homepage"
 
 for _p in ["/workspace", "/workspace/tools"]:
     if _p not in sys.path:
@@ -183,7 +183,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
 def backup_wordpress(ts: str) -> tuple[bool, str]:
     dest_db = f"/volumeUSB1/usbshare/backups/wordpress/wp_dbs_{ts}.sql.gz"
     dest_tar = f"/volumeUSB1/usbshare/backups/wordpress/wp_files_{ts}.tar.gz"
-    wp_root = "/volume2/docker/wordpress"
+    wp_root = "/volume2/docker-nvme/wordpress"
 
     # 1. Dump wp01 & wp02 from MariaDB with pipefail so container errors aren't masked by gzip
     cmd_db = (

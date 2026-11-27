@@ -141,6 +141,7 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     h1 = host_1 or "127.0.0.1"
     h2 = host_2 or "127.0.0.1"
     default_h1_docker = posixpath.join("/volume1", "docker")
+    default_h1_nvme_docker = posixpath.join("/volume2", "docker-nvme")
     default_h2_docker = posixpath.join("/volume2", "docker")
     host_1_docker_root = (
         env_h1_docker
@@ -152,7 +153,7 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     host_1_nvme_docker_root = (
         env_h1_nvme_docker
         or json_h1_nvme_docker
-        or default_h2_docker
+        or default_h1_nvme_docker
     ).replace("\\", "/")
     default_ha_config = posixpath.join(host_1_nvme_docker_root, "homeassistant", "config")
     ha_config_root = (
@@ -196,7 +197,7 @@ DOCKER_ROOT = (
 ).replace("\\", "/")
 HOST_1_DOCKER_ROOT = DOCKER_ROOT
 HOST_1_NVME_DOCKER_ROOT = (
-    os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or posixpath.join("/volume2", "docker")
+    os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or posixpath.join("/volume2", "docker-nvme")
 ).replace("\\", "/")
 HA_CONFIG_ROOT = (
     os.environ.get("NAS_HA_CONFIG_ROOT")
@@ -529,13 +530,14 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
 
     default_vol_docker = posixpath.join("/volume1", "docker")
     default_vol2_docker = posixpath.join("/volume2", "docker")
+    default_vol2_docker_nvme = posixpath.join("/volume2", "docker-nvme")
     default_vol_data = posixpath.join("/volume1", "data")
     configured_h1_docker_root = (
         os.environ.get("NAS_HOST_1_DOCKER_ROOT") or HOST_1_DOCKER_ROOT or default_vol_docker
     ).strip()
     configured_docker_root = (os.environ.get("NAS_DOCKER_ROOT") or DOCKER_ROOT or default_vol_docker).strip()
     configured_h1_nvme_docker_root = (
-        os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or HOST_1_NVME_DOCKER_ROOT or default_vol2_docker
+        os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or HOST_1_NVME_DOCKER_ROOT or default_vol2_docker_nvme
     ).strip()
     configured_h2_docker_root = (
         os.environ.get("NAS_HOST_2_DOCKER_ROOT") or HOST_2_DOCKER_ROOT or default_vol2_docker
@@ -543,6 +545,7 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
     protected_top_dirs = {
         posixpath.normpath(default_vol_docker),
         posixpath.normpath(default_vol2_docker),
+        posixpath.normpath(default_vol2_docker_nvme),
         posixpath.normpath(default_vol_data),
         "/docker",
     }

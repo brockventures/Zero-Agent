@@ -62,7 +62,7 @@ def test_backup_wordpress_success():
     assert "--exclude='sites/*/wp-content/upgrade-temp-backup/*'" in tar_cmd
     assert "--exclude='@eaDir'" in tar_cmd
     assert "--exclude='*.log'" in tar_cmd
-    assert "-C '/volume2/docker/wordpress'" in tar_cmd
+    assert "-C '/volume2/docker-nvme/wordpress'" in tar_cmd
     assert "docker-compose.yml .env apache php sites" in tar_cmd
     assert tar_timeout == 240
 
@@ -252,16 +252,16 @@ def test_backup_home_assistant_success():
     assert "--exclude='backups'" in cfg_cmd
     assert "--exclude='*.db*'" in cfg_cmd
     assert "--exclude='*.log'" in cfg_cmd
-    assert "-C '/volume2/docker/homeassistant/config' ." in cfg_cmd
+    assert "-C '/volume2/docker-nvme/homeassistant/config' ." in cfg_cmd
     assert cfg_timeout == 120
 
     db_cmd, db_timeout = calls[1]
-    assert "sudo sqlite3 '/volume2/docker/homeassistant/config/home-assistant_v2.db'" in db_cmd
+    assert "sudo sqlite3 '/volume2/docker-nvme/homeassistant/config/home-assistant_v2.db'" in db_cmd
     assert f".backup '/volumeUSB1/usbshare/backups/homeassistant/ha_db_{ts}.db'" in db_cmd
     assert db_timeout == 240
 
     zb_cmd, zb_timeout = calls[2]
-    assert "sudo test -f '/volume2/docker/homeassistant/config/zigbee.db'" in zb_cmd
+    assert "sudo test -f '/volume2/docker-nvme/homeassistant/config/zigbee.db'" in zb_cmd
     assert f".backup '/volumeUSB1/usbshare/backups/homeassistant/zigbee_db_{ts}.db'" in zb_cmd
     assert zb_timeout == 120
 
@@ -271,7 +271,7 @@ def test_backup_home_assistant_success():
     assert "--exclude='homebridge/node_modules'" in radios_cmd
     assert "--exclude='homebridge/homebridge.log'" in radios_cmd
     assert "--exclude='*.log'" in radios_cmd
-    assert "-C '/volume2/docker'" in radios_cmd
+    assert "-C '/volume2/docker-nvme'" in radios_cmd
     for member in (
         "homeassistant/matter-server",
         "homeassistant/otbr-data",
@@ -503,7 +503,7 @@ def test_backup_docker_appdata_success():
         ok, msg = backup_host1.backup_docker_appdata(ts)
 
     assert ok is True
-    assert backup_host1.HOMEPAGE_NVME_ROOT == "/volume2/docker/homepage"
+    assert backup_host1.HOMEPAGE_NVME_ROOT == "/volume2/docker-nvme/homepage"
     dest_compose = f"/volumeUSB1/usbshare/backups/docker-appdata/docker-compose_{ts}.yml"
     dest_tar = f"/volumeUSB1/usbshare/backups/docker-appdata/appdata_critical_{ts}.tar.gz"
     assert msg == f"docker-appdata -> {dest_compose} & {dest_tar}"
@@ -516,16 +516,16 @@ def test_backup_docker_appdata_success():
     assert ckpt_timeout == 30
     assert f"'{backup_host1.DOCKER_ROOT}/appdata/dockhand/db/dockhand.db'" not in ckpt_cmd
     for db_path in (
-        "'/volume2/docker/appdata/dockhand/db/dockhand.db'",
-        "'/volume2/docker/appdata/seerr/db/db.sqlite3'",
-        "'/volume2/docker/appdata/tautulli/tautulli.db'",
-        "'/volume2/docker/appdata/maintainerr/maintainerr.sqlite'",
-        "'/volume2/docker/appdata/bazarr/db/bazarr.db'",
-        "'/volume2/docker/appdata/sabnzbd/admin/history1.db'",
-        "'/volume2/docker/appdata/calibre-web-automated/app.db'",
-        "'/volume2/docker/appdata/calibre-web-automated/cwa.db'",
-        "'/volume2/docker/appdata/calibre-web-automated/gdrive.db'",
-        "'/volume2/docker/appdata/shelfmark/users.db'",
+        "'/volume2/docker-nvme/appdata/dockhand/db/dockhand.db'",
+        "'/volume2/docker-nvme/appdata/seerr/db/db.sqlite3'",
+        "'/volume2/docker-nvme/appdata/tautulli/tautulli.db'",
+        "'/volume2/docker-nvme/appdata/maintainerr/maintainerr.sqlite'",
+        "'/volume2/docker-nvme/appdata/bazarr/db/bazarr.db'",
+        "'/volume2/docker-nvme/appdata/sabnzbd/admin/history1.db'",
+        "'/volume2/docker-nvme/appdata/calibre-web-automated/app.db'",
+        "'/volume2/docker-nvme/appdata/calibre-web-automated/cwa.db'",
+        "'/volume2/docker-nvme/appdata/calibre-web-automated/gdrive.db'",
+        "'/volume2/docker-nvme/appdata/shelfmark/users.db'",
     ):
         assert db_path in ckpt_cmd
 
@@ -550,11 +550,11 @@ def test_backup_docker_appdata_success():
         assert excl in tar_cmd
     assert f"-C '{backup_host1.DOCKER_ROOT}/appdata' dockhand" not in tar_cmd
     expected_members = (
-        "-C '/volume2/docker/appdata' "
+        "-C '/volume2/docker-nvme/appdata' "
         "maintainerr seerr tautulli bazarr dockhand calibre-web-automated shelfmark "
         "sabnzbd/sabnzbd.ini sabnzbd/admin/history1.db glances/conf/glances.conf "
         "sonarr/config.xml radarr/config.xml prowlarr/config.xml "
-        "-C '/volume2/docker/homepage' config"
+        "-C '/volume2/docker-nvme/homepage' config"
     )
     assert expected_members in tar_cmd
 
@@ -645,7 +645,7 @@ def test_backup_plex_artwork_success():
 
     lib_cmd, lib_timeout = calls[0]
     assert (
-        "sudo sqlite3 '/volume2/docker/appdata/plex/Plug-in Support/Databases/com.plexapp.plugins.library.db'"
+        "sudo sqlite3 '/volume2/docker-nvme/appdata/plex/Plug-in Support/Databases/com.plexapp.plugins.library.db'"
         in lib_cmd
     )
     assert f".backup '/volumeUSB1/usbshare/backups/plex/plex_library_{ts}.db'" in lib_cmd
@@ -653,7 +653,7 @@ def test_backup_plex_artwork_success():
 
     blobs_cmd, blobs_timeout = calls[1]
     assert (
-        "sudo test -f '/volume2/docker/appdata/plex/Plug-in Support/Databases/com.plexapp.plugins.library.blobs.db'"
+        "sudo test -f '/volume2/docker-nvme/appdata/plex/Plug-in Support/Databases/com.plexapp.plugins.library.blobs.db'"
         in blobs_cmd
     )
     assert f".backup '/volumeUSB1/usbshare/backups/plex/plex_blobs_{ts}.db'" in blobs_cmd
@@ -664,7 +664,7 @@ def test_backup_plex_artwork_success():
     assert "--warning=no-file-changed" in tar_cmd
     for excl in ("--exclude='*.log'", "--exclude='Logs'", "--exclude='Cache'", "--exclude='temp'"):
         assert excl in tar_cmd
-    assert "-C '/volume2/docker/appdata'" in tar_cmd
+    assert "-C '/volume2/docker-nvme/appdata'" in tar_cmd
     for member in (
         "plex/Preferences.xml",
         "kometa/radarr_arrapi_patch.py",

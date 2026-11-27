@@ -18,7 +18,7 @@ except ImportError:
 
 HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
-HA_NVME_ROOT = "/volume2/docker/homeassistant"
+HA_NVME_ROOT = "/volume2/docker-nvme/homeassistant"
 
 
 def run_ssh(cmd_str: str, timeout: int = 180) -> str:
