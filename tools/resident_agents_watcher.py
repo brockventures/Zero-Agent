@@ -864,7 +864,7 @@ def post_reddit_comment_human_paced(
                 submit_res = page.evaluate(
                     """async ({thing_id, text}) => {
                         try {
-                            const meRes = await fetch('https://old.reddit.com/api/me.json', {credentials: 'include'});
+                            const meRes = await fetch('/api/me.json', {credentials: 'include'});
                             if (!meRes || !meRes.ok) {
                                 return {error: `Failed to verify active Reddit session (/api/me.json HTTP ${meRes ? meRes.status : 'err'})`};
                             }
@@ -891,7 +891,7 @@ def post_reddit_comment_human_paced(
                                 text,
                                 api_type: 'json'
                             });
-                            const r = await fetch('https://old.reddit.com/api/comment', {
+                            const r = await fetch('/api/comment', {
                                 method: 'POST',
                                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                                 body: params.toString(),
