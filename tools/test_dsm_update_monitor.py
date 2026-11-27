@@ -422,7 +422,8 @@ def test_ensure_adb_updates_usb_and_rc_script():
     assert "chmod -R a+rwX /dev/bus/usb" in rc_script
     assert "chmod 755" in rc_script
     assert "adb_host.log" in rc_script
-    assert "fork-server server" in rc_script
+    assert "start-server" in rc_script
+    assert "fork-server" not in rc_script
     assert "36261FDJG0003L" in rc_script
     assert "tcp:9223" in rc_script
 
@@ -441,12 +442,213 @@ def test_ensure_adb_updates_usb_and_rc_script():
         assert "chmod -R a+rwX /dev/bus/usb" in ssh_calls[0][1]
         assert "adb_host.log" in ssh_calls[0][1]
         assert "/usr/local/etc/rc.d/pixel_adb.sh" in ssh_calls[0][1]
+        assert "start-server" in ssh_calls[0][1]
+        assert "fork-server" not in ssh_calls[0][1]
+        assert "</dev/null" in ssh_calls[0][1]
         assert "5037" in ssh_calls[0][1]
         assert "tcp:9223" in ssh_calls[0][1]
 
 
+def test_upgrade_setting_drift_remediation_via_synowebapi_preserves_schedule():
+    ssh_calls: list[tuple[str, str]] = []
+
+    def fake_run_ssh(host: str, cmd: str, **kwargs):
+        ssh_calls.append((host, cmd))
+        return 0, '{"success":true}', ""
+
+    wrapped_drift = json.dumps(
+        {
+            "data": {
+                "autoupdate_type": "hotfix-security",
+                "smart_nano_enabled": True,
+                "schedule": {"date_type": 0, "hour": 2, "minute": 30},
+            },
+            "success": True,
+        }
+    )
+
+    with patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh):
+        remediated, setting = dsm_update_monitor.check_and_remediate_upgrade_setting(
+            MOCK_HOST_1_IP,
+            setting_output=wrapped_drift,
+        )
+
+    assert remediated is True
+    assert setting["autoupdate_type"] == "notify"
+    assert setting["smart_nano_enabled"] is False
+    assert setting["schedule"] == {"date_type": 0, "hour": 2, "minute": 30}
+    assert len(ssh_calls) == 1
+    assert ssh_calls[0][0] == MOCK_HOST_1_IP
+
+    cmd = ssh_calls[0][1]
+    match = re.search(r"chroot /host sh -c \"echo '([A-Za-z0-9+/=]+)' \| base64 -d \| sh\"", cmd)
+    assert match is not None
+    decoded = base64.b64decode(match.group(1)).decode("utf-8")
+    assert "api=SYNO.Core.Upgrade.Setting method=set version=4" in decoded
+    assert "autoupdate_type='\"notify\"'" in decoded
+    assert "smart_nano_enabled=false" in decoded
+    assert 'schedule=\'{"date_type":0,"hour":2,"minute":30}\'' in decoded
+    syntax_check = subprocess.run(["sh", "-n"], input=decoded, text=True, capture_output=True, check=False)
+    assert syntax_check.returncode == 0, syntax_check.stderr
+
+    # Also test flat dict with only smart_nano_enabled=True
+    ssh_calls.clear()
+    flat_nano_drift = json.dumps(
+        {
+            "autoupdate_type": "notify",
+            "smart_nano_enabled": True,
+            "schedule": {"date_type": 1, "hour": 4, "minute": 0},
+        }
+    )
+    with patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh):
+        remediated2, setting2 = dsm_update_monitor.check_and_remediate_upgrade_setting(
+            MOCK_HOST_2_IP,
+            setting_output=flat_nano_drift,
+        )
+    assert remediated2 is True
+    assert setting2["autoupdate_type"] == "notify"
+    assert setting2["smart_nano_enabled"] is False
+    assert len(ssh_calls) == 1
+
+
+def test_upgrade_setting_update_conf_fallback_when_schedule_absent(tmp_path: Path):
+    ssh_calls: list[tuple[str, str]] = []
+
+    def fake_run_ssh(host: str, cmd: str, **kwargs):
+        ssh_calls.append((host, cmd))
+        return 0, "", ""
+
+    conf_drift = 'autoupdate_type="hotfix-security"\nsmart_nano_enabled="true"\n'
+    with patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh):
+        remediated, setting = dsm_update_monitor.check_and_remediate_upgrade_setting(
+            MOCK_HOST_1_IP,
+            setting_output=conf_drift,
+        )
+
+    assert remediated is True
+    assert setting["source"] == "update.conf"
+    assert setting["autoupdate_type"] == "notify"
+    assert setting["smart_nano_enabled"] is False
+    assert len(ssh_calls) == 1
+
+    match = re.search(r"chroot /host sh -c \"echo '([A-Za-z0-9+/=]+)' \| base64 -d \| sh\"", ssh_calls[0][1])
+    assert match is not None
+    decoded = base64.b64decode(match.group(1)).decode("utf-8")
+    assert "/usr/syno/etc/update.conf" in decoded
+
+    # Execute the decoded update.conf script against a temporary file to verify idempotent rewrite
+    tmp_conf = tmp_path / "update.conf"
+    tmp_conf.write_text(conf_drift, encoding="utf-8")
+    test_script = decoded.replace("/usr/syno/etc/update.conf", str(tmp_conf))
+    proc = subprocess.run(["sh"], input=test_script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    updated_text = tmp_conf.read_text(encoding="utf-8")
+    assert 'autoupdate_type="notify"' in updated_text
+    assert 'smart_nano_enabled="false"' in updated_text
+
+
+def test_upgrade_setting_noop_when_clean_or_empty_or_unparseable():
+    ssh_calls: list[tuple[str, str]] = []
+
+    def fake_run_ssh(host: str, cmd: str, **kwargs):
+        ssh_calls.append((host, cmd))
+        return 0, "", ""
+
+    clean_json = json.dumps(
+        {
+            "data": {
+                "autoupdate_type": "notify",
+                "smart_nano_enabled": False,
+                "schedule": {"date_type": 0, "hour": 3, "minute": 0},
+            },
+            "success": True,
+        }
+    )
+    clean_conf = 'autoupdate_type="notify"\nsmart_nano_enabled="false"\n'
+    samples = [
+        clean_json,
+        clean_conf,
+        "",
+        "   \n",
+        "chroot: can't execute '/usr/syno/bin/synowebapi': No such file or directory",
+        "{not-valid-json",
+        '{"success": false, "error": {"code": 119}}',
+    ]
+
+    with patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh):
+        for idx, sample in enumerate(samples):
+            remediated, setting = dsm_update_monitor.check_and_remediate_upgrade_setting(
+                MOCK_HOST_1_IP,
+                setting_output=sample,
+            )
+            assert remediated is False, f"sample[{idx}] unexpectedly triggered remediation"
+            if idx in (0, 1):
+                assert setting["autoupdate_type"] == "notify"
+                assert setting["smart_nano_enabled"] is False
+            else:
+                assert setting == {}
+    assert len(ssh_calls) == 0
+
+
+def test_check_host_dsm_upgrade_setting_split_and_quiet_suppression(capsys):
+    ssh_calls: list[tuple[str, str]] = []
+
+    def fake_run_ssh(host: str, cmd: str, **kwargs):
+        ssh_calls.append((host, cmd))
+        if "===TASK_SPLIT===" in cmd:
+            if host == MOCK_HOST_1_IP:
+                setting_json = json.dumps(
+                    {
+                        "data": {
+                            "autoupdate_type": "hotfix-security",
+                            "smart_nano_enabled": True,
+                            "schedule": {"date_type": 0, "hour": 2, "minute": 0},
+                        },
+                        "success": True,
+                    }
+                )
+                out = (
+                    f"{SAMPLE_VERSION_HOST1}\n===TASK_SPLIT===\n"
+                    f"{SAMPLE_TASK_CLEAN}\n===UPGRADE_SPLIT===\n"
+                    f"{SAMPLE_CHECK_NONE}\n===UPGRADE_SETTING_SPLIT===\n"
+                    f"{setting_json}"
+                )
+                return 0, out, ""
+            if host == MOCK_HOST_2_IP:
+                out = (
+                    f"{SAMPLE_VERSION_HOST2}\n===TASK_SPLIT===\n"
+                    f"{SAMPLE_TASK_CLEAN}\n===UPGRADE_SPLIT===\n"
+                    f"{SAMPLE_CHECK_NONE}\n===UPGRADE_SETTING_SPLIT===\n"
+                    '{"data":{"autoupdate_type":"notify","smart_nano_enabled":false},"success":true}'
+                )
+                return 0, out, ""
+        return 0, '{"success":true}', ""
+
+    with (
+        patch.object(dsm_update_monitor.nas_config, "HOST_1_IP", MOCK_HOST_1_IP),
+        patch.object(dsm_update_monitor.nas_config, "HOST_2_IP", MOCK_HOST_2_IP),
+        patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh),
+    ):
+        rc = dsm_update_monitor.main(["--check", "--quiet"])
+        assert rc == 0
+        captured = capsys.readouterr().out
+        assert "Remediated Upgrade.Setting -> notify, smart_nano=false" in captured
+
+        sidecar_summary = dsm_update_monitor.run_dsm_update_sidecar(
+            ensure_adb=False,
+            stage_card=False,
+            post_to_discord=False,
+            quiet=True,
+        )
+        assert "Remediated Upgrade.Setting -> notify, smart_nano=false" in sidecar_summary
+
+
 def test_schedule_json_contains_dsm_update_monitor():
     sched_path = Path(__file__).resolve().parent.parent / "data" / "schedule.json"
+    if not sched_path.exists():
+        alt_path = Path("/workspace/data/schedule.json")
+        if alt_path.exists():
+            sched_path = alt_path
     entries = json.loads(sched_path.read_text(encoding="utf-8"))
     match = next((e for e in entries if e.get("id") == "dsm_update_monitor"), None)
     assert match is not None

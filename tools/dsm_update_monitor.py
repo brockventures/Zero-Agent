@@ -20,6 +20,7 @@ import argparse
 import base64
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -44,6 +45,7 @@ PIXEL_SERIAL = "36261FDJG0003L"
 HOTFIX_ACTION = "action=#schedule:dsm_autoupdate_hotfix#"
 NOTIFY_ACTION = "action=#schedule:dsm_autoupdate_notify#"
 SCHEDULE_TASK_PATH = "/usr/syno/etc/synoschedule.d/root/1.task"
+UPDATE_CONF_PATH = "/usr/syno/etc/update.conf"
 PIXEL_ADB_RC_PATH = "/usr/local/etc/rc.d/pixel_adb.sh"
 
 
@@ -161,6 +163,162 @@ def check_and_remediate_schedule_task(
     return False, ""
 
 
+def _parse_bool_flag(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        norm = value.strip().strip('"').strip("'").lower()
+        if norm in ("true", "1", "yes"):
+            return True
+        if norm in ("false", "0", "no"):
+            return False
+    return None
+
+
+def parse_upgrade_setting(setting_output: str) -> dict[str, Any]:
+    """
+    Parse SYNO.Core.Upgrade.Setting v4 JSON (wrapped {'data': ..., 'success': true} or flat dict)
+    or /usr/syno/etc/update.conf key=value output into autoupdate_type, smart_nano_enabled, and schedule.
+    Returns {} if empty or unparseable.
+    """
+    text = (setting_output or "").strip()
+    if not text:
+        return {}
+
+    json_candidates = [text]
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match and match.group(0) != text:
+        json_candidates.append(match.group(0))
+
+    for candidate in json_candidates:
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("success") is False and "data" not in data:
+            return {}
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        autoupdate_raw = payload.get("autoupdate_type")
+        autoupdate_type = (
+            autoupdate_raw.strip().strip('"').strip("'")
+            if isinstance(autoupdate_raw, str) and autoupdate_raw.strip()
+            else None
+        )
+        smart_nano = _parse_bool_flag(payload.get("smart_nano_enabled"))
+        schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else None
+        if autoupdate_type is None and smart_nano is None:
+            continue
+        parsed: dict[str, Any] = {"source": "synowebapi"}
+        if autoupdate_type is not None:
+            parsed["autoupdate_type"] = autoupdate_type
+        if smart_nano is not None:
+            parsed["smart_nano_enabled"] = smart_nano
+        if schedule is not None:
+            parsed["schedule"] = schedule
+        return parsed
+
+    conf_type: Optional[str] = None
+    conf_nano: Optional[bool] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k == "autoupdate_type" and v:
+            conf_type = v
+        elif k == "smart_nano_enabled":
+            conf_nano = _parse_bool_flag(v)
+
+    if conf_type is not None or conf_nano is not None:
+        parsed_conf: dict[str, Any] = {"source": "update.conf"}
+        if conf_type is not None:
+            parsed_conf["autoupdate_type"] = conf_type
+        if conf_nano is not None:
+            parsed_conf["smart_nano_enabled"] = conf_nano
+        return parsed_conf
+
+    return {}
+
+
+def check_and_remediate_upgrade_setting(
+    host_ip: str,
+    setting_output: Optional[str] = None,
+) -> tuple[bool, dict[str, Any]]:
+    """
+    Check SYNO.Core.Upgrade.Setting / update.conf on host_ip and remediate drift if
+    autoupdate_type != 'notify' or smart_nano_enabled is True.
+    Never triggers remediation on empty or unparseable setting_output.
+    """
+    if setting_output is None:
+        _, out, _ = nas_config.run_ssh(
+            host_ip,
+            "PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
+            "docker run --rm --privileged -v /:/host alpine "
+            "chroot /host sh -c \""
+            "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Setting method=get version=4 2>/dev/null || "
+            f"cat {UPDATE_CONF_PATH} 2>/dev/null"
+            "\"",
+        )
+        setting_output = out or ""
+
+    parsed = parse_upgrade_setting(setting_output)
+    if not parsed:
+        return False, {}
+
+    autoupdate_type = parsed.get("autoupdate_type")
+    smart_nano_enabled = parsed.get("smart_nano_enabled")
+    needs_type_fix = autoupdate_type is not None and autoupdate_type != "notify"
+    needs_nano_fix = smart_nano_enabled is True
+
+    if not needs_type_fix and not needs_nano_fix:
+        return False, parsed
+
+    schedule = parsed.get("schedule")
+    if isinstance(schedule, dict):
+        schedule_json = json.dumps(schedule, separators=(",", ":"))
+        inner_script = (
+            "/usr/syno/bin/synowebapi --exec "
+            "api=SYNO.Core.Upgrade.Setting method=set version=4 "
+            "autoupdate_type='\"notify\"' "
+            "smart_nano_enabled=false "
+            f"schedule={shlex.quote(schedule_json)}\n"
+        )
+    else:
+        inner_script = (
+            f"conf={shlex.quote(UPDATE_CONF_PATH)}\n"
+            'touch "$conf"\n'
+            'if grep -q \'^autoupdate_type=\' "$conf" 2>/dev/null; then\n'
+            '    sed -i \'s/^autoupdate_type=.*/autoupdate_type="notify"/\' "$conf"\n'
+            "else\n"
+            '    printf \'autoupdate_type="notify"\\n\' >> "$conf"\n'
+            "fi\n"
+            'if grep -q \'^smart_nano_enabled=\' "$conf" 2>/dev/null; then\n'
+            '    sed -i \'s/^smart_nano_enabled=.*/smart_nano_enabled="false"/\' "$conf"\n'
+            "else\n"
+            '    printf \'smart_nano_enabled="false"\\n\' >> "$conf"\n'
+            "fi\n"
+        )
+
+    b64_script = base64.b64encode(inner_script.encode("utf-8")).decode("ascii")
+    remediate_cmd = (
+        "PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
+        "docker run --rm --privileged -v /:/host alpine "
+        f"chroot /host sh -c \"echo '{b64_script}' | base64 -d | sh\""
+    )
+    rc, _, _ = nas_config.run_ssh(host_ip, remediate_cmd)
+    if rc != 0:
+        return False, parsed
+
+    updated = dict(parsed)
+    updated["autoupdate_type"] = "notify"
+    updated["smart_nano_enabled"] = False
+    return True, updated
+
+
 def stage_dsm_update_decision(
     host_num: int,
     host_ip: str,
@@ -198,7 +356,7 @@ def check_host_dsm(
     post_to_discord: bool = True,
     channel_id: int = ZERO_CHAT_CHANNEL_ID,
 ) -> dict[str, Any]:
-    """Check DSM version, 1.task schedule drift, and synoupgrade --check on a single NAS host."""
+    """Check DSM version, 1.task schedule drift, Upgrade.Setting drift, and synoupgrade --check on a single NAS host."""
     probe_cmd = (
         "cat /etc.defaults/VERSION 2>/dev/null; "
         "echo '===TASK_SPLIT==='; "
@@ -206,21 +364,35 @@ def check_host_dsm(
         "echo '===UPGRADE_SPLIT==='; "
         "PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
         "docker run --rm --privileged -v /:/host alpine "
-        "chroot /host /usr/syno/sbin/synoupgrade --check 2>&1"
+        "chroot /host sh -c \""
+        "/usr/syno/sbin/synoupgrade --check 2>&1; "
+        "echo '===UPGRADE_SETTING_SPLIT==='; "
+        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Setting method=get version=4 2>/dev/null || "
+        f"cat {UPDATE_CONF_PATH} 2>/dev/null"
+        "\""
     )
     rc, stdout, stderr = nas_config.run_ssh(host_ip, probe_cmd)
     out = stdout or ""
 
     if "===TASK_SPLIT===" in out and "===UPGRADE_SPLIT===" in out:
         ver_part, rest = out.split("===TASK_SPLIT===", 1)
-        task_part, upg_part = rest.split("===UPGRADE_SPLIT===", 1)
+        task_part, upg_rest = rest.split("===UPGRADE_SPLIT===", 1)
+        if "===UPGRADE_SETTING_SPLIT===" in upg_rest:
+            upg_part, setting_part = upg_rest.split("===UPGRADE_SETTING_SPLIT===", 1)
+        else:
+            upg_part = upg_rest
+            setting_part = ""
     else:
         ver_part = out
         task_part = out
         upg_part = out
+        setting_part = ""
 
     ver_info = parse_version_file(ver_part)
     remediated, task_action = check_and_remediate_schedule_task(host_ip, task_content=task_part)
+    upgrade_setting_remediated, upgrade_setting = check_and_remediate_upgrade_setting(
+        host_ip, setting_output=setting_part
+    )
     upgrade_info = parse_synoupgrade_check(upg_part)
 
     available = bool(upgrade_info.get("available", False))
@@ -246,6 +418,8 @@ def check_host_dsm(
         "version_info": ver_info,
         "schedule_drift_remediated": remediated,
         "schedule_action": task_action,
+        "upgrade_setting_remediated": upgrade_setting_remediated,
+        "upgrade_setting": upgrade_setting,
         "available": available,
         "target_version": target_version,
         "upgrade_info": upgrade_info,
@@ -390,7 +564,7 @@ def build_pixel_adb_rc_script(docker_root: Optional[str] = None) -> str:
         f"        export HOME={adb_home}\n"
         f"        export ADB_VENDOR_KEYS={adb_key}\n"
         f"        {adb_bin} kill-server >/dev/null 2>&1 || true\n"
-        f"        nohup {adb_bin} -a -P 5037 fork-server server >{adb_home}/adb_host.log 2>&1 &\n"
+        f"        {adb_bin} -a -P 5037 start-server >{adb_home}/adb_host.log 2>&1 </dev/null\n"
         "        sleep 2\n"
         f"        {adb_bin} -H 127.0.0.1 -P 5037 -s {PIXEL_SERIAL} forward tcp:9223 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true\n"
         "        ;;\n"
@@ -429,7 +603,7 @@ def ensure_host2_adb(host_ip: Optional[str] = None) -> dict[str, Any]:
         f"devs=$({adb_bin} -H 127.0.0.1 -P 5037 devices 2>/dev/null || true); "
         f"case \"$devs\" in *{PIXEL_SERIAL}*device*) ;; *) "
         f"{adb_bin} kill-server >/dev/null 2>&1 || true; "
-        f"nohup {adb_bin} -a -P 5037 fork-server server >{adb_home}/adb_host.log 2>&1 </dev/null & "
+        f"{adb_bin} -a -P 5037 start-server >{adb_home}/adb_host.log 2>&1 </dev/null; "
         "sleep 2 ;; esac && "
         f"{adb_bin} -H 127.0.0.1 -P 5037 -s {PIXEL_SERIAL} forward tcp:9223 localabstract:chrome_devtools_remote 2>&1 || true; "
         f"{adb_bin} -H 127.0.0.1 -P 5037 devices -l 2>&1; "
@@ -457,6 +631,7 @@ def format_check_summary(results: dict[str, Any], adb_res: Optional[dict[str, An
         avail = info.get("available", False)
         target = info.get("target_version", "")
         remediated = info.get("schedule_drift_remediated", False)
+        upgrade_setting_remediated = info.get("upgrade_setting_remediated", False)
         dec = info.get("decision") or {}
         dec_id = dec.get("decision_id", "")
 
@@ -465,6 +640,8 @@ def format_check_summary(results: dict[str, Any], adb_res: Optional[dict[str, An
             status_str += f" (Decision Card `{dec_id}` staged)"
         if remediated:
             status_str += " [Remediated 1.task hotfix -> notify]"
+        if upgrade_setting_remediated:
+            status_str += " [Remediated Upgrade.Setting -> notify, smart_nano=false]"
         lines.append(f"• **{label}:** `{cur}` — {status_str}")
 
     if adb_res is not None:
@@ -489,6 +666,8 @@ def run_dsm_update_sidecar(
     any_remediated = (
         results["host1"].get("schedule_drift_remediated")
         or results["host2"].get("schedule_drift_remediated")
+        or results["host1"].get("upgrade_setting_remediated")
+        or results["host2"].get("upgrade_setting_remediated")
     )
     if quiet and not any_avail and not any_remediated:
         return ""
@@ -555,7 +734,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Default action or explicit --check
     results = check_all_hosts(stage_card=not args.no_stage, post_to_discord=True)
     summary = format_check_summary(results, adb_res=adb_res)
-    if not args.quiet or results["host1"].get("available") or results["host2"].get("available"):
+    any_avail = results["host1"].get("available") or results["host2"].get("available")
+    any_remediated = (
+        results["host1"].get("schedule_drift_remediated")
+        or results["host2"].get("schedule_drift_remediated")
+        or results["host1"].get("upgrade_setting_remediated")
+        or results["host2"].get("upgrade_setting_remediated")
+    )
+    if not args.quiet or any_avail or any_remediated:
         if summary:
             print(summary)
     return 0
