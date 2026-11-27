@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import contextvars
 import json
 import logging
 import os
@@ -39,10 +40,21 @@ ADB_BIN = "/workspace/tools/bin/adb"
 if not os.path.exists(ADB_BIN):
     ADB_BIN = "/workspace/scratch/platform-tools/platform-tools/adb"
 
+try:
+    from tools import dsm_update_monitor
+except ImportError:
+    import dsm_update_monitor  # type: ignore
+
 import nas_config
 HOST2_IP = nas_config.HOST_2_IP
 ADB_PORT = "5037"
 USB_SERIAL = "36261FDJG0003L"
+CHROME_PACKAGES = ("com.android.chrome", "com.chrome.beta")
+CDP_PROBE_TIMEOUT_SEC = 3.0
+
+_HOST2_HEAL_ATTEMPTED: contextvars.ContextVar[Optional[List[bool]]] = contextvars.ContextVar(
+    "_HOST2_HEAL_ATTEMPTED", default=None
+)
 
 
 def _resolve_wifi_device() -> str:
@@ -64,9 +76,8 @@ CDP_PORT = 9223
 IP_WEBCAM_URL = f"http://{HOST2_IP}:3333/status.json"
 
 
-def get_adb_command_prefix() -> Tuple[List[str], str]:
-    """Resolve ADB command prefix, strictly targeting the Pixel 8 Pro (husky) via Host 2 USB, local USB, or configuredPIXEL_WIFI_ADB."""
-    # 1. Try USB via Host 2 ADB server first (explicitly pinned to USB_SERIAL)
+def _check_host2_adb_device() -> Tuple[bool, str]:
+    """Return (True, 'ok') if Host 2 ADB (:5037) is reachable and lists USB_SERIAL online."""
     try:
         res = subprocess.run(
             [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "devices"],
@@ -74,28 +85,71 @@ def get_adb_command_prefix() -> Tuple[List[str], str]:
             text=True,
             timeout=2,
         )
-        if f"{USB_SERIAL}	device" in res.stdout:
-            return [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "-s", USB_SERIAL], "usb"
-    except Exception:
-        pass
+        stdout = res.stdout or ""
+        stderr = res.stderr or ""
+        if res.returncode == 0 and f"{USB_SERIAL}\tdevice" in stdout:
+            return True, "ok"
+        detail = (stderr or stdout).strip() or f"returncode={res.returncode}"
+        return False, detail
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _recover_host2_adb() -> Dict[str, Any]:
+    """Invoke dsm_update_monitor.ensure_host2_adb() to restore USB permissions, Host 2 ADB :5037, and tcp:9223."""
+    try:
+        res = dsm_update_monitor.ensure_host2_adb()
+        log.info(
+            "Host 2 ADB recovery finished: ok=%s device_online=%s forward_active=%s",
+            res.get("ok"),
+            res.get("device_online"),
+            res.get("forward_active"),
+        )
+        return res
+    except Exception as exc:
+        log.warning("Host 2 ADB recovery via ensure_host2_adb() failed: %s", exc)
+        return {"ok": False, "device_online": False, "forward_active": False, "error": str(exc)}
+
+
+def get_adb_command_prefix(auto_heal: bool = True) -> Tuple[List[str], str]:
+    """Resolve ADB command prefix, strictly targeting the Pixel 8 Pro (husky) via Host 2 USB, local USB, or configured PIXEL_WIFI_ADB."""
+    # 1. Try USB via Host 2 ADB server first (explicitly pinned to USB_SERIAL)
+    host2_ok, host2_reason = _check_host2_adb_device()
+    if host2_ok:
+        return [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "-s", USB_SERIAL], "usb"
 
     # 2. Check local connected devices ONLY if they match USB_SERIAL or WIFI_DEVICE (never hijack unrelated ADB devices like ApoloSign)
     try:
         res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
-        for line in res.stdout.splitlines():
-            if "	device" in line and not line.startswith("List"):
-                dev = line.split("	")[0].strip()
+        for line in (res.stdout or "").splitlines():
+            if "\tdevice" in line and not line.startswith("List"):
+                dev = line.split("\t")[0].strip()
                 if dev and (dev == USB_SERIAL or (WIFI_DEVICE and dev == WIFI_DEVICE)):
                     return [ADB_BIN, "-s", dev], "local"
     except Exception:
         pass
 
-    # 3. Try connecting to Wi-Fi device locally if configured
+    # 3. Self-heal Host 2 ADB (:5037) via ensure_host2_adb() when connection is refused or USB_SERIAL is missing
+    heal_state = _HOST2_HEAL_ATTEMPTED.get()
+    if auto_heal and (heal_state is None or not heal_state[0]):
+        log.warning(
+            "Host 2 ADB (:5037) unavailable or %s missing (%s); invoking ensure_host2_adb()",
+            USB_SERIAL,
+            host2_reason,
+        )
+        if heal_state is not None:
+            heal_state[0] = True
+        _recover_host2_adb()
+        host2_ok_after, _ = _check_host2_adb_device()
+        if host2_ok_after:
+            return [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "-s", USB_SERIAL], "usb"
+
+    # 4. Try connecting to Wi-Fi device locally if configured
     if WIFI_DEVICE:
         try:
             subprocess.run([ADB_BIN, "connect", WIFI_DEVICE], capture_output=True, text=True, timeout=3)
             res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
-            if f"{WIFI_DEVICE}	device" in res.stdout:
+            if f"{WIFI_DEVICE}\tdevice" in (res.stdout or ""):
                 return [ADB_BIN, "-s", WIFI_DEVICE], "local"
         except Exception:
             pass
@@ -209,12 +263,61 @@ def sleep_screen() -> bool:
     return _run_adb_keyevent(prefix, "223")
 
 
-def setup_cdp_forwarding() -> bool:
+def setup_cdp_forwarding(remove_existing: bool = False) -> bool:
     """Ensure ADB port forwarding for Chrome DevTools Protocol."""
     prefix, _ = get_adb_command_prefix()
+    if remove_existing:
+        rm_cmd = prefix + ["forward", "--remove", f"tcp:{CDP_PORT}"]
+        try:
+            subprocess.run(rm_cmd, capture_output=True, text=True, timeout=5)
+        except Exception as exc:
+            log.debug("Ignoring forward --remove error for tcp:%s: %s", CDP_PORT, exc)
     fwd_cmd = prefix + ["forward", f"tcp:{CDP_PORT}", "localabstract:chrome_devtools_remote"]
-    res = subprocess.run(fwd_cmd, capture_output=True, text=True, timeout=5)
-    return res.returncode == 0
+    try:
+        res = subprocess.run(fwd_cmd, capture_output=True, text=True, timeout=5)
+        return res.returncode == 0
+    except Exception as exc:
+        log.warning("ADB forward tcp:%s failed: %s", CDP_PORT, exc)
+        return False
+
+
+def force_stop_browsers(prefix: Optional[List[str]] = None) -> None:
+    """Force-stop both Chrome and Chrome Beta to clear wedged @chrome_devtools_remote sockets."""
+    if prefix is None:
+        prefix, _ = get_adb_command_prefix()
+    for pkg in CHROME_PACKAGES:
+        try:
+            subprocess.run(
+                prefix + ["shell", "am", "force-stop", pkg],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception as exc:
+            log.warning("Failed to force-stop %s: %s", pkg, exc)
+
+
+def probe_cdp_version(
+    cdp_host: str,
+    port: int = CDP_PORT,
+    timeout: float = CDP_PROBE_TIMEOUT_SEC,
+) -> bool:
+    """Probe http://<cdp_host>:<port>/json/version to confirm Chrome CDP is responsive."""
+    url = f"http://{cdp_host}:{port}/json/version"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return False
+            raw = resp.read()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            return isinstance(data, dict) and (
+                "webSocketDebuggerUrl" in data or "Browser" in data
+            )
+    except Exception as exc:
+        log.warning("CDP health probe %s failed: %s", url, exc)
+        return False
 
 
 def launch_chrome():
@@ -249,9 +352,17 @@ def launch_chrome_beta():
     time.sleep(1.5)
 
 
+def _launch_requested_browser(browser: str) -> None:
+    """Launch the requested mobile browser ('chrome' or 'chrome_beta')."""
+    if browser == "chrome_beta":
+        launch_chrome_beta()
+    else:
+        launch_chrome()
+
+
 @contextmanager
 def pixel_session(force: bool = False, browser: str = "chrome"):
-    """Context manager guaranteeing screen sleep and CDP cleanup on exit."""
+    """Context manager guaranteeing screen sleep and CDP recovery/cleanup on exit."""
     if browser not in ("chrome", "chrome_beta"):
         raise ValueError(f"Unsupported browser {browser!r}; expected 'chrome' or 'chrome_beta'.")
 
@@ -259,19 +370,49 @@ def pixel_session(force: bool = False, browser: str = "chrome"):
     if conflict and not force:
         raise RuntimeError(f"Printer conflict guard active: {msg}. Pass --force to override.")
 
-    prefix, transport = get_adb_command_prefix()
-    wake_and_unlock()
-    if browser == "chrome_beta":
-        launch_chrome_beta()
-    else:
-        launch_chrome()
-    setup_cdp_forwarding()
-
+    heal_state = [False]
+    token = _HOST2_HEAL_ATTEMPTED.set(heal_state)
     try:
+        prefix, transport = get_adb_command_prefix()
+        wake_and_unlock()
+        _launch_requested_browser(browser)
+        setup_cdp_forwarding()
+
         cdp_host = "127.0.0.1" if transport == "local" else HOST2_IP
+        if not probe_cdp_version(cdp_host):
+            log.warning(
+                "CDP health probe failed on http://%s:%s/json/version; forcing browser restart and ADB forward rebind",
+                cdp_host,
+                CDP_PORT,
+            )
+            force_stop_browsers(prefix=prefix)
+            _launch_requested_browser(browser)
+            setup_cdp_forwarding(remove_existing=True)
+
+            if not probe_cdp_version(cdp_host):
+                if not heal_state[0]:
+                    log.warning(
+                        "CDP still unreachable on http://%s:%s/json/version; falling back to ensure_host2_adb()",
+                        cdp_host,
+                        CDP_PORT,
+                    )
+                    heal_state[0] = True
+                    _recover_host2_adb()
+                    prefix, transport = get_adb_command_prefix()
+                    cdp_host = "127.0.0.1" if transport == "local" else HOST2_IP
+                    setup_cdp_forwarding(remove_existing=True)
+
+                if not probe_cdp_version(cdp_host):
+                    raise RuntimeError(
+                        f"Chrome CDP unreachable at http://{cdp_host}:{CDP_PORT}/json/version after recovery."
+                    )
+
         yield f"http://{cdp_host}:{CDP_PORT}"
     finally:
-        sleep_screen()
+        try:
+            sleep_screen()
+        finally:
+            _HOST2_HEAL_ATTEMPTED.reset(token)
 
 
 def close_extra_tabs(context, keep_page=None) -> int:
