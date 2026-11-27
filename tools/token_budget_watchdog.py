@@ -159,7 +159,7 @@ def query_zero_tokens(
 
 def query_ivy_tokens(start_ts: float, end_ts: float) -> Tuple[int, int]:
     """Query Ivy's token burn from Host 2 for the time window."""
-    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker"))
+    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker-nvme"))
     script = f"""
 import os, glob, json, time
 from datetime import datetime

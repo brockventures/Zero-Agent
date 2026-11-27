@@ -14,11 +14,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 CURRENT_DIR = Path(__file__).resolve().parent.parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+if str(CURRENT_DIR) in sys.path:
+    sys.path.remove(str(CURRENT_DIR))
+sys.path.insert(0, str(CURRENT_DIR))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.append(str(WORKSPACE))
+if "tools" in sys.modules and hasattr(sys.modules["tools"], "__path__"):
+    local_tools = str(CURRENT_DIR / "tools")
+    if local_tools in sys.modules["tools"].__path__:
+        sys.modules["tools"].__path__.remove(local_tools)
+    sys.modules["tools"].__path__.insert(0, local_tools)
 
 import tools.zero_health_server as zhealth
 
@@ -264,10 +270,12 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertEqual(payload1, payload2)
 
     def test_ivy_probe_code_defaults_to_volume2_with_fallbacks(self):
-        v2_ivy = os.path.join(os.sep, "volume2", "docker", "discord-ivy-agent")
+        v2_ivy = os.path.join(os.sep, "volume2", "docker-nvme", "discord-ivy-agent")
+        v2_legacy_ivy = os.path.join(os.sep, "volume2", "docker", "discord-ivy-agent")
         v1_ivy = os.path.join(os.sep, "volume1", "docker", "discord-ivy-agent")
         self.assertIn("NAS_HOST_2_DOCKER_ROOT", zhealth.IVY_PROBE_CODE)
         self.assertIn('"volume2"', zhealth.IVY_PROBE_CODE)
+        self.assertIn('"docker-nvme"', zhealth.IVY_PROBE_CODE)
         self.assertIn("/opt/docker/discord-ivy-agent", zhealth.IVY_PROBE_CODE)
 
         def _run_probe(existing_paths, env_overrides=None):
@@ -292,7 +300,7 @@ class TestZeroHealthServer(unittest.TestCase):
                 exec(compile(zhealth.IVY_PROBE_CODE, "<ivy_probe>", "exec"), ns)  # noqa: S102
             return ns["ivy_dir"], json.loads(buf.getvalue())
 
-        # 1. Defaults to Volume 2 when present and no env vars set
+        # 1. Defaults to Volume 2 docker-nvme when present and no env vars set
         ivy_dir_v2, out_v2 = _run_probe({v2_ivy})
         self.assertEqual(ivy_dir_v2, v2_ivy)
         self.assertEqual(out_v2["container_status"], "offline")
@@ -302,6 +310,10 @@ class TestZeroHealthServer(unittest.TestCase):
         custom_ivy = os.path.join(custom_root, "discord-ivy-agent")
         ivy_dir_custom, _ = _run_probe({custom_ivy}, {"NAS_HOST_2_DOCKER_ROOT": custom_root})
         self.assertEqual(ivy_dir_custom, custom_ivy)
+
+        # 2b. Falls back to legacy Volume 2 docker when docker-nvme is absent
+        ivy_dir_legacy, _ = _run_probe({v2_legacy_ivy})
+        self.assertEqual(ivy_dir_legacy, v2_legacy_ivy)
 
         # 3. Falls back to Volume 1 when Volume 2 is absent
         ivy_dir_v1, _ = _run_probe({v1_ivy})

@@ -87,7 +87,7 @@ try:
 except Exception as e:
     res["container_status"] = "offline"
 
-_default_h2_root = os.path.join(os.sep, "volume2", "docker")
+_default_h2_root = os.path.join(os.sep, "volume2", "docker-nvme")
 _default_h1_root = os.path.join(os.sep, "volume1", "docker")
 ivy_dir = os.environ.get(
     "IVY_AGENT_DIR",
@@ -96,6 +96,7 @@ ivy_dir = os.environ.get(
 if not os.path.exists(ivy_dir):
     for candidate in [
         os.path.join(_default_h2_root, "discord-ivy-agent"),
+        os.path.join(os.sep, "volume2", "docker", "discord-ivy-agent"),
         os.path.join(os.environ.get("NAS_DOCKER_ROOT", _default_h1_root), "discord-ivy-agent"),
         os.path.join(_default_h1_root, "discord-ivy-agent"),
         "/opt/docker/discord-ivy-agent",

@@ -60,7 +60,7 @@ def _run_host2_python(script_str: str) -> Optional[Dict[str, Any]]:
 
 def get_ivy_sessions_list() -> List[Dict[str, Any]]:
     """Return all available Ivy sessions, sorted by recency."""
-    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker"))
+    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker-nvme"))
     script = f"""
 import os, json, time
 
@@ -120,7 +120,7 @@ def get_ivy_telemetry(compacted_id: Optional[str] = None) -> Dict[str, Any]:
         return _TELEMETRY_CACHE["payload"]
 
     escaped_compacted_id = repr(compacted_id)
-    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker"))
+    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker-nvme"))
 
     script = f"""
 import os, json, time, glob, calendar

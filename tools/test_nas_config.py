@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001
 """Unit tests for tools/nas_config.py SSH ControlMaster persistence, server-side timeout, and remote du guards."""
 
 import base64
@@ -274,7 +275,7 @@ def test_validate_remote_ssh_command_blocks_unbounded_du_direct_and_base64(monke
 
 
 def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
-    """Verify Host 1 compose root defaults to Volume 1, Host 1 NVMe defaults to docker-nvme on Volume 2, and Host 2 defaults to Volume 2 docker."""
+    """Verify Host 1 compose root defaults to Volume 1, Host 1 NVMe defaults to docker-nvme on Volume 2, and Host 2 defaults to Volume 2 docker-nvme."""
     monkeypatch.delenv("NAS_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_1_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_1_NVME_DOCKER_ROOT", raising=False)
@@ -284,7 +285,8 @@ def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
     reloaded = _load_local_module("nas_config")
     expected_h1 = posixpath.join(VOL1_ROOT, "docker")
     expected_h1_nvme = posixpath.join(VOL2_ROOT, "docker-nvme")
-    expected_h2 = posixpath.join(VOL2_ROOT, "docker")
+    expected_h2 = posixpath.join(VOL2_ROOT, "docker-nvme")
+    legacy_h2 = posixpath.join(VOL2_ROOT, "docker")
     expected_ha = posixpath.join(expected_h1_nvme, "homeassistant", "config")
     assert reloaded.HOST_1_DOCKER_ROOT == expected_h1
     assert reloaded.DOCKER_ROOT == expected_h1
@@ -301,6 +303,9 @@ def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
     blocked, reason = reloaded.validate_remote_ssh_command(f"rm -rf {expected_h2}")
     assert blocked is False
     assert "NAS SSH Command Filter Blocked" in reason
+    blocked_legacy, reason_legacy = reloaded.validate_remote_ssh_command(f"rm -rf {legacy_h2}")
+    assert blocked_legacy is False
+    assert "NAS SSH Command Filter Blocked" in reason_legacy
 
 
 def test_resolve_nas_config_env_and_secrets_precedence_with_empty_fallback(monkeypatch, tmp_path):

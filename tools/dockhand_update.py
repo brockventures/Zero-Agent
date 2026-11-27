@@ -19,7 +19,7 @@ except ImportError:
     from nas_config import resolve_nas_config
 
 DOCKER_ROOT = getattr(nas_config, "DOCKER_ROOT", os.path.join("/volume1", "docker"))
-HOST_2_DOCKER_ROOT = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join("/volume2", "docker"))
+HOST_2_DOCKER_ROOT = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join("/volume2", "docker-nvme"))
 
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 

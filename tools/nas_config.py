@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: BLE001, PIE810, PLW1510, RUF013, S110, SIM103, UP006, UP035
+# ruff: noqa: BLE001, EXE001, PIE810, PLW1510, RUF013, S110, SIM103, UP006, UP035
 """
 nas_config.py — Canonical NAS topology resolver and SSH configuration for Zero.
 
@@ -23,9 +23,13 @@ from pathlib import Path
 from typing import Tuple
 
 # Ensure workspace paths are present in sys.path
-for _path in [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent), "/workspace", "/workspace/tools"]:
+for _path in ["/workspace", "/workspace/tools"]:
     if _path not in sys.path:
-        sys.path.insert(0, _path)
+        sys.path.append(_path)
+for _path in [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parent.parent)]:
+    if _path in sys.path:
+        sys.path.remove(_path)
+    sys.path.insert(0, _path)
 
 def _get_default_ssh_port() -> str:
     # Custom Synology DSM SSH port. Calculated dynamically to avoid literal patterns in scanners.
@@ -142,7 +146,7 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     h2 = host_2 or "127.0.0.1"
     default_h1_docker = posixpath.join("/volume1", "docker")
     default_h1_nvme_docker = posixpath.join("/volume2", "docker-nvme")
-    default_h2_docker = posixpath.join("/volume2", "docker")
+    default_h2_docker = posixpath.join("/volume2", "docker-nvme")
     host_1_docker_root = (
         env_h1_docker
         or env_docker
@@ -204,7 +208,7 @@ HA_CONFIG_ROOT = (
     or posixpath.join(HOST_1_NVME_DOCKER_ROOT, "homeassistant", "config")
 ).replace("\\", "/")
 HOST_2_DOCKER_ROOT = (
-    os.environ.get("NAS_HOST_2_DOCKER_ROOT") or posixpath.join("/volume2", "docker")
+    os.environ.get("NAS_HOST_2_DOCKER_ROOT") or posixpath.join("/volume2", "docker-nvme")
 ).replace("\\", "/")
 
 
@@ -540,7 +544,7 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
         os.environ.get("NAS_HOST_1_NVME_DOCKER_ROOT") or HOST_1_NVME_DOCKER_ROOT or default_vol2_docker_nvme
     ).strip()
     configured_h2_docker_root = (
-        os.environ.get("NAS_HOST_2_DOCKER_ROOT") or HOST_2_DOCKER_ROOT or default_vol2_docker
+        os.environ.get("NAS_HOST_2_DOCKER_ROOT") or HOST_2_DOCKER_ROOT or default_vol2_docker_nvme
     ).strip()
     protected_top_dirs = {
         posixpath.normpath(default_vol_docker),
