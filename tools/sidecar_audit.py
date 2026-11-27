@@ -12,7 +12,6 @@ Ensures all scheduled sidecars follow the 5-layer lifecycle protocol:
 
 import argparse
 import ast
-import importlib.util
 import json
 import os
 import re
@@ -40,6 +39,7 @@ KNOWN_ALIASES = {
     "ev9": "ev9_monitor",
     "ha_battery": "ha_battery_check",
     "ha_update_check": "ha_update_check",
+    "hdd": "hdd_monitor",
     "heartbeat": "heartbeat_sweep",
     "host1_backup": "host1_backup",
     "host2_backup": "host2_backup",
@@ -131,23 +131,28 @@ def get_sidecars_py_actions() -> set[str]:
                         if isinstance(op, ast.Eq):
                             if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
                                 actions.add(comparator.value)
-                        elif isinstance(op, ast.In):
-                            if isinstance(comparator, (ast.Tuple, ast.List, ast.Set)):
-                                for elt in comparator.elts:
-                                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                                        actions.add(elt.value)
+                        elif isinstance(op, ast.In) and isinstance(comparator, (ast.Tuple, ast.List, ast.Set)):
+                            for elt in comparator.elts:
+                                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                    actions.add(elt.value)
                 for op, comparator in zip(node.ops, node.comparators):
-                    if isinstance(comparator, ast.Name) and comparator.id == "action":
-                        if isinstance(op, ast.Eq):
-                            if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
-                                actions.add(node.left.value)
-            elif isinstance(node, ast.Match):
-                if isinstance(node.subject, ast.Name) and node.subject.id == "action":
-                    for case in node.cases:
-                        if isinstance(case.pattern, ast.MatchValue) and isinstance(case.pattern.value, ast.Constant):
-                            if isinstance(case.pattern.value.value, str):
-                                actions.add(str(case.pattern.value.value))
-    except Exception as e:
+                    if (
+                        isinstance(comparator, ast.Name)
+                        and comparator.id == "action"
+                        and isinstance(op, ast.Eq)
+                        and isinstance(node.left, ast.Constant)
+                        and isinstance(node.left.value, str)
+                    ):
+                        actions.add(node.left.value)
+            elif isinstance(node, ast.Match) and isinstance(node.subject, ast.Name) and node.subject.id == "action":
+                for case in node.cases:
+                    if (
+                        isinstance(case.pattern, ast.MatchValue)
+                        and isinstance(case.pattern.value, ast.Constant)
+                        and isinstance(case.pattern.value.value, str)
+                    ):
+                        actions.add(str(case.pattern.value.value))
+    except Exception as e:  # noqa: BLE001
         print(f"[Auditor] Error reading sidecars.py AST: {e}", file=sys.stderr)
     return actions
 
@@ -170,10 +175,9 @@ def get_bridge_triggers() -> set[str]:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Dict):
                     for k in node.keys:
-                        if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                            if k.value.startswith("!") or k.value.startswith("/"):
-                                triggers.add(k.value.lstrip("!/"))
-        except Exception as e:
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str) and (k.value.startswith("!") or k.value.startswith("/")):
+                            triggers.add(k.value.lstrip("!/"))
+        except Exception as e:  # noqa: BLE001
             print(f"[Auditor] Error reading {target_file.name} AST: {e}", file=sys.stderr)
     return triggers
 
@@ -187,7 +191,7 @@ def audit_sidecars(verbose: bool = False, check_orphans: bool = True) -> tuple[b
     try:
         with open(SCHEDULE_FILE, "r") as f:
             jobs = json.load(f)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"❌ Malformed schedule.json: {e}")
         return False, [], [], []
 
@@ -275,9 +279,8 @@ def audit_sidecars(verbose: bool = False, check_orphans: bool = True) -> tuple[b
 
         # 5. Sidecars.py Hook Check
         sidecar_act = extract_sidecar_action(prompt)
-        if sidecar_act:
-            if sidecar_act not in sidecars_actions:
-                warnings.append(f"Action '{sidecar_act}' not registered in tools/sidecars.py CLI dispatcher")
+        if sidecar_act and sidecar_act not in sidecars_actions:
+            warnings.append(f"Action '{sidecar_act}' not registered in tools/sidecars.py CLI dispatcher")
 
         # 6. Discord Trigger Hook Check
         trigger_match = None
@@ -373,7 +376,7 @@ def audit_sidecars(verbose: bool = False, check_orphans: bool = True) -> tuple[b
     return not has_critical_failures, results, collision_warnings, orphan_warnings
 
 
-def print_audit_report(results: list[dict], collisions: list[str], orphans: list[str] = None, verbose: bool = False):
+def print_audit_report(results: list[dict], collisions: list[str], orphans: list[str] | None = None, verbose: bool = False):
     """Print clean terminal audit summary."""
     now_pt = datetime.now(tz=PT).strftime("%Y-%m-%d %I:%M %p PT")
     print(f"\n📋 **Sidecar Schedule & Lifecycle Audit Report** ({now_pt})\n")
@@ -481,7 +484,8 @@ def test_job(job_id: str, timeout: int = 45):
             [sys.executable, str(script_path)] + cmd_args,
             capture_output=True,
             text=True,
-            timeout=timeout
+            timeout=timeout,
+            check=False,
         )
         duration = time.time() - start
         if res.returncode == 0:
@@ -497,7 +501,7 @@ def test_job(job_id: str, timeout: int = 45):
     except subprocess.TimeoutExpired:
         print(f"🔴 Timed out after {timeout}s!")
         return 124
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"🔴 Execution error: {e}")
         return 1
 
@@ -510,7 +514,7 @@ def main():
     audit_parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose debugging info")
     audit_parser.add_argument("--no-orphans", action="store_true", help="Skip reverse orphan detection")
 
-    matrix_parser = subparsers.add_parser("matrix", help="Show 24-hour visual schedule breakdown")
+    subparsers.add_parser("matrix", help="Show 24-hour visual schedule breakdown")
 
     test_parser = subparsers.add_parser("test", help="Test-run a specific sidecar by id")
     test_parser.add_argument("job_id", help="ID of job to test")

@@ -1299,6 +1299,47 @@ def run_ev9_monitor(force_digest: bool = False) -> tuple[bool, str, str | None]:
         return False, f"⚠️ **EV9 Monitor Exception**: {e}", None
 
 # --------------------------------------------------------------------------
+# 6b. Weekly Enterprise HDD Price Monitor (#homelab)
+# --------------------------------------------------------------------------
+def run_hdd_monitor(
+    force_digest: bool = False,
+    sunday_only: bool = False,
+    post_discord: bool = False,
+    save: bool = True,
+) -> tuple[bool, str, dict | None]:
+    """Capture 16TB-24TB CMR enterprise HDD prices and format #homelab digest."""
+    try:
+        try:
+            from tools import hdd_monitor
+        except ImportError:
+            import hdd_monitor
+
+        res = hdd_monitor.run_capture(save=save)
+        if not res.get("ok"):
+            return False, f"⚠️ **HDD Monitor Error**: {res.get('error', 'Unknown error')}", res
+
+        now_pt = datetime.now(PT)
+        if sunday_only and not force_digest and now_pt.weekday() != 6:
+            return True, "", res
+
+        digest = res.get("digest", "")
+        if post_discord and digest:
+            try:
+                from tools.outbox import queue_outbox_message
+
+                queue_outbox_message(
+                    str(hdd_monitor.HOMELAB_CHANNEL_ID),
+                    digest,
+                    source_turn="hdd_monitor",
+                )
+            except Exception as post_err:
+                log.warning("Failed to queue HDD monitor digest to #homelab: %s", post_err)
+
+        return True, digest or "💾 **HDD Monitor**: Weekly capture completed (no new digest).", res
+    except Exception as e:
+        return False, f"⚠️ **HDD Monitor Exception**: {e}", None
+
+# --------------------------------------------------------------------------
 # 7. Marketing Email Sweep (Biweekly Sunday)
 # --------------------------------------------------------------------------
 MARKETING_STATE_FILE = "/workspace/data/marketing_sweep_last_run"
@@ -3077,6 +3118,20 @@ if __name__ == "__main__":
             print(rep)
         if plot:
             print(f"\n[Trend plot generated: {plot}]")
+    elif action in ("hdd", "hdd_monitor"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        post = "--post" in sys.argv or "-p" in sys.argv
+        no_save = "--dry-run" in sys.argv or "--no-save" in sys.argv
+        ok, rep, _ = run_sidecar_job(
+            "hdd",
+            "Enterprise HDD Price Monitor",
+            run_hdd_monitor,
+            force_digest=force,
+            post_discord=post,
+            save=not no_save,
+        )
+        if rep:
+            print(rep)
     elif action == "marketing":
         ok, rep, _ = run_sidecar_job("marketing", "Marketing Email Sweep", run_marketing_sweep, force=True)
         print(rep)
