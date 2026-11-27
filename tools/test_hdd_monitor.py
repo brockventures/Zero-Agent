@@ -53,26 +53,26 @@ def test_compute_price_per_tb_and_tiers():
 def test_normalize_listing_filters_non_target_drives_and_accessories():
     good_iw = hm.normalize_listing(
         {
-            "title": "Seagate IronWolf Pro 20TB Enterprise NAS Internal HDD ST20000NT001",
-            "price": "$349.99",
+            "title": "Seagate IronWolf Pro 16TB Enterprise NAS Internal HDD ST16000NT001",
+            "price": "$279.99",
             "url": "https://www.amazon.com/dp/B0B94MF4LP",
         },
         source="Amazon",
     )
     assert good_iw is not None
     assert good_iw["family"] == "IronWolf Pro"
-    assert good_iw["capacity_tb"] == 20
-    assert good_iw["model"] == "ST20000NT001"
-    assert good_iw["price"] == 349.99
+    assert good_iw["capacity_tb"] == 16
+    assert good_iw["model"] == "ST16000NT001"
+    assert good_iw["price"] == 279.99
     assert good_iw["price_per_tb"] == 17.5
     assert good_iw["tier"] == "good"
     assert good_iw["condition"] == "New"
 
     recert_exos = hm.normalize_listing(
         {
-            "title": "Seagate Exos X20 20TB ST20000NM007D Manufacturer Recertified SATA",
-            "price": 259.99,
-            "url": "https://serverpartdeals.com/products/exos-x20",
+            "title": "Seagate Exos X18 16TB ST16000NM000J Manufacturer Recertified SATA",
+            "price": 207.99,
+            "url": "https://serverpartdeals.com/products/exos-x18-16tb",
         },
         source="ServerPartDeals",
     )
@@ -84,23 +84,24 @@ def test_normalize_listing_filters_non_target_drives_and_accessories():
 
     wd_red_pro = hm.normalize_listing(
         {
-            "title": "Western Digital 18TB WD Red Pro NAS Internal Hard Drive WD181KFGX",
-            "price": "$359.99",
+            "title": "Western Digital 16TB WD Red Pro NAS Internal Hard Drive WD161KFGX",
+            "price": "$319.99",
             "url": "https://www.bhphotovideo.com/c/product/123",
         },
         source="B&H",
     )
     assert wd_red_pro is not None
     assert wd_red_pro["family"] == "WD Red Pro"
-    assert wd_red_pro["capacity_tb"] == 18
-    assert wd_red_pro["model"] == "WD181KFGX"
+    assert wd_red_pro["capacity_tb"] == 16
+    assert wd_red_pro["model"] == "WD161KFGX"
 
-    # Reject non-Pro, out-of-range capacities, accessories, and multi-packs
+    # Reject non-Pro, non-16TB capacities, accessories, and multi-packs
     assert hm.normalize_listing({"title": "Seagate IronWolf 16TB NAS HDD", "price": "$280"}, "Amazon") is None
     assert hm.normalize_listing({"title": "WD Red Plus 16TB NAS Drive", "price": "$290"}, "Amazon") is None
     assert hm.normalize_listing({"title": "Seagate IronWolf Pro 8TB NAS HDD", "price": "$210"}, "Amazon") is None
-    assert hm.normalize_listing({"title": "Seagate IronWolf Pro 20TB 2-Pack Bundle", "price": "$700"}, "Amazon") is None
-    assert hm.normalize_listing({"title": "20TB IronWolf Pro USB Enclosure Case", "price": "$150"}, "Amazon") is None
+    assert hm.normalize_listing({"title": "Seagate IronWolf Pro 20TB NAS HDD", "price": "$349"}, "Amazon") is None
+    assert hm.normalize_listing({"title": "Seagate IronWolf Pro 16TB 2-Pack Bundle", "price": "$560"}, "Amazon") is None
+    assert hm.normalize_listing({"title": "16TB IronWolf Pro USB Enclosure Case", "price": "$150"}, "Amazon") is None
 
 
 # --------------------------------------------------------------------------
@@ -116,8 +117,8 @@ def test_fetch_amazon_listings_mocked_serpapi():
                 "products": [
                     {
                         "asin": "B0B94MF4LP",
-                        "title": "Seagate IronWolf Pro 20TB Enterprise NAS HDD ST20000NT001",
-                        "price": "$359.99",
+                        "title": "Seagate IronWolf Pro 16TB Enterprise NAS HDD ST16000NT001",
+                        "price": "$289.99",
                         "link": "https://www.amazon.com/dp/B0B94MF4LP?ref=tracking",
                     },
                     {
@@ -209,9 +210,9 @@ def test_amazon_failure_still_succeeds_with_secondary_source(tmp_path):
     spd_payload = {
         "products": [
             {
-                "title": "Seagate Exos X20 20TB ST20000NM007D Manufacturer Recertified",
-                "handle": "seagate-exos-x20-20tb",
-                "variants": [{"price": "269.99", "available": True}],
+                "title": "Seagate Exos X18 16TB ST16000NM000J Manufacturer Recertified",
+                "handle": "seagate-exos-x18-16tb",
+                "variants": [{"price": "219.99", "available": True}],
             }
         ]
     }
@@ -221,9 +222,9 @@ def test_amazon_failure_still_succeeds_with_secondary_source(tmp_path):
     {"@type": "ItemList", "itemListElement": [
       {"@type": "ListItem", "item": {
         "@type": "Product",
-        "name": "WD Red Pro 20TB NAS Internal Hard Drive WD202KFGX",
+        "name": "WD Red Pro 16TB NAS Internal Hard Drive WD161KFGX",
         "url": "/c/product/1800001",
-        "offers": {"@type": "Offer", "price": "359.00"}
+        "offers": {"@type": "Offer", "price": "299.00"}
       }}
     ]}
     </script>
@@ -288,7 +289,7 @@ def test_sqlite_price_history_and_historical_lows(tmp_path):
         ),
         hm.normalize_listing(
             {
-                "title": "Seagate Exos X20 20TB ST20000NM007D",
+                "title": "Seagate Exos X18 16TB ST16000NM000J",
                 "price": 340.0,
                 "url": "https://www.amazon.com/dp/B0TEST20",
             },
@@ -306,7 +307,7 @@ def test_sqlite_price_history_and_historical_lows(tmp_path):
         ),
         hm.normalize_listing(
             {
-                "title": "Seagate Exos X20 20TB ST20000NM007D",
+                "title": "Seagate Exos X18 16TB ST16000NM000J",
                 "price": 360.0,
                 "url": "https://www.amazon.com/dp/B0TEST20",
             },
@@ -320,9 +321,9 @@ def test_sqlite_price_history_and_historical_lows(tmp_path):
 
     prior_lows = hm.get_historical_lows(db_path=db_path, exclude_date="2026-11-22")
     assert prior_lows[("IronWolf Pro", 16)]["min_price"] == 304.0
-    assert prior_lows[("Exos", 20)]["min_price"] == 340.0
+    assert prior_lows[("Exos", 16)]["min_price"] == 340.0
 
-    # Week 2 run sees new ATL on 16TB IronWolf Pro ($272 < $304) and higher price on 20TB Exos ($360 > $340)
+    # Week 2 run sees new ATL on 16TB IronWolf Pro ($272 < $304) and higher price on 16TB Exos ($360 > $340)
     sources_w2 = (("Amazon", lambda: week2),)
     res = hm.run_capture(
         save=True,
@@ -337,7 +338,7 @@ def test_sqlite_price_history_and_historical_lows(tmp_path):
 
     all_lows = hm.get_historical_lows(db_path=db_path)
     assert all_lows[("IronWolf Pro", 16)]["min_price"] == 272.0
-    assert all_lows[("Exos", 20)]["min_price"] == 340.0
+    assert all_lows[("Exos", 16)]["min_price"] == 340.0
 
     hist = hm.get_price_history(family="IronWolf Pro", capacity_tb=16, db_path=db_path)
     assert len(hist) == 2
@@ -353,7 +354,7 @@ def test_sqlite_price_history_and_historical_lows(tmp_path):
 def test_discord_digest_mobile_safe_and_under_1900_chars():
     listings = []
     idx = 0
-    for cap in (16, 18, 20, 22, 24):
+    for cap in (16,):
         for fam in ("IronWolf Pro", "Exos", "WD Red Pro"):
             idx += 1
             price = round(cap * (14.25 if idx % 3 == 0 else 17.5), 2)

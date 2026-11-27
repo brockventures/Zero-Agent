@@ -43,8 +43,8 @@ PT = ZoneInfo("America/Los_Angeles")
 DB_PATH = Path(os.environ.get("HDD_PRICES_DB", "/workspace/data/hdd_prices.db"))
 HOMELAB_CHANNEL_ID = 1544955535722545253
 
-TARGET_CAPACITIES = (16, 18, 20, 22, 24)
-SWEET_SPOT_CAPACITIES = (16, 18, 20)
+TARGET_CAPACITIES = (16,)
+SWEET_SPOT_CAPACITIES = (16,)
 TARGET_FAMILIES = ("IronWolf Pro", "Exos", "WD Red Pro")
 
 GOOD_PRICE_PER_TB = 18.0
@@ -61,12 +61,12 @@ USER_AGENT = (
 )
 
 AMAZON_QUERIES = (
-    "Seagate IronWolf Pro 16TB 20TB",
-    "Seagate Exos 16TB 20TB 24TB",
-    "WD Red Pro 16TB 20TB 24TB",
+    "Seagate IronWolf Pro 16TB",
+    "Seagate Exos 16TB",
+    "WD Red Pro 16TB",
 )
 
-_CAPACITY_RE = re.compile(r"\b(16|18|20|22|24)\s*TB\b", re.IGNORECASE)
+_CAPACITY_RE = re.compile(r"\b(16)\s*TB\b", re.IGNORECASE)
 _MODEL_RE = re.compile(r"\b(ST\d{4,5}[A-Z0-9]{2,6}|WD\d{3,4}[A-Z0-9]{3,6})\b", re.IGNORECASE)
 _PRICE_RE = re.compile(r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)")
 _JSON_LD_RE = re.compile(
@@ -392,8 +392,8 @@ def fetch_bh_listings() -> list[dict[str, Any]]:
 
 
 def fetch_newegg_listings() -> list[dict[str, Any]]:
-    """Query Newegg search for 16TB-24TB IronWolf Pro / Exos / WD Red Pro."""
-    url = "https://www.newegg.com/p/pl?d=Seagate+IronWolf+Pro+Exos+WD+Red+Pro+16TB+20TB"
+    """Query Newegg search for 16TB IronWolf Pro / Exos / WD Red Pro."""
+    url = "https://www.newegg.com/p/pl?d=Seagate+IronWolf+Pro+Exos+WD+Red+Pro+16TB"
     resp = requests.get(
         url,
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
@@ -755,7 +755,7 @@ def format_digest(
     footer = _format_source_footer(source_status)
 
     if not listings:
-        msg = f"{header}\n\n⚠️ No matching 16TB-24TB CMR drives found this run.\n\n{footer}"
+        msg = f"{header}\n\n⚠️ No matching 16TB CMR drives found this run.\n\n{footer}"
         return msg[:max_chars]
 
     target_buys = [x for x in listings if x["price_per_tb"] <= TARGET_BUY_PER_TB]
@@ -783,7 +783,7 @@ def format_digest(
             f"⏳ **No deals <= ${GOOD_PRICE_PER_TB:.0f}/TB yet** — tracking cheapest options below:"
         )
 
-    market_lines = ["📊 **Best Observed by Model (16TB-20TB Sweet Spot First)**"]
+    market_lines = ["📊 **Best Observed 16TB Models**"]
     shown_ids = {x["id"] for x in (target_buys[:4] + good_deals[:4])}
     remaining_slots = [x for x in best_slots if x["id"] not in shown_ids]
     if not remaining_slots:
