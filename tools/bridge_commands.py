@@ -392,6 +392,28 @@ async def execute_bridge_reload(
         except Exception as se:
             print(f"[Bridge] Notice checking /app sync: {se}")
 
+        # Clear auto-exported NAS path env vars (not pinned in PID 1 container env)
+        # so in-place execv reloads pick up updated nas_config.py defaults cleanly.
+        try:
+            _p1_keys: set[str] = set()
+            _p1_env_path = Path("/proc/1/environ")
+            if _p1_env_path.exists():
+                for _entry in _p1_env_path.read_bytes().decode("utf-8", errors="ignore").split("\0"):
+                    if "=" in _entry:
+                        _p1_keys.add(_entry.split("=", 1)[0])
+            for _nas_key in (
+                "NAS_DOCKER_ROOT",
+                "NAS_HOST_1_DOCKER_ROOT",
+                "NAS_HOST_1_NVME_DOCKER_ROOT",
+                "NAS_HA_CONFIG_ROOT",
+                "NAS_HOST_2_DOCKER_ROOT",
+                "NAS_HOST_2_NAME",
+            ):
+                if _nas_key not in _p1_keys:
+                    os.environ.pop(_nas_key, None)
+        except Exception as _env_err:
+            print(f"[Bridge] Notice clearing cached NAS env vars before reload: {_env_err}")
+
         os.execv(sys.executable, [sys.executable] + sys.argv)
     finally:
         _reload_in_progress = False
