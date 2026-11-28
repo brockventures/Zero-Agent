@@ -27,10 +27,10 @@ for _p in ["/workspace", "/workspace/tools"]:
         sys.path.insert(0, _p)
 
 try:
-    from tools.nas_config import DOCKER_ROOT, resolve_nas_config
+    from tools.nas_config import resolve_nas_config
     from tools.nas_config import run_ssh as _nas_run_ssh
 except ImportError:
-    from nas_config import DOCKER_ROOT, resolve_nas_config
+    from nas_config import resolve_nas_config
     from nas_config import run_ssh as _nas_run_ssh
 
 HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
@@ -132,7 +132,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
     dest_tar = f"/volumeUSB1/usbshare/backups/docker-appdata/appdata_critical_{ts}.tar.gz"
 
     # 1. Copy root compose stack
-    cmd_cp = f"cp '{DOCKER_ROOT}/appdata/docker-compose.yml' '{dest_compose}'"
+    cmd_cp = f"cp '{APPDATA_NVME_ROOT}/docker-compose.yml' '{dest_compose}'"
     code_cp, _, stderr_cp = run_ssh(cmd_cp, timeout=30)
     if code_cp != 0:
         run_ssh(f"rm -f '{dest_compose}'")

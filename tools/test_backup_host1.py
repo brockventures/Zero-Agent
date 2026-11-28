@@ -7,6 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
+try:
+    from tools.nas_config import DOCKER_ROOT
+except ImportError:
+    from nas_config import DOCKER_ROOT
+
 _TOOLS_DIR = Path(__file__).resolve().parent
 
 
@@ -509,12 +514,12 @@ def test_backup_docker_appdata_success():
     assert msg == f"docker-appdata -> {dest_compose} & {dest_tar}"
 
     cp_cmd, cp_timeout = calls[0]
-    assert cp_cmd == f"cp '{backup_host1.DOCKER_ROOT}/appdata/docker-compose.yml' '{dest_compose}'"
+    assert cp_cmd == f"cp '{backup_host1.APPDATA_NVME_ROOT}/docker-compose.yml' '{dest_compose}'"
     assert cp_timeout == 30
 
     ckpt_cmd, ckpt_timeout = calls[1]
     assert ckpt_timeout == 30
-    assert f"'{backup_host1.DOCKER_ROOT}/appdata/dockhand/db/dockhand.db'" not in ckpt_cmd
+    assert f"'{DOCKER_ROOT}/appdata/dockhand/db/dockhand.db'" not in ckpt_cmd
     for db_path in (
         "'/volume2/docker-nvme/appdata/dockhand/db/dockhand.db'",
         "'/volume2/docker-nvme/appdata/seerr/db/db.sqlite3'",
@@ -548,7 +553,7 @@ def test_backup_docker_appdata_success():
         "--exclude='covers'",
     ):
         assert excl in tar_cmd
-    assert f"-C '{backup_host1.DOCKER_ROOT}/appdata' dockhand" not in tar_cmd
+    assert f"-C '{DOCKER_ROOT}/appdata' dockhand" not in tar_cmd
     expected_members = (
         "-C '/volume2/docker-nvme/appdata' "
         "maintainerr seerr tautulli bazarr dockhand calibre-web-automated shelfmark "

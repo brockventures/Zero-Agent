@@ -38,8 +38,8 @@ for _p in [
 try:
     from tools import nas_config
     from tools.nas_config import (
-        DOCKER_ROOT,
         HOST_1_IP,
+        HOST_1_NVME_DOCKER_ROOT,
         HOST_2_DOCKER_ROOT,
         HOST_2_IP,
         run_ssh,
@@ -47,8 +47,8 @@ try:
 except ImportError:
     import nas_config  # type: ignore
     from nas_config import (  # type: ignore
-        DOCKER_ROOT,
         HOST_1_IP,
+        HOST_1_NVME_DOCKER_ROOT,
         HOST_2_DOCKER_ROOT,
         HOST_2_IP,
         run_ssh,
@@ -68,7 +68,7 @@ POSTGRES_TARGETS: dict[str, dict[str, str]] = {
         "label": "Host 1 Arr DB",
         "host_attr": "HOST_1_IP",
         "container": "postgres-arr",
-        "compose_dir": os.path.join(DOCKER_ROOT, "appdata"),
+        "compose_dir": os.path.join(HOST_1_NVME_DOCKER_ROOT, "appdata"),
         "service": "postgres-arr",
         "tag": "16-alpine",
         "pg_user": "postgres",

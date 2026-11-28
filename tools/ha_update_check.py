@@ -10,10 +10,14 @@ for _p in ["/workspace", "/workspace/tools"]:
         sys.path.append(_p)
 
 try:
-    from tools.nas_config import DOCKER_ROOT, resolve_nas_config
+    from tools.nas_config import (
+        DOCKER_ROOT,
+        HOST_1_NVME_DOCKER_ROOT,
+        resolve_nas_config,
+    )
     from tools.nas_config import run_ssh as _nas_run_ssh
 except ImportError:
-    from nas_config import DOCKER_ROOT, resolve_nas_config
+    from nas_config import DOCKER_ROOT, HOST_1_NVME_DOCKER_ROOT, resolve_nas_config
     from nas_config import run_ssh as _nas_run_ssh
 
 HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
@@ -166,11 +170,11 @@ def perform_upgrade(target_service: str = "all"):
     print(f"\n2. Upgrading Home Assistant Core to `v{latest_ha}`...")
     # Update compose file image tag
     run_ssh(
-        f"sed -i -E 's|image: homeassistant/home-assistant:.*|image: homeassistant/home-assistant:{latest_ha}|g' '{DOCKER_ROOT}/docker-compose.yml'"
+        f"sed -i -E 's|image: homeassistant/home-assistant:.*|image: homeassistant/home-assistant:{latest_ha}|g' '{HOST_1_NVME_DOCKER_ROOT}/docker-compose.yml'"
     )
 
     # Pull and recreate
-    run_ssh(f"cd '{DOCKER_ROOT}' && docker compose pull homeassistant && docker compose up -d homeassistant", timeout=120)
+    run_ssh(f"cd '{HOST_1_NVME_DOCKER_ROOT}' && docker compose pull homeassistant && docker compose up -d homeassistant", timeout=120)
     # Patch python-kasa IoT HomeKit probe immediately so 2020 Kasa HS200/HS105 firmware does not hang on startup
     kasa_patch_cmd = (
         "docker exec home-assistant python3 -c \""
@@ -181,7 +185,7 @@ def perform_upgrade(target_service: str = "all"):
     )
     run_ssh(kasa_patch_cmd, timeout=20)
     run_ssh(
-        f"cd '{DOCKER_ROOT}/homeassistant' && docker compose pull matter-server otbr go2rtc && docker compose up -d matter-server otbr go2rtc",
+        f"cd '{HOST_1_NVME_DOCKER_ROOT}/homeassistant' && docker compose pull matter-server otbr go2rtc && docker compose up -d matter-server otbr go2rtc",
         timeout=120,
     )
 
