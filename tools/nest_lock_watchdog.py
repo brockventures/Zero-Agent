@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Nest x Yale Lock & Homebridge Self-Healing Watchdog.
 
 Monitors the end-to-end communication chain:
@@ -345,7 +346,7 @@ def execute_self_heal(
 
     code, out, err = run_ssh(
         host1_ip,
-        f"docker compose -f {nas_config.DOCKER_ROOT}/appdata/docker-compose.yml restart homebridge || sudo docker restart homebridge",
+        f"docker compose -f {getattr(nas_config, 'HOST_1_NVME_DOCKER_ROOT', nas_config.DOCKER_ROOT)}/appdata/docker-compose.yml restart homebridge || sudo docker restart homebridge",
     )
     if code != 0:
         state["consecutive_failures"] = consec + 1

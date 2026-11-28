@@ -637,7 +637,7 @@ def _auto_heal_zwave_js(
                             break
 
         restart_cmd = (
-            f"cd {nas_config.DOCKER_ROOT}/homeassistant && "
+            f"cd {getattr(nas_config, 'HOST_1_NVME_DOCKER_ROOT', nas_config.DOCKER_ROOT)}/homeassistant && "
             "sudo /usr/local/bin/docker compose restart zwave-js-ui"
         )
         rc, _, err = nas_config.run_ssh(nas_config.HOST_1_IP, restart_cmd, timeout=45)

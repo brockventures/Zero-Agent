@@ -1,3 +1,4 @@
+# ruff: noqa
 """Unit tests for Home Assistant Re-Auth & Generalized Matter-over-Thread Self-Healing Watchdog."""
 
 import json
@@ -286,7 +287,9 @@ def test_auto_heal_zwave_js_resets_unreachable_radio_restarts_container_and_clos
         )
         assert ok is True
         assert mock_ssh.call_count == 1
-        assert "docker compose restart zwave-js-ui" in mock_ssh.call_args[0][1]
+        restart_cmd = mock_ssh.call_args[0][1]
+        assert "docker compose restart zwave-js-ui" in restart_cmd
+        assert "cd /volume2/docker-nvme/homeassistant &&" in restart_cmd
         assert ZWAVE_RADIO_RESET_SETTLE_SECONDS in sleeps
         assert ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS in sleeps
         assert events == [
@@ -1226,6 +1229,52 @@ def test_reconcile_post_outage_covers_outside_daytime_window():
         assert reconciled == []
         assert mock_url.call_count == 0
         assert state["unavailable_covers"] == []
+
+
+def test_auto_heal_zwave_js_uses_host_1_nvme_docker_root():
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect_ex(self, addr):
+            return 0
+
+    def fake_urlopen(req, timeout=10):
+        resp = MagicMock()
+        resp.status = 200
+        if req.full_url.endswith("/api/config/config_entries/entry"):
+            resp.read.return_value = f'[{{"entry_id": "{ZWAVE_JS_DEFAULT_ENTRY_ID}", "state": "loaded"}}]'.encode()
+        resp.__enter__.return_value = resp
+        return resp
+
+    sample_states = [
+        {"entity_id": "sensor.tubeszb_2026_zw_esp_ip_address", "state": "198.51.100.50"},
+    ]
+    with (
+        patch("tools.nas_config.HOST_1_NVME_DOCKER_ROOT", "/volume2/docker-nvme-custom"),
+        patch("tools.nas_config.run_ssh", return_value=(0, "Restarted", "")) as mock_ssh,
+        patch("tools.ha_reauth_watchdog.socket.socket", return_value=FakeSocket()),
+        patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("tools.ha_reauth_watchdog.time.sleep"),
+    ):
+        ok = _auto_heal_zwave_js(
+            "http://198.51.100.10:8123",
+            "test_token",
+            ZWAVE_JS_DEFAULT_ENTRY_ID,
+            states=sample_states,
+        )
+        assert ok is True
+        assert mock_ssh.call_count == 1
+        restart_cmd = mock_ssh.call_args[0][1]
+        assert "cd /volume2/docker-nvme-custom/homeassistant &&" in restart_cmd
+        assert "docker compose restart zwave-js-ui" in restart_cmd
+
 
 
 

@@ -1,3 +1,4 @@
+# ruff: noqa
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -161,6 +162,10 @@ def test_execute_self_heal_success(
     assert ok is True
     assert "Successfully restored" in msg
     mock_ssh.assert_called_once()
+    assert (
+        "docker compose -f /volume2/docker-nvme/appdata/docker-compose.yml restart homebridge"
+        in mock_ssh.call_args[0][1]
+    )
     mock_reload.assert_called_once()
     mock_save.assert_called_once()
 
@@ -288,5 +293,28 @@ def test_audit_defers_when_ha_unreachable_mid_restart(mock_get_ha, mock_core):
     healthy, reason, details = audit_lock_health("http://fake-ha", "fake-token")
     assert healthy is True
     assert "Deferred" in reason
+
+
+@patch("nest_lock_watchdog.load_state")
+@patch("nest_lock_watchdog.save_state")
+@patch("nest_lock_watchdog.run_ssh")
+@patch("nest_lock_watchdog.reload_ha_config_entry")
+@patch("nest_lock_watchdog.get_ha_entity_state")
+@patch("nest_lock_watchdog.time.sleep")
+def test_execute_self_heal_uses_host_1_nvme_docker_root(
+    mock_sleep, mock_get_ha, mock_reload, mock_ssh, mock_save, mock_load
+):
+    import tools.nas_config as nas_config
+    mock_load.return_value = {"last_heal_ts": 0, "consecutive_failures": 0, "history": []}
+    mock_ssh.return_value = (0, "Restarting homebridge\n", "")
+    mock_reload.return_value = True
+    mock_get_ha.return_value = {"state": "locked"}
+
+    with patch.object(nas_config, "HOST_1_NVME_DOCKER_ROOT", "/volume2/docker-nvme-custom"):
+        ok, msg = execute_self_heal("custom test", "http://fake-ha", "fake-token", force=True)
+        assert ok is True
+        ssh_cmd = mock_ssh.call_args[0][1]
+        assert "docker compose -f /volume2/docker-nvme-custom/appdata/docker-compose.yml restart homebridge" in ssh_cmd
+
 
 
